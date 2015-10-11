@@ -139,13 +139,10 @@ int arch_show_interrupts(struct seq_file *p, int prec)
 	seq_puts(p, "  Machine check polls\n");
 #endif
 #if IS_ENABLED(CONFIG_HYPERV) || defined(CONFIG_XEN)
-	if (test_bit(HYPERVISOR_CALLBACK_VECTOR, used_vectors)) {
-		seq_printf(p, "%*s: ", prec, "HYP");
-		for_each_online_cpu(j)
-			seq_printf(p, "%10u ",
-				   irq_stats(j)->irq_hv_callback_count);
-		seq_puts(p, "  Hypervisor callback interrupts\n");
-	}
+	seq_printf(p, "%*s: ", prec, "HYP");
+	for_each_online_cpu(j)
+		seq_printf(p, "%10u ", irq_stats(j)->irq_hv_callback_count);
+	seq_puts(p, "  Hypervisor callback interrupts\n");
 #endif
 	seq_printf(p, "%*s: %10u\n", prec, "ERR", atomic_read(&irq_err_count));
 #if defined(CONFIG_X86_IO_APIC)
@@ -219,22 +216,7 @@ __visible unsigned int __irq_entry do_IRQ(struct pt_regs *regs)
 	unsigned vector = ~regs->orig_ax;
 	unsigned irq;
 
-	/*
-	 * NB: Unlike exception entries, IRQ entries do not reliably
-	 * handle context tracking in the low-level entry code.  This is
-	 * because syscall entries execute briefly with IRQs on before
-	 * updating context tracking state, so we can take an IRQ from
-	 * kernel mode with CONTEXT_USER.  The low-level entry code only
-	 * updates the context if we came from user mode, so we won't
-	 * switch to CONTEXT_KERNEL.  We'll fix that once the syscall
-	 * code is cleaned up enough that we can cleanly defer enabling
-	 * IRQs.
-	 */
-
 	entering_irq();
-
-	/* entering_irq() tells RCU that we're not quiescent.  Check it. */
-	RCU_LOCKDEP_WARN(!rcu_is_watching(), "IRQ failed to wake up RCU");
 
 	irq = __this_cpu_read(vector_irq[vector]);
 

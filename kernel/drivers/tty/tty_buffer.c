@@ -291,11 +291,12 @@ static int __tty_buffer_request_room(struct tty_port *port, size_t size,
 			n->flags = flags;
 			buf->tail = n;
 			b->commit = b->used;
-			/* paired w/ acquire in flush_to_ldisc(); ensures the
+			/* paired w/ barrier in flush_to_ldisc(); ensures the
 			 * latest commit value can be read before the head is
 			 * advanced to the next buffer
 			 */
-			smp_store_release(&b->next, n);
+			smp_wmb();
+			b->next = n;
 		} else if (change)
 			size = 0;
 		else
@@ -444,6 +445,7 @@ receive_buf(struct tty_struct *tty, struct tty_buffer *head, int count)
 		if (count)
 			disc->ops->receive_buf(tty, p, f, count);
 	}
+	head->read += count;
 	return count;
 }
 
@@ -486,11 +488,12 @@ static void flush_to_ldisc(struct work_struct *work)
 		if (atomic_read(&buf->priority))
 			break;
 
-		/* paired w/ release in __tty_buffer_request_room();
+		next = head->next;
+		/* paired w/ barrier in __tty_buffer_request_room();
 		 * ensures commit value read is not stale if the head
 		 * is advancing to the next buffer
 		 */
-		next = smp_load_acquire(&head->next);
+		smp_rmb();
 		count = head->commit - head->read;
 		if (!count) {
 			if (next == NULL) {
@@ -505,7 +508,6 @@ static void flush_to_ldisc(struct work_struct *work)
 		count = receive_buf(tty, head, count);
 		if (!count)
 			break;
-		head->read += count;
 	}
 
 	mutex_unlock(&buf->lock);

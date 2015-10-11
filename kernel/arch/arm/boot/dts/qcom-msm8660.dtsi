@@ -67,16 +67,15 @@
 			cpu-offset = <0x40000>;
 		};
 
-		tlmm: pinctrl@800000 {
-			compatible = "qcom,msm8660-pinctrl";
-			reg = <0x800000 0x4000>;
-
+		msmgpio: gpio@800000 {
+			compatible = "qcom,msm-gpio";
+			reg = <0x00800000 0x4000>;
 			gpio-controller;
 			#gpio-cells = <2>;
+			ngpio = <173>;
 			interrupts = <0 16 0x4>;
 			interrupt-controller;
 			#interrupt-cells = <2>;
-
 		};
 
 		gcc: clock-controller@900000 {
@@ -116,7 +115,7 @@
 
 			pmicintc: pmic@0 {
 				compatible = "qcom,pm8058";
-				interrupt-parent = <&tlmm>;
+				interrupt-parent = <&msmgpio>;
 				interrupts = <88 8>;
 				#interrupt-cells = <2>;
 				interrupt-controller;

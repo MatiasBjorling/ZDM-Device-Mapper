@@ -72,12 +72,21 @@ void __init ux500_init_irq(void)
 	 * Init clocks here so that they are available for system timer
 	 * initialization.
 	 */
-	if (cpu_is_u8500_family())
-		u8500_clk_init();
-	else if (cpu_is_u9540())
-		u9540_clk_init();
-	else if (cpu_is_u8540())
-		u8540_clk_init();
+	if (cpu_is_u8500_family()) {
+		u8500_of_clk_init(U8500_CLKRST1_BASE,
+				  U8500_CLKRST2_BASE,
+				  U8500_CLKRST3_BASE,
+				  U8500_CLKRST5_BASE,
+				  U8500_CLKRST6_BASE);
+	} else if (cpu_is_u9540()) {
+		u9540_clk_init(U8500_CLKRST1_BASE, U8500_CLKRST2_BASE,
+			       U8500_CLKRST3_BASE, U8500_CLKRST5_BASE,
+			       U8500_CLKRST6_BASE);
+	} else if (cpu_is_u8540()) {
+		u8540_clk_init(U8500_CLKRST1_BASE, U8500_CLKRST2_BASE,
+			       U8500_CLKRST3_BASE, U8500_CLKRST5_BASE,
+			       U8500_CLKRST6_BASE);
+	}
 }
 
 static const char * __init ux500_get_machine(void)

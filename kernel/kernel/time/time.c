@@ -268,14 +268,10 @@ EXPORT_SYMBOL(jiffies_to_msecs);
 
 unsigned int jiffies_to_usecs(const unsigned long j)
 {
-	/*
-	 * Hz usually doesn't go much further MSEC_PER_SEC.
-	 * jiffies_to_usecs() and usecs_to_jiffies() depend on that.
-	 */
-	BUILD_BUG_ON(HZ > USEC_PER_SEC);
-
-#if !(USEC_PER_SEC % HZ)
+#if HZ <= USEC_PER_SEC && !(USEC_PER_SEC % HZ)
 	return (USEC_PER_SEC / HZ) * j;
+#elif HZ > USEC_PER_SEC && !(HZ % USEC_PER_SEC)
+	return (j + (HZ / USEC_PER_SEC) - 1)/(HZ / USEC_PER_SEC);
 #else
 # if BITS_PER_LONG == 32
 	return (HZ_TO_USEC_MUL32 * j) >> HZ_TO_USEC_SHR32;

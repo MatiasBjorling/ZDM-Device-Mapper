@@ -82,7 +82,6 @@ static int p8_aes_ctr_setkey(struct crypto_tfm *tfm, const u8 *key,
 
 	pagefault_disable();
 	enable_kernel_altivec();
-	enable_kernel_vsx();
 	ret = aes_p8_set_encrypt_key(key, keylen * 8, &ctx->enc_key);
 	pagefault_enable();
 
@@ -101,7 +100,6 @@ static void p8_aes_ctr_final(struct p8_aes_ctr_ctx *ctx,
 
 	pagefault_disable();
 	enable_kernel_altivec();
-	enable_kernel_vsx();
 	aes_p8_encrypt(ctrblk, keystream, &ctx->enc_key);
 	pagefault_enable();
 
@@ -115,7 +113,6 @@ static int p8_aes_ctr_crypt(struct blkcipher_desc *desc,
 			    struct scatterlist *src, unsigned int nbytes)
 {
 	int ret;
-	u64 inc;
 	struct blkcipher_walk walk;
 	struct p8_aes_ctr_ctx *ctx =
 		crypto_tfm_ctx(crypto_blkcipher_tfm(desc->tfm));
@@ -134,7 +131,6 @@ static int p8_aes_ctr_crypt(struct blkcipher_desc *desc,
 		while ((nbytes = walk.nbytes) >= AES_BLOCK_SIZE) {
 			pagefault_disable();
 			enable_kernel_altivec();
-			enable_kernel_vsx();
 			aes_p8_ctr32_encrypt_blocks(walk.src.virt.addr,
 						    walk.dst.virt.addr,
 						    (nbytes &
@@ -144,12 +140,7 @@ static int p8_aes_ctr_crypt(struct blkcipher_desc *desc,
 						    walk.iv);
 			pagefault_enable();
 
-			/* We need to update IV mostly for last bytes/round */
-			inc = (nbytes & AES_BLOCK_MASK) / AES_BLOCK_SIZE;
-			if (inc > 0)
-				while (inc--)
-					crypto_inc(walk.iv, AES_BLOCK_SIZE);
-
+			crypto_inc(walk.iv, AES_BLOCK_SIZE);
 			nbytes &= AES_BLOCK_SIZE - 1;
 			ret = blkcipher_walk_done(desc, &walk, nbytes);
 		}

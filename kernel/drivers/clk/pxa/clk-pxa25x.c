@@ -79,7 +79,7 @@ unsigned int pxa25x_get_clk_frequency_khz(int info)
 			clks[3] / 1000000, (clks[3] % 1000000) / 10000);
 	}
 
-	return (unsigned int)clks[0] / KHz;
+	return (unsigned int)clks[0];
 }
 
 static unsigned long clk_pxa25x_memory_get_rate(struct clk_hw *hw,

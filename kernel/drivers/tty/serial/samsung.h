@@ -82,7 +82,6 @@ struct s3c24xx_uart_port {
 	unsigned char			tx_claimed;
 	unsigned int			pm_level;
 	unsigned long			baudclk_rate;
-	unsigned int			min_dma_size;
 
 	unsigned int			rx_irq;
 	unsigned int			tx_irq;

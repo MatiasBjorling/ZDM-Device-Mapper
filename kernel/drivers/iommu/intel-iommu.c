@@ -408,10 +408,6 @@ struct device_domain_info {
 	struct list_head global; /* link to global list */
 	u8 bus;			/* PCI bus number */
 	u8 devfn;		/* PCI devfn number */
-	struct {
-		u8 enabled:1;
-		u8 qdep;
-	} ats;			/* ATS state */
 	struct device *dev; /* it's NULL for PCIe-to-PCI bridge */
 	struct intel_iommu *iommu; /* IOMMU used by this device */
 	struct dmar_domain *domain; /* pointer to domain */
@@ -1395,26 +1391,19 @@ iommu_support_dev_iotlb (struct dmar_domain *domain, struct intel_iommu *iommu,
 
 static void iommu_enable_dev_iotlb(struct device_domain_info *info)
 {
-	struct pci_dev *pdev;
-
 	if (!info || !dev_is_pci(info->dev))
 		return;
 
-	pdev = to_pci_dev(info->dev);
-	if (pci_enable_ats(pdev, VTD_PAGE_SHIFT))
-		return;
-
-	info->ats.enabled = 1;
-	info->ats.qdep = pci_ats_queue_depth(pdev);
+	pci_enable_ats(to_pci_dev(info->dev), VTD_PAGE_SHIFT);
 }
 
 static void iommu_disable_dev_iotlb(struct device_domain_info *info)
 {
-	if (!info->ats.enabled)
+	if (!info->dev || !dev_is_pci(info->dev) ||
+	    !pci_ats_enabled(to_pci_dev(info->dev)))
 		return;
 
 	pci_disable_ats(to_pci_dev(info->dev));
-	info->ats.enabled = 0;
 }
 
 static void iommu_flush_dev_iotlb(struct dmar_domain *domain,
@@ -1426,11 +1415,16 @@ static void iommu_flush_dev_iotlb(struct dmar_domain *domain,
 
 	spin_lock_irqsave(&device_domain_lock, flags);
 	list_for_each_entry(info, &domain->devices, link) {
-		if (!info->ats.enabled)
+		struct pci_dev *pdev;
+		if (!info->dev || !dev_is_pci(info->dev))
+			continue;
+
+		pdev = to_pci_dev(info->dev);
+		if (!pci_ats_enabled(pdev))
 			continue;
 
 		sid = info->bus << 8 | info->devfn;
-		qdep = info->ats.qdep;
+		qdep = pci_ats_queue_depth(pdev);
 		qi_flush_dev_iotlb(info->iommu, sid, qdep, addr, mask);
 	}
 	spin_unlock_irqrestore(&device_domain_lock, flags);
@@ -2281,8 +2275,6 @@ static struct dmar_domain *dmar_insert_dev_info(struct intel_iommu *iommu,
 
 	info->bus = bus;
 	info->devfn = devfn;
-	info->ats.enabled = 0;
-	info->ats.qdep = 0;
 	info->dev = dev;
 	info->domain = domain;
 	info->iommu = iommu;

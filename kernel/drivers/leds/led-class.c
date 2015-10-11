@@ -228,15 +228,12 @@ static int led_classdev_next_name(const char *init_name, char *name,
 {
 	unsigned int i = 0;
 	int ret = 0;
-	struct device *dev;
 
 	strlcpy(name, init_name, len);
 
-	while ((ret < len) &&
-	       (dev = class_find_device(leds_class, NULL, name, match_name))) {
-		put_device(dev);
+	while (class_find_device(leds_class, NULL, name, match_name) &&
+	       (ret < len))
 		ret = snprintf(name, len, "%s_%u", init_name, ++i);
-	}
 
 	if (ret >= len)
 		return -ENOMEM;

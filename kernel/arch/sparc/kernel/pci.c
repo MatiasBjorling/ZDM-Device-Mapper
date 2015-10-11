@@ -249,6 +249,7 @@ static struct pci_dev *of_create_pci_dev(struct pci_pbm_info *pbm,
 					 struct pci_bus *bus, int devfn)
 {
 	struct dev_archdata *sd;
+	struct pci_slot *slot;
 	struct platform_device *op;
 	struct pci_dev *dev;
 	const char *type;
@@ -289,7 +290,10 @@ static struct pci_dev *of_create_pci_dev(struct pci_pbm_info *pbm,
 	dev->multifunction = 0;		/* maybe a lie? */
 	set_pcie_port_type(dev);
 
-	pci_dev_assign_slot(dev);
+	list_for_each_entry(slot, &dev->bus->slots, list)
+		if (PCI_SLOT(dev->devfn) == slot->number)
+			dev->slot = slot;
+
 	dev->vendor = of_getintprop_default(node, "vendor-id", 0xffff);
 	dev->device = of_getintprop_default(node, "device-id", 0xffff);
 	dev->subsystem_vendor =

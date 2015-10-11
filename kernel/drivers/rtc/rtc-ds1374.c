@@ -666,8 +666,9 @@ static int ds1374_remove(struct i2c_client *client)
 #ifdef CONFIG_RTC_DRV_DS1374_WDT
 	int res;
 
-	misc_deregister(&ds1374_miscdev);
-	ds1374_miscdev.parent = NULL;
+	res = misc_deregister(&ds1374_miscdev);
+	if (!res)
+		ds1374_miscdev.parent = NULL;
 	unregister_reboot_notifier(&ds1374_wdt_notifier);
 #endif
 

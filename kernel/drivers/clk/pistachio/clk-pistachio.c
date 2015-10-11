@@ -159,15 +159,9 @@ PNAME(mux_debug) = { "mips_pll_mux", "rpu_v_pll_mux",
 		     "wifi_pll_mux", "bt_pll_mux" };
 static u32 mux_debug_idx[] = { 0x0, 0x1, 0x2, 0x4, 0x8, 0x10 };
 
-static unsigned int pistachio_critical_clks_core[] __initdata = {
-	CLK_MIPS
-};
-
-static unsigned int pistachio_critical_clks_sys[] __initdata = {
-	PERIPH_CLK_SYS,
-	PERIPH_CLK_SYS_BUS,
-	PERIPH_CLK_DDR,
-	PERIPH_CLK_ROM,
+static unsigned int pistachio_critical_clks[] __initdata = {
+	CLK_MIPS,
+	CLK_PERIPH_SYS,
 };
 
 static void __init pistachio_clk_init(struct device_node *np)
@@ -199,8 +193,8 @@ static void __init pistachio_clk_init(struct device_node *np)
 
 	pistachio_clk_register_provider(p);
 
-	pistachio_clk_force_enable(p, pistachio_critical_clks_core,
-				   ARRAY_SIZE(pistachio_critical_clks_core));
+	pistachio_clk_force_enable(p, pistachio_critical_clks,
+				   ARRAY_SIZE(pistachio_critical_clks));
 }
 CLK_OF_DECLARE(pistachio_clk, "img,pistachio-clk", pistachio_clk_init);
 
@@ -267,9 +261,6 @@ static void __init pistachio_clk_periph_init(struct device_node *np)
 				    ARRAY_SIZE(pistachio_periph_gates));
 
 	pistachio_clk_register_provider(p);
-
-	pistachio_clk_force_enable(p, pistachio_critical_clks_sys,
-				   ARRAY_SIZE(pistachio_critical_clks_sys));
 }
 CLK_OF_DECLARE(pistachio_clk_periph, "img,pistachio-clk-periph",
 	       pistachio_clk_periph_init);

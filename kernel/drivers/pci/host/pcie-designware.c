@@ -350,6 +350,7 @@ static int dw_pcie_msi_map(struct irq_domain *domain, unsigned int irq,
 {
 	irq_set_chip_and_handler(irq, &dw_msi_irq_chip, handle_simple_irq);
 	irq_set_chip_data(irq, domain->host_data);
+	set_irq_flags(irq, IRQF_VALID);
 
 	return 0;
 }
@@ -387,7 +388,7 @@ int dw_pcie_host_init(struct pcie_port *pp)
 		addrp = of_get_address(np, index, NULL, NULL);
 		pp->cfg0_mod_base = of_read_number(addrp, ns);
 		pp->cfg1_mod_base = pp->cfg0_mod_base + pp->cfg0_size;
-	} else if (!pp->va_cfg0_base) {
+	} else {
 		dev_err(pp->dev, "missing *config* reg space\n");
 	}
 
@@ -525,6 +526,7 @@ int dw_pcie_host_init(struct pcie_port *pp)
 
 #ifdef CONFIG_PCI_MSI
 	dw_pcie_msi_chip.dev = pp->dev;
+	dw_pci.msi_ctrl = &dw_pcie_msi_chip;
 #endif
 
 	dw_pci.nr_controllers = 1;
@@ -706,15 +708,8 @@ static struct pci_bus *dw_pcie_scan_bus(int nr, struct pci_sys_data *sys)
 	struct pcie_port *pp = sys_to_pcie(sys);
 
 	pp->root_bus_nr = sys->busnr;
-
-	if (IS_ENABLED(CONFIG_PCI_MSI))
-		bus = pci_scan_root_bus_msi(pp->dev, sys->busnr, &dw_pcie_ops,
-					    sys, &sys->resources,
-					    &dw_pcie_msi_chip);
-	else
-		bus = pci_scan_root_bus(pp->dev, sys->busnr, &dw_pcie_ops,
-					sys, &sys->resources);
-
+	bus = pci_scan_root_bus(pp->dev, sys->busnr,
+				  &dw_pcie_ops, sys, &sys->resources);
 	if (!bus)
 		return NULL;
 

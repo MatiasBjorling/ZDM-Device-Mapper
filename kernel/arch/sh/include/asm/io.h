@@ -368,7 +368,6 @@ static inline int iounmap_fixed(void __iomem *addr) { return -EINVAL; }
 #endif
 
 #define ioremap_nocache	ioremap
-#define ioremap_uc	ioremap
 #define iounmap		__iounmap
 
 /*
