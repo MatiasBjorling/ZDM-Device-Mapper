@@ -1,6 +1,6 @@
-From b0f8bb3a427b4551b76b94fa068efbce500779a0 Mon Sep 17 00:00:00 2001
-From: Shaun Tancheff <shaun@tancheff.com>
-Date: Sat, 10 Oct 2015 19:20:45 -0500
+From 7fb06551c400a95416a63e0c669e7f8aec6e0cf3 Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun.tancheff@seagate.com>
+Date: Mon, 12 Oct 2015 13:52:45 -0500
 Subject: [PATCH 3/5] Support sending ZAC/ZBC commands via block layer.
 
     ZDM device mapper (and file systems) will need the ability to
@@ -80,7 +80,7 @@ index 00ecc97..13d4954 100644
  obj-$(CONFIG_IOSCHED_DEADLINE)	+= deadline-iosched.o
 diff --git a/block/blk-zoned-ctrl.c b/block/blk-zoned-ctrl.c
 new file mode 100644
-index 0000000..b6660a1
+index 0000000..9f197a4
 --- /dev/null
 +++ b/block/blk-zoned-ctrl.c
 @@ -0,0 +1,471 @@
@@ -511,7 +511,7 @@ index 0000000..b6660a1
 +		 sub_command, disk->disk_name, start_lba);
 +
 +	cmd[0] = ZAC_PASS_THROUGH16_OPCODE;
-+	cmd[1] = ata16byte1(0, ATA_PROT_NODATA, 1);
++	cmd[1] = ata16byte1(0, ATA_PROT_DMA, 1);
 +	cmd[4] = sub_command; /* [feature] */
 +
 +	if (start_lba == ~0ul || start_lba == ~1ul)
@@ -763,5 +763,5 @@ index 0000000..c802bdf
 +
 +#endif /* _UAPI_BLK_ZONED_CTRL_H */
 -- 
-2.6.0
+1.9.1
 

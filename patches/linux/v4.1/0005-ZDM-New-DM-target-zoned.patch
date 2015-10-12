@@ -1,6 +1,6 @@
-From 8e2a177f397b449c3fc368340d57b81cd1949ab5 Mon Sep 17 00:00:00 2001
-From: Shaun Tancheff <shaun@tancheff.com>
-Date: Sat, 10 Oct 2015 19:25:29 -0500
+From 9046264de9bd7e2f287815968d2e170a030f2921 Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun.tancheff@seagate.com>
+Date: Mon, 12 Oct 2015 14:02:06 -0500
 Subject: [PATCH 5/5] ZDM: New DM target 'zoned'
 
     ZDM presents a traditional block device for ZBC/ZAC zone based
@@ -16,8 +16,8 @@ Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
  drivers/md/Makefile                   |    1 +
  drivers/md/dm-zoned.c                 | 1979 +++++++++++++
  drivers/md/dm-zoned.h                 |  399 +++
- drivers/md/libzoned.c                 | 5113 +++++++++++++++++++++++++++++++++
- 7 files changed, 7594 insertions(+), 9 deletions(-)
+ drivers/md/libzoned.c                 | 5127 +++++++++++++++++++++++++++++++++
+ 7 files changed, 7608 insertions(+), 9 deletions(-)
  create mode 100644 Documentation/device-mapper/zoned.txt
  create mode 100644 drivers/md/dm-zoned.c
  create mode 100644 drivers/md/dm-zoned.h
@@ -2581,10 +2581,10 @@ index 0000000..44983af
 +#endif /* _DM_ZONED_H */
 diff --git a/drivers/md/libzoned.c b/drivers/md/libzoned.c
 new file mode 100644
-index 0000000..6482377
+index 0000000..b464daf
 --- /dev/null
 +++ b/drivers/md/libzoned.c
-@@ -0,0 +1,5113 @@
+@@ -0,0 +1,5127 @@
 +/*
 + * Kernel Device Mapper for abstracting ZAC/ZBC devices as normal
 + * block devices for linux file systems.
@@ -2599,7 +2599,7 @@ index 0000000..6482377
 + * warranty of any kind, whether express or implied.
 + */
 +
-+#define BUILD_NO                90
++#define BUILD_NO                91
 +
 +#define EXTRA_DEBUG              0
 +
@@ -6163,7 +6163,21 @@ index 0000000..6482377
 +	}
 +
 +retry:
-+	for (z_pref = megaz->z_data; z_pref < megaz->z_count; z_pref++) {
++	/* continue down the round-robin path */
++	for (z_pref = megaz->z_current + 1; z_pref < megaz->z_count; z_pref++) {
++		if (is_reserved(megaz, z_pref))
++			continue;
++
++		found = _blkalloc(megaz, z_pref, flags, nblks, nfound);
++		if (found || *nfound) {
++			megaz->z_current = z_pref;
++			megaz->z_gc_free--;
++			goto out;
++		}
++	}
++
++	/* If we didn't get a new pref zone ... walk from the start */
++	for (z_pref = megaz->z_data; z_pref < megaz->z_current; z_pref++) {
 +		if (is_reserved(megaz, z_pref))
 +			continue;
 +
@@ -7699,5 +7713,5 @@ index 0000000..6482377
 +	return err;
 +}
 -- 
-2.6.0
+1.9.1
 

@@ -1,4 +1,4 @@
-From 4fa6870f2f46bbdfafad43cc207bbca893b0de6d Mon Sep 17 00:00:00 2001
+From 10cb5c0b7615e3ad2fcd56f3b1bbe7c7463807c8 Mon Sep 17 00:00:00 2001
 From: Shaun Tancheff <shaun@tancheff.com>
 Date: Sat, 10 Oct 2015 19:22:03 -0500
 Subject: [PATCH 4/5] Provide ioctl access for ZAC/ZBC commands.
@@ -27,7 +27,7 @@ Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
  5 files changed, 224 insertions(+)
 
 diff --git a/block/blk-zoned-ctrl.c b/block/blk-zoned-ctrl.c
-index b6660a1..5d45230 100644
+index 9f197a4..a193a3e 100644
 --- a/block/blk-zoned-ctrl.c
 +++ b/block/blk-zoned-ctrl.c
 @@ -469,3 +469,187 @@ int blk_zoned_reset_wp_ata(struct gendisk *disk, u64 start_lba)
@@ -235,7 +235,7 @@ index 55b6f15..e210597 100644
  	case CDROM_GET_CAPABILITY:
  		/* Keep this until we remove the printk below.  udev sends it
 diff --git a/drivers/scsi/sd.c b/drivers/scsi/sd.c
-index 11ea52b..6346c8c 100644
+index 7f9d65f..01905cd 100644
 --- a/drivers/scsi/sd.c
 +++ b/drivers/scsi/sd.c
 @@ -45,6 +45,7 @@
@@ -308,5 +308,5 @@ index 009122b..3513c97 100644
  static inline __u32 scsi_to_u32(__u8 *ptr)
  {
 -- 
-2.6.0
+1.9.1
 
