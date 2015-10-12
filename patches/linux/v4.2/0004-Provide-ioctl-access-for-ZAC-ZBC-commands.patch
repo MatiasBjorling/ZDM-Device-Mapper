@@ -1,0 +1,312 @@
+From d511dfc94a18f3e8171ecb8ecf49880522503f53 Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Sat, 10 Oct 2015 19:22:03 -0500
+Subject: [PATCH 4/5] Provide ioctl access for ZAC/ZBC commands.
+
+    Userspace needs to be able to manipulate devices which support
+    the ZBC/ZAC specification. While this functionality can be
+    handled via SG_IO it is good to confirm that the functionality
+    in the kernel is correct.
+
+    Additionally most host-bus adapters that provide SCSI->SAS
+    interfaces do not support the ZBC command set (yet). However
+    they normally do have ATA pass-though support. These ioctls
+    support using the ZAC command set via ATA pass-through as well
+    as ZBC.
+
+    Userspace tools available can be found in the zdm-tools and/or
+    the smrffs-tools project.
+
+Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
+---
+ block/blk-zoned-ctrl.c         | 184 +++++++++++++++++++++++++++++++++++++++++
+ block/scsi_ioctl.c             |   5 ++
+ drivers/scsi/sd.c              |  19 +++++
+ include/linux/blk-zoned-ctrl.h |   8 ++
+ include/scsi/scsi.h            |   8 ++
+ 5 files changed, 224 insertions(+)
+
+diff --git a/block/blk-zoned-ctrl.c b/block/blk-zoned-ctrl.c
+index 9f197a4..a193a3e 100644
+--- a/block/blk-zoned-ctrl.c
++++ b/block/blk-zoned-ctrl.c
+@@ -469,3 +469,187 @@ int blk_zoned_reset_wp_ata(struct gendisk *disk, u64 start_lba)
+ 	return _blk_zoned_command_ata(disk, start_lba, ZONE_RESET_WP);
+ }
+ EXPORT_SYMBOL(blk_zoned_reset_wp_ata);
++
++int _inquiry_ioctl(struct gendisk *disk, void __user *parg)
++{
++	int error = 0;
++	size_t result_size = 0;
++	size_t alloc_size = PAGE_SIZE;
++	struct zoned_inquiry *inq = kmalloc(alloc_size, GFP_KERNEL);
++	u8 extended;
++
++	if (!inq) {
++		error = -ENOMEM;
++		goto out;
++	}
++	if (copy_from_user(inq, parg, sizeof(*inq))) {
++		error = -EFAULT;
++		goto out;
++	}
++	result_size = inq->mx_resp_len + offsetof(struct zoned_inquiry, result);
++	if (result_size > alloc_size) {
++		void *tmp;
++
++		alloc_size = result_size;
++		tmp = krealloc(inq, alloc_size, GFP_KERNEL);
++		if (!tmp) {
++			error = -ENOMEM;
++			goto out;
++		}
++		inq = tmp;
++	}
++
++	extended = inq->evpd & 0x7f;
++	if (inq->evpd & ZOPT_USE_ATA_PASS) {
++		struct zoned_identity ident;
++
++		pr_debug("%s: using ata passthrough.\n", __func__);
++		error = blk_zoned_identify_ata(disk, &ident);
++		inq->result[8] = ident.type_id << 4;
++	} else {
++		error = blk_zoned_inquiry(disk, extended,   inq->pg_op,
++					  inq->mx_resp_len, inq->result);
++	}
++	if (error) {
++		error = -EFAULT;
++		goto out;
++	}
++	if (copy_to_user(parg, inq, result_size)) {
++		error = -EFAULT;
++		goto out;
++	}
++
++out:
++	kfree(inq);
++
++	return error;
++}
++EXPORT_SYMBOL(_inquiry_ioctl);
++
++int _zone_close_ioctl(struct gendisk *disk, unsigned long arg)
++{
++	int error = -EFAULT;
++
++	if (arg & 1) {
++		if (arg != ~0ul)
++			arg &= ~1ul; /* ~1 :: 0xFF...FE */
++		error = blk_zoned_close_ata(disk, arg);
++	} else {
++		if (arg == ~1ul)
++			arg = ~0ul;
++		error = blk_zoned_close(disk, arg);
++	}
++
++	return error;
++}
++EXPORT_SYMBOL(_zone_close_ioctl);
++
++int _zone_finish_ioctl(struct gendisk *disk, unsigned long arg)
++{
++	int error = -EFAULT;
++
++	if (arg & 1) {
++		if (arg != ~0ul)
++			arg &= ~1ul; /* ~1 :: 0xFF...FE */
++		error = blk_zoned_finish_ata(disk, arg);
++	} else {
++		if (arg == ~1ul)
++			arg = ~0ul;
++		error = blk_zoned_finish(disk, arg);
++	}
++
++	return error;
++}
++EXPORT_SYMBOL(_zone_finish_ioctl);
++
++int _zone_open_ioctl(struct gendisk *disk, unsigned long arg)
++{
++	int error = -EFAULT;
++
++	if (arg & 1) {
++		if (arg != ~0ul)
++			arg &= ~1ul; /* ~1 :: 0xFF...FE */
++		error = blk_zoned_open_ata(disk, arg);
++	} else {
++		if (arg == ~1ul)
++			arg = ~0ul;
++		error = blk_zoned_open(disk, arg);
++	}
++
++	return error;
++}
++EXPORT_SYMBOL(_zone_open_ioctl);
++
++int _reset_wp_ioctl(struct gendisk *disk, unsigned long arg)
++{
++	int error = -EFAULT;
++
++	if (arg & 1) {
++		if (arg != ~0ul)
++			arg &= ~1ul; /* ~1 :: 0xFF...FE */
++		error = blk_zoned_reset_wp_ata(disk, arg);
++	} else {
++		if (arg == ~1ul)
++			arg = ~0ul;
++		error = blk_zoned_reset_wp(disk, arg);
++	}
++
++	return error;
++}
++EXPORT_SYMBOL(_reset_wp_ioctl);
++
++int _report_zones_ioctl(struct gendisk *disk, void __user *parg)
++{
++	int error = -EFAULT;
++	struct bdev_zone_report_io *zone_iodata = NULL;
++	u32 alloc_size = max(PAGE_SIZE, sizeof(*zone_iodata));
++	u8 opt = 0;
++
++	zone_iodata = kmalloc(alloc_size, GFP_KERNEL);
++	if (!zone_iodata) {
++		error = -ENOMEM;
++		goto report_zones_out;
++	}
++	if (copy_from_user(zone_iodata, parg, sizeof(*zone_iodata))) {
++		error = -EFAULT;
++		goto report_zones_out;
++	}
++	if (zone_iodata->data.in.return_page_count > alloc_size) {
++		void *tmp;
++
++		alloc_size = zone_iodata->data.in.return_page_count;
++		if (alloc_size < KMALLOC_MAX_SIZE) {
++			tmp = krealloc(zone_iodata, alloc_size, GFP_KERNEL);
++			if (!tmp) {
++				error = -ENOMEM;
++				goto report_zones_out;
++			}
++			zone_iodata = tmp;
++		} else {
++			/* Result requires DMA capable memory */
++			pr_err("Not enough memory available for request.\n");
++			error = -ENOMEM;
++			goto report_zones_out;
++		}
++	}
++	opt = zone_iodata->data.in.report_option & 0x7F;
++	if (zone_iodata->data.in.report_option & ZOPT_USE_ATA_PASS)
++		error = blk_zoned_report_ata(disk,
++				zone_iodata->data.in.zone_locator_lba,
++				opt, &zone_iodata->data.out, alloc_size);
++	else
++		error = blk_zoned_report(disk,
++				zone_iodata->data.in.zone_locator_lba,
++				opt, &zone_iodata->data.out, alloc_size);
++
++	if (error)
++		goto report_zones_out;
++
++	if (copy_to_user(parg, zone_iodata, alloc_size))
++		error = -EFAULT;
++
++report_zones_out:
++	kfree(zone_iodata);
++	return error;
++}
++EXPORT_SYMBOL(_report_zones_ioctl);
+diff --git a/block/scsi_ioctl.c b/block/scsi_ioctl.c
+index dda653c..b5eed6e 100644
+--- a/block/scsi_ioctl.c
++++ b/block/scsi_ioctl.c
+@@ -705,6 +705,11 @@ int scsi_verify_blk_ioctl(struct block_device *bd, unsigned int cmd)
+ 	case SG_GET_RESERVED_SIZE:
+ 	case SG_SET_RESERVED_SIZE:
+ 	case SG_EMULATED_HOST:
++	case SCSI_IOCTL_INQUIRY:
++	case SCSI_IOCTL_REPORT_ZONES:
++	case SCSI_IOCTL_RESET_WP:
++	case SCSI_IOCTL_OPEN_ZONE:
++	case SCSI_IOCTL_CLOSE_ZONE:
+ 		return 0;
+ 	case CDROM_GET_CAPABILITY:
+ 		/* Keep this until we remove the printk below.  udev sends it
+diff --git a/drivers/scsi/sd.c b/drivers/scsi/sd.c
+index a20da8c..77ea123 100644
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -45,6 +45,7 @@
+ #include <linux/init.h>
+ #include <linux/blkdev.h>
+ #include <linux/blkpg.h>
++#include <linux/blk-zoned-ctrl.h>
+ #include <linux/delay.h>
+ #include <linux/mutex.h>
+ #include <linux/string_helpers.h>
+@@ -1330,6 +1331,24 @@ static int sd_ioctl(struct block_device *bdev, fmode_t mode,
+ 		case SCSI_IOCTL_GET_BUS_NUMBER:
+ 			error = scsi_ioctl(sdp, cmd, p);
+ 			break;
++		case SCSI_IOCTL_INQUIRY:
++			error = _inquiry_ioctl(disk, p);
++			break;
++		case SCSI_IOCTL_CLOSE_ZONE:
++			error = _zone_close_ioctl(disk, arg);
++			break;
++		case SCSI_IOCTL_FINISH_ZONE:
++			error = _zone_finish_ioctl(disk, arg);
++			break;
++		case SCSI_IOCTL_OPEN_ZONE:
++			error = _zone_open_ioctl(disk, arg);
++			break;
++		case SCSI_IOCTL_RESET_WP:
++			error = _reset_wp_ioctl(disk, arg);
++			break;
++		case SCSI_IOCTL_REPORT_ZONES:
++			error = _report_zones_ioctl(disk, p);
++			break;
+ 		default:
+ 			error = scsi_cmd_blk_ioctl(bdev, mode, cmd, p);
+ 			if (error != -ENOTTY)
+diff --git a/include/linux/blk-zoned-ctrl.h b/include/linux/blk-zoned-ctrl.h
+index 92fadd2..2ac5171 100644
+--- a/include/linux/blk-zoned-ctrl.h
++++ b/include/linux/blk-zoned-ctrl.h
+@@ -39,4 +39,12 @@ int blk_zoned_reset_wp_ata(struct gendisk *disk, u64 start_lba);
+ int blk_zoned_report_ata(struct gendisk *disk, u64, u8,
+ 			 struct bdev_zone_report *, size_t);
+ 
++/* for testing from userspace via ioctl */
++int _inquiry_ioctl(struct gendisk *disk, void __user *parg);
++int _zone_close_ioctl(struct gendisk *disk, unsigned long arg);
++int _zone_finish_ioctl(struct gendisk *disk, unsigned long arg);
++int _zone_open_ioctl(struct gendisk *disk, unsigned long arg);
++int _reset_wp_ioctl(struct gendisk *disk, unsigned long arg);
++int _report_zones_ioctl(struct gendisk *disk, void __user *parg);
++
+ #endif /* BLK_ZONED_CTRL_H */
+diff --git a/include/scsi/scsi.h b/include/scsi/scsi.h
+index 988c873..427f276 100644
+--- a/include/scsi/scsi.h
++++ b/include/scsi/scsi.h
+@@ -304,6 +304,14 @@ static inline int scsi_is_wlun(u64 lun)
+ /* Used to obtain the PCI location of a device */
+ #define SCSI_IOCTL_GET_PCI		0x5387
+ 
++/* Used for Zone based SMR devices */
++#define SCSI_IOCTL_INQUIRY		0x10000
++#define SCSI_IOCTL_CLOSE_ZONE		0x10001
++#define SCSI_IOCTL_FINISH_ZONE		0x10002
++#define SCSI_IOCTL_OPEN_ZONE		0x10003
++#define SCSI_IOCTL_RESET_WP		0x10004
++#define SCSI_IOCTL_REPORT_ZONES		0x10005
++
+ /* Pull a u32 out of a SCSI message (using BE SCSI conventions) */
+ static inline __u32 scsi_to_u32(__u8 *ptr)
+ {
+-- 
+1.9.1
+
