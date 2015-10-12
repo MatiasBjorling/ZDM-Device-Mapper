@@ -28,6 +28,7 @@
 
 #include <linux/fs.h>
 #include <linux/hdreg.h>
+#include <linux/major.h>
 
 #include <errno.h>
 #include <string.h> // strdup
@@ -37,6 +38,27 @@
 #include "zbc-ctrl.h"
 #include "crc64.h"
 #include "is_mounted.h"
+
+#ifndef MAJOR
+  #define MAJOR(dev)	((dev)>>8)
+  #define MINOR(dev)	((dev) & 0xff)
+#endif
+
+#ifndef SCSI_BLK_MAJOR
+  #ifdef SCSI_DISK0_MAJOR
+    #ifdef SCSI_DISK8_MAJOR
+      #define SCSI_DISK_MAJOR(M) ((M) == SCSI_DISK0_MAJOR || \
+	((M) >= SCSI_DISK1_MAJOR && (M) <= SCSI_DISK7_MAJOR) || \
+	((M) >= SCSI_DISK8_MAJOR && (M) <= SCSI_DISK15_MAJOR))
+    #else
+      #define SCSI_DISK_MAJOR(M) ((M) == SCSI_DISK0_MAJOR || \
+	((M) >= SCSI_DISK1_MAJOR && (M) <= SCSI_DISK7_MAJOR))
+    #endif /* defined(SCSI_DISK8_MAJOR) */
+    #define SCSI_BLK_MAJOR(M) (SCSI_DISK_MAJOR((M)) || (M) == SCSI_CDROM_MAJOR)
+  #else
+    #define SCSI_BLK_MAJOR(M)  ((M) == SCSI_DISK_MAJOR || (M) == SCSI_CDROM_MAJOR)
+  #endif /* defined(SCSI_DISK0_MAJOR) */
+#endif /* defined(SCSI_BLK_MAJOR) */
 
 #define ZDMADM_CREATE 1
 #define ZDMADM_RESTORE 2
@@ -164,6 +186,27 @@ static void zdmadm_show(const char * dname, zdm_super_block_t *sblk)
 	printf("zac/zbc - ZAC: %s / ZBC: %s\n",
 		sblk->zac_zbc & MEDIA_ZAC ? "Yes" : "No",
 		sblk->zac_zbc & MEDIA_ZBC ? "Yes" : "No" );
+}
+
+/**
+ * Use device major/minor to determine if whole device or partition is specified.
+ */
+static int is_part(const char *dname)
+{
+	int is_partition = 1;
+	struct stat st_buf;
+	if (stat(dname, &st_buf) == 0) {
+		if ( ((MAJOR(st_buf.st_rdev) == HD_MAJOR &&
+		      (MINOR(st_buf.st_rdev) % 64) == 0))
+		           ||
+		     ((SCSI_BLK_MAJOR(MAJOR(st_buf.st_rdev)) &&
+		                     (MINOR(st_buf.st_rdev) % 16) == 0))
+		) {
+			printf("%s is entire device, not just one partition!\n", dname);
+			is_partition = 0;
+		}
+	}
+	return is_partition;
 }
 
 /**
@@ -1105,12 +1148,6 @@ int zdmadm_probe_zones(int fd, zdm_super_block_t * sblk)
 			int is_be = zdm_is_big_endian_report(info);
 			u64 fz_at = is_be ? be64toh(entry->lba_start) : entry->lba_start;
 			unsigned int type = entry->type & 0xF;
-			int same = info->same_field & 0x0f;
-
-			if (0 == same) {
-				printf("Same code: %d is not supported.\n", same );
-				rcode = -1;
-			}
 
 			if (lba != fz_at) {
 				printf("Partition is not on zone boundary .. unsupported.\n");
@@ -1433,7 +1470,7 @@ void usage(void)
 	       "    -k check zdm instance\n"
 	       "    -l specify zdm 'label' (default is zdm_sdXn)\n"
 	       "    -p probe device for superblock. (default)\n"
-	       "    -r restore zdm instance11\n"
+	       "    -r restore zdm instance\n"
 	       "    -R <N> over-provision <N> zones per Megazone (minimum=8)\n"
 	       "    -t <0|1> trim on/off, default is on.\n"
 	       "    -u unload zdm instance\n"
@@ -1523,7 +1560,7 @@ int main(int argc, char *argv[])
 
 		is_busy = is_anypart_mounted(dname, &flags, buf, sizeof(buf));
 		if (is_busy || flags) {
-			if (ZDMADM_CREATE == command ||ZDMADM_WIPE == command ) {
+			if (ZDMADM_CREATE == command || ZDMADM_WIPE == command ) {
 				need_rw = 1;
 			}
 			if (use_force && ZDMADM_CHECK == command) {
@@ -1538,6 +1575,16 @@ int main(int argc, char *argv[])
 				goto out;
 			}
 		}
+
+		if (ZDMADM_CREATE == command || ZDMADM_WIPE == command ) {
+			if (0 == is_part(dname)) {
+				if (!use_force) {
+					printf("Whole disk .. use -F to force\n");
+					goto out;
+				}
+			}
+		}
+
 
 		if (need_rw) {
 			o_flags = O_RDWR;

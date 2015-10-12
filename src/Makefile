@@ -32,6 +32,10 @@ else
 BE_QUIET=@
 endif
 
+SUBDIRS = zdmonitor
+SUBCLEAN = $(addsuffix .clean,$(SUBDIRS))
+SUBMORECLEAN = $(addsuffix .distclean,$(SUBDIRS))
+     
 ## Targets ##
 TARGETS		+= zdmadm zdm-status zdm-zones
 
@@ -60,7 +64,9 @@ LIBS += `pkg-config uuid --libs`
 ## Compiling Rules
 ##
 
-all: $(TARGETS)
+.PHONY: subdirs $(SUBDIRS)
+     
+all: $(TARGETS) subdirs
 
 zdmadm: $(OBJECTS)
 	@echo "Linking $@"
@@ -82,13 +88,31 @@ zdm-zones: zdm-zones.c
 	@echo "Compiling $<"
 	$(BE_QUIET)$(CC) $(DEFINES) $(CFLAGS) $(INCPATH) -c $< -o $@
 
+subdirs: $(SUBDIRS)
+
+$(SUBDIRS):
+	@echo "Building $@"
+	$(BE_QUIET)cd $@; qmake; cd ..
+	$(BE_QUIET)$(MAKE) --quiet -C $@
+
 test: $(TARGETS)
 	echo "TODO"
 
 check: test
 
-clean:
+
+.PHONY: clean $(SUBCLEAN)
+
+clean: $(SUBCLEAN)
 	$(BE_QUIET)$(RM) $(OBJECTS)
 
-distclean: clean
+$(SUBCLEAN): %.clean:
+	$(BE_QUIET)$(MAKE) --quiet -C $* clean
+
+.PHONY: distclean $(SUBMORECLEAN)
+
+distclean: clean $(SUBMORECLEAN)
 	$(BE_QUIET)$(RM) $(TARGETS)
+
+$(SUBMORECLEAN): %.distclean:
+	$(BE_QUIET)$(MAKE) --quiet -C $* distclean
