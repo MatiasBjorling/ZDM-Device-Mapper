@@ -137,3 +137,14 @@ If not, please see http://www.gnu.org/licenses/.
     * Test: RAID 5 across 4 drives with ZDM
     * Result: Observed degrading performance and occasional miscompare. 
     * Notes: ZDM is currently not optimized for the complexity of RAID5. Furthermore, it appears that one drive is stressed more during writes to the filesystem than the other 3 drives.
+
+## Changes from Initial Release
+
+  - ZDM #91
+    * Kernel from v4.2 tag is pre-patched.
+    * Added version number to track alpha/beta releases.
+    * Numerous bug fixes and better stability.
+    * Much improved GC / zone compaction handling.
+    * Patch set is cleaner and better defined.
+    * Patches provided to apply cleanly against 4.1 (stable), 4.2, and 4.3.
+
