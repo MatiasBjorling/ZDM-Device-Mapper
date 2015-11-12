@@ -29,16 +29,16 @@ or
       sd_reset_wp ata -1 /dev/sdX
 ```
 
-  - Partition the drive to start the partion at a WP boundary.
+  - Partition the drive as normal.
 ```
-      parted /dev/sdX
-      mklabel gpt
-      mkpart primary 256MiB 7452GiB
+      sudo parted -s /dev/sdX mklabel gpt
+      sudo parted -s /dev/sdX mkpart 1 1MiB -- -1
 ```
 
-  - Place ZDM drive mapper on /dev/sdX
+  - Place ZDM drive mapper on /dev/sdX. Since conventional space is not
+    cleared by reset wp activity use -F to overwrite.
 ```
-      zdmadm -c /dev/sdX1
+      zdmadm -F -c /dev/sdX1
 ```
 
   - Format:
@@ -56,7 +56,7 @@ or
 ```
       mount -o discard /dev/mapper/zdm_sdX1 /mnt/zdm_sdX1
 ```
- 
+
 Building:
   - Normal kernel build with CONFIG_DM_ZONED and CONFIG_BLK_ZONED_CTRL enabled.
 
@@ -69,14 +69,14 @@ Architecture:
 
    Device trim [aka discard] support is enabled by default. It is recommeded
    to increase the over-provision ratio if discard is disabled.
-   
+
    The initial implementation focuses on drives with same sized zones of
    256MB which is 65536 4k blocks. In future the zone size of 256MB will
    be relaxed to allow any size of zone as long as they are all the same.
-   
+
    Internally all addressing is on 4k boundaries. Currently a 4k PAGE_SIZE is
    assumed. Architectures with 8k (or other) PAGE_SIZE values have not been
    tested and are likly broken at the moment.
-   
+
    Host Managed drives should work if the zone type at the start of the partition
    is Conventional, or Preferred.
