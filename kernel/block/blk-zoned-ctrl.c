@@ -59,18 +59,18 @@
 /**
  * ZBC zone command
  */
-#define ZBC_ZONE_ACTION  RESET_WP
+#define ZBC_ZONE_ACTION  ZONE_COMMAND
 
 static inline void _len_to_cmd_zbc(u8 *cmd, u32 _len)
 {
-	u32 len = cpu_to_be32(_len);
+	__be32 len = cpu_to_be32(_len);
 
 	memcpy(cmd, &len, sizeof(len));
 }
 
 static inline void _lba_to_cmd_zbc(u8 *cmd, u64 _lba)
 {
-	u64 lba = cpu_to_be64(_lba);
+	__be64 lba = cpu_to_be64(_lba);
 
 	memcpy(cmd, &lba, sizeof(lba));
 }
@@ -194,7 +194,7 @@ int blk_cmd_with_sense(struct gendisk *disk,
 	} else if (rc) {
 		if ((driver_byte(rc) == DRIVER_SENSE)
 		    && (status_byte(rc) == CHECK_CONDITION)
-		    && (0 != sense_buffer[0])) {
+		    && (sense_buffer[0] != 0)) {
 			pr_err("%s: Something else failed\n", __func__);
 			return -1;
 		}
@@ -235,10 +235,10 @@ int blk_zoned_inquiry(struct gendisk *disk, u8 evpd, u8 pg_op,
 	int ret = 0;
 	u8 cmd[INQUIRY_CMDLEN] = {0};
 	u8 sense_buf[SCSI_SENSE_BUFFERSIZE] = {0};
-
 	__be16 slen = cpu_to_be16(mx_resp_len);
+	u16 len = (__force u16)slen;
 
-	if (0xb1 != pg_op) {
+	if (pg_op != 0xb1) {
 		pr_err("Unsupported Page Code %02x. Expected 0xb1\n", pg_op);
 		return -1;
 	}
@@ -247,8 +247,8 @@ int blk_zoned_inquiry(struct gendisk *disk, u8 evpd, u8 pg_op,
 	if (evpd)
 		cmd[1] |= 1;
 	cmd[2] = pg_op;
-	cmd[3] = slen & 0xff;
-	cmd[4] = (slen >> 8) & 0xff;
+	cmd[3] = len & 0xff;
+	cmd[4] = (len >> 8) & 0xff;
 
 	pr_debug("%s: cmd: %02x:%02x:%02x:%02x:%02x:%02x\n",
 		__func__, cmd[0],  cmd[1], cmd[2],  cmd[3],  cmd[4],  cmd[5]);
@@ -383,7 +383,7 @@ int blk_zoned_identify_ata(struct gendisk *disk, struct zoned_identity *ident)
 
 	ident->type_id = NOT_ZONED;
 
-	if (NULL == disk)
+	if (!disk)
 		return -1;
 
 	identify_cmd[0] = ZAC_PASS_THROUGH16_OPCODE;
@@ -425,7 +425,7 @@ static int _blk_zoned_command_ata(struct gendisk *disk, u64 start_lba,
 		 sub_command, disk->disk_name, start_lba);
 
 	cmd[0] = ZAC_PASS_THROUGH16_OPCODE;
-	cmd[1] = ata16byte1(0, ATA_PROT_DMA, 1);
+	cmd[1] = ata16byte1(0, ATA_PROT_NODATA, 1);
 	cmd[4] = sub_command; /* [feature] */
 
 	if (start_lba == ~0ul || start_lba == ~1ul)

@@ -202,8 +202,8 @@ static inline int scsi_is_wlun(u64 lun)
 #define DRIVER_SENSE	    0x08
 
 /* Op code for ZBC */
-#define RESET_WP            0x94
-#define REPORT_ZONES        0x95
+#define ZONE_COMMAND		0x94
+#define REPORT_ZONES		0x95
 
 /*
  * Internal return values.

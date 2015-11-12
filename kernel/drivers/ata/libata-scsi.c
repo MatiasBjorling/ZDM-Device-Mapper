@@ -3576,7 +3576,7 @@ static inline ata_xlat_func_t ata_get_xlat_func(struct ata_device *dev, u8 cmd)
 	case START_STOP:
 		return ata_scsi_start_stop_xlat;
 
-	case RESET_WP:
+	case ZONE_COMMAND:
 		return ata_scsi_zone_command_xlat;
 
 	case REPORT_ZONES:

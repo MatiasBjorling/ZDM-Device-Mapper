@@ -33,7 +33,7 @@ config LBDAF
 	  This option is required to support the full capacity of large
 	  (2TB+) block devices, including RAID, disk, Network Block Device,
 	  Logical Volume Manager (LVM) and loopback.
-	
+
 	  This option also enables support for single files larger than
 	  2TB.
 
@@ -107,6 +107,10 @@ config BLK_ZONED_CTRL
 	Support sending close/finish/open/reset wp, and report zones
 	to zoned based devices. Support sending ZAC/ZBC commands to
 	block devices.
+
+	Say yes here if you have a storage device that is has T10 ZBC
+	or T13 ZAC command support for zoned based storage.
+	If in doubt, say N.
 
 config BLK_CMDLINE_PARSER
 	bool "Block device command line partition parser"
