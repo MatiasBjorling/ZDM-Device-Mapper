@@ -80,7 +80,7 @@ or
 ```
       mount -o discard /dev/mapper/zdm_sdX1 /mnt/zdm_sdX1
 ```
- 
+
 Building:
   - Normal kernel build with CONFIG_DM_ZONED and CONFIG_BLK_ZONED_CTRL enabled.
 
@@ -102,7 +102,7 @@ If not, please see http://www.gnu.org/licenses/.
 ## Contact and Bug Reports
 
  - Adrian Palmer [adrian.palmer@seagate.com](mailto:adrian.palmer@seagate.com)
- 
+
 ## Observations and Known Issues
 
  - Issue
@@ -127,15 +127,15 @@ If not, please see http://www.gnu.org/licenses/.
 |median get MB/sec|101.048|97.415|1.037294051|
 |average get MB/sec|1054.253523|1355.445637|0.7777910782|
 
- - Issue 
+ - Issue
     * System: SDS-6037R-E1R16L using onboard LSI/Avago 2308 HBA chipset
     * Test: Single drive with ext4 running multiple 50GB file writes, compares, and deletes.
     * Result: Observed no degradation in performance or miscompares.
 
- - Issue 
+ - Issue
     * System: SDS-6037R-E1R16L using onboard LSI/Avago 2308 HBA chipset
     * Test: RAID 5 across 4 drives with ZDM
-    * Result: Observed degrading performance and occasional miscompare. 
+    * Result: Observed degrading performance and occasional miscompare.
     * Notes: ZDM is currently not optimized for the complexity of RAID5. Furthermore, it appears that one drive is stressed more during writes to the filesystem than the other 3 drives.
 
 ## Changes from Initial Release
@@ -148,3 +148,14 @@ If not, please see http://www.gnu.org/licenses/.
     * Patch set is cleaner and better defined.
     * Patches provided to apply cleanly against 4.1 (stable), 4.2, and 4.3.
 
+  - ZDM #96
+    * Support for ZDM metadata on conventional space.
+    * Modified queue limits to not confuse sgdisk.
+    * Initial ceph support for ZDM OSD (ceph-disk prepare --zdm).
+    * Block layer fixes for ZAC commands.
+    * Move ZDM metadata initialization to zdmadm userspace.
+    * Kernel from v4.2 tag is pre-patched.
+    * More code cleanups: Endian (__le/__be), style and formatting, started adding inline documentation.
+    * Numerous bug fixes and better stability.
+    * More GC / zone compaction improvements.
+    * Patches provided to apply cleanly against 4.1 (stable), 4.2, and 4.3.
