@@ -1,4 +1,4 @@
-From 16d25c3fc45bdb6d02c99da142f54c7f6a5a63c5 Mon Sep 17 00:00:00 2001
+From 834bc7b424929c0d44adca7ec243596e227164ff Mon Sep 17 00:00:00 2001
 From: Shaun Tancheff <shaun@tancheff.com>
 Date: Thu, 12 Nov 2015 03:19:45 -0600
 Subject: [PATCH 5/5] ZDM: New DM target 'zoned'

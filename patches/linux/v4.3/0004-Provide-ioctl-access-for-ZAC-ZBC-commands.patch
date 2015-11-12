@@ -1,4 +1,4 @@
-From 85444d77516a567092fa5692878ca47c7902df2d Mon Sep 17 00:00:00 2001
+From 7273d631d8779d8217501b20d2f77d88efcf7053 Mon Sep 17 00:00:00 2001
 From: Shaun Tancheff <shaun@tancheff.com>
 Date: Thu, 12 Nov 2015 01:49:58 -0600
 Subject: [PATCH 4/5] Provide ioctl access for ZAC/ZBC commands.

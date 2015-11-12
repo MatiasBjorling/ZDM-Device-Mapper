@@ -1,6 +1,6 @@
-From d511dfc94a18f3e8171ecb8ecf49880522503f53 Mon Sep 17 00:00:00 2001
+From 838d263cdfa87572766274cfe0d44d78d90ec4aa Mon Sep 17 00:00:00 2001
 From: Shaun Tancheff <shaun@tancheff.com>
-Date: Sat, 10 Oct 2015 19:22:03 -0500
+Date: Thu, 12 Nov 2015 01:49:58 -0600
 Subject: [PATCH 4/5] Provide ioctl access for ZAC/ZBC commands.
 
     Userspace needs to be able to manipulate devices which support
@@ -27,7 +27,7 @@ Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
  5 files changed, 224 insertions(+)
 
 diff --git a/block/blk-zoned-ctrl.c b/block/blk-zoned-ctrl.c
-index 9f197a4..a193a3e 100644
+index 5f41ca7..b2f6e96 100644
 --- a/block/blk-zoned-ctrl.c
 +++ b/block/blk-zoned-ctrl.c
 @@ -469,3 +469,187 @@ int blk_zoned_reset_wp_ata(struct gendisk *disk, u64 start_lba)
@@ -289,7 +289,7 @@ index 92fadd2..2ac5171 100644
 +
  #endif /* BLK_ZONED_CTRL_H */
 diff --git a/include/scsi/scsi.h b/include/scsi/scsi.h
-index 988c873..427f276 100644
+index f0fd6b6..8fb5376 100644
 --- a/include/scsi/scsi.h
 +++ b/include/scsi/scsi.h
 @@ -304,6 +304,14 @@ static inline int scsi_is_wlun(u64 lun)
@@ -308,5 +308,5 @@ index 988c873..427f276 100644
  static inline __u32 scsi_to_u32(__u8 *ptr)
  {
 -- 
-1.9.1
+2.6.2
 

@@ -1,6 +1,6 @@
-From af23b270a710bda399b06f39fe3f10734242662f Mon Sep 17 00:00:00 2001
+From f2f4e02c2d827ae1afbd028301937c006e065e79 Mon Sep 17 00:00:00 2001
 From: Shaun Tancheff <shaun@tancheff.com>
-Date: Thu, 12 Nov 2015 04:00:10 -0600
+Date: Thu, 12 Nov 2015 13:50:34 -0600
 Subject: [PATCH 3/5] Support ZAC/ZBC commands via block layer.
 
     ZDM device mapper (and file systems) will need the ability to
@@ -18,13 +18,13 @@ Subject: [PATCH 3/5] Support ZAC/ZBC commands via block layer.
 Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
 ---
  MAINTAINERS                         |   8 +
- block/Kconfig                       |   8 +
+ block/Kconfig                       |  14 +-
  block/Makefile                      |   1 +
  block/blk-zoned-ctrl.c              | 471 ++++++++++++++++++++++++++++++++++++
  include/linux/blk-zoned-ctrl.h      |  42 ++++
  include/uapi/linux/Kbuild           |   1 +
  include/uapi/linux/blk-zoned-ctrl.h | 259 ++++++++++++++++++++
- 7 files changed, 790 insertions(+)
+ 7 files changed, 795 insertions(+), 1 deletion(-)
  create mode 100644 block/blk-zoned-ctrl.c
  create mode 100644 include/linux/blk-zoned-ctrl.h
  create mode 100644 include/uapi/linux/blk-zoned-ctrl.h
@@ -49,10 +49,19 @@ index 747c653..45bf7e9 100644
  M:	Dan Streetman <ddstreet@ieee.org>
  L:	linux-mm@kvack.org
 diff --git a/block/Kconfig b/block/Kconfig
-index 161491d..f7ac7cb 100644
+index 161491d..8ce2721 100644
 --- a/block/Kconfig
 +++ b/block/Kconfig
-@@ -100,6 +100,14 @@ config BLK_DEV_THROTTLING
+@@ -33,7 +33,7 @@ config LBDAF
+ 	  This option is required to support the full capacity of large
+ 	  (2TB+) block devices, including RAID, disk, Network Block Device,
+ 	  Logical Volume Manager (LVM) and loopback.
+-	
++
+ 	  This option also enables support for single files larger than
+ 	  2TB.
+ 
+@@ -100,6 +100,18 @@ config BLK_DEV_THROTTLING
  
  	See Documentation/cgroups/blkio-controller.txt for more information.
  
@@ -65,7 +74,7 @@ index 161491d..f7ac7cb 100644
 +	block devices.
 +
 +	Say yes here if you have a storage device that is has T10 ZBC
-+       or T13 ZAC command support for zoned based storage.
++	or T13 ZAC command support for zoned based storage.
 +	If in doubt, say N.
 +
  config BLK_CMDLINE_PARSER
