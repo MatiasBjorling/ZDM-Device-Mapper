@@ -7,9 +7,17 @@
 #define MF_SWAP      (1 << 4)
 #define MF_BUSY      (1 << 5)
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 int is_mounted(const char *device, int *mount_flags, char *mtpt, int mtlen);
 int is_anypart_mounted(const char *device, int *mount_flags, char *mtpt, int mtlen);
 int exists(const char *dname);
+
+#ifdef __cplusplus
+}
+#endif
 
 /**
  * Ex:

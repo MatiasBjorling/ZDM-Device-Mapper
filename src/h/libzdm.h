@@ -29,7 +29,12 @@
 #include "malloc.h"
 
 
-typedef unsigned long long __le64;
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef __u32 __le32;
+typedef __u64 __le64;
 
 
 #define BUILD_BUG_ON(condition) ((void)sizeof(char[1 - 2*!!(condition)]))
@@ -58,6 +63,10 @@ struct atomic_type {
 
 struct work_struct {
 	int  tag;
+};
+
+struct delayed_work {
+	struct work_struct work;
 };
 
 struct mutex {
@@ -144,6 +153,8 @@ void set_debug(int state);
 #define jiffies_64           ((u64)clock())
 #define msecs_to_jiffies(v)  ( (v) * 1000)
 #define time_before64(a, b)  ( (a) < (b) ? 1 : 0 )
+#define time_after64(a, b)   ( (a) < (b) ? 0 : 1 )
+
 
 
 #define Dspin_lock( p )
@@ -255,6 +266,15 @@ static inline void atomic_dec(atomic_t * value) { value->counter--; }
 
 
 #define INIT_WORK(work, pfn_task)  (void)work, (void) pfn_task
+#define INIT_DELAYED_WORK(work, pfn_task)  (void)work, (void) pfn_task
+
+static inline struct delayed_work *to_delayed_work(struct work_struct *work)
+{
+        return container_of(work, struct delayed_work, work);
+}
+
+#define blkdev_issue_flush(a, b, c) *(c) = 0
+
 
 static inline void * dm_io_client_create(void) { return calloc(1, 1); }
 static inline void * dm_kcopyd_client_create(struct dm_kcopyd_throttle * throttle)
@@ -309,6 +329,26 @@ static inline void queue_work(struct workqueue_struct * wq, struct work_struct *
 	printf("do something: %d\n", __LINE__);
 }
 
+static inline void queue_delayed_work(struct workqueue_struct * wq,
+				      struct delayed_work * work,
+				      unsigned long delay)
+{
+	printf("do nothing: %d\n", __LINE__);
+}
+
+static inline int delayed_work_pending(struct delayed_work * work)
+{
+	return 0;
+}
+static inline void mod_delayed_work(struct workqueue_struct * wq,
+				      struct delayed_work * work,
+				      unsigned long delay)
+{
+}
+
+static inline void flush_delayed_work(struct delayed_work * work)
+{
+}
 
 static inline void flush_workqueue(struct workqueue_struct * wq)
 {
@@ -327,7 +367,6 @@ static inline void ssleep(int s)
 }
 
 static inline void msleep(int ms)
-
 {
 	usleep(1000 * ms);
 }
@@ -354,20 +393,20 @@ int zdm_sb_test_flag(struct zdm_superblock * sb, int bit_no);
 void zdm_sb_set_flag(struct zdm_superblock * sb, int bit_no);
 
 int zdm_map_onto_zdm(struct zoned *znd, u64 sector_nr, struct map_addr * out);
-int zdm_map_addr(u64 dm_s, struct map_addr * out);
-int zdm_sync_tables(struct megazone * megaz, int need_table_push);
+int zdm_map_addr(struct zoned *znd, u64 dm_s, struct map_addr * out);
+int zdm_sync_tables(struct megazone * megaz);
 int zdm_sync_crc_pages(struct megazone * megaz);
 int zdm_unused_phy(struct megazone * megaz, u64 block_nr, u64 orig);
 int zdm_unused_addr(struct megazone * megaz, u64 dm_s);
 u64 zdm_lookup(struct megazone * megaz, struct map_addr * maddr);
 int zdm_mapped_addmany(struct megazone * megaz, u64 dm_s, u64 lba, u64 count);
 int zdm_mapped_discard(struct megazone * megaz, u64 dm_s, u64 lba);
-int zdm_mapped_to_list(struct megazone * megaz, u64 dm_s, u64 lba, int purge);
+int zdm_mapped_to_list(struct megazone * megaz, u64 dm_s, u64 lba);
 int zdm_mapped_sync(struct megazone * megaz);
 int zdm_mapped_init(struct megazone * megaz);
 int zdm_write_if_dirty(struct megazone * megaz, struct map_pg * oldest, int use_wq);
 int zdm_release_table_pages(struct megazone * megaz);
-int zdm_sync(struct megazone * megaz, int do_tables);
+int zdm_sync(struct megazone * megaz);
 u32 zdm_sb_crc32(struct zdm_superblock *sblock);
 u64 zdm_reserve_blocks(struct megazone * megaz, u32 flags, u32 count, u32 *avail);
 int zdm_move_to_map_tables(struct megazone * megaz, struct map_cache * jrnl);
@@ -386,6 +425,10 @@ int zdm_is_reverse_table_zone(struct megazone * megaz, struct map_addr * maddr);
 u64 zdm_lookup_cache(struct megazone * megaz, struct map_addr * maddr);
 u64 zdm_locate_sector(struct megazone * megaz, struct map_addr * maddr);
 int zdm_load_page(struct megazone * megaz, struct map_pg * mapped, u64 lba, int is_to);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // _ZONED_H_
 

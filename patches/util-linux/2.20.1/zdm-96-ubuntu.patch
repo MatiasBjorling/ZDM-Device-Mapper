@@ -1,6 +1,20 @@
-diff -uPr util-linux-2.20.1.orig/include/crc64.h util-linux-2.20.1/include/crc64.h
---- util-linux-2.20.1.orig/include/crc64.h	1969-12-31 18:00:00.000000000 -0600
-+++ util-linux-2.20.1/include/crc64.h	2015-09-09 15:04:07.883893403 -0500
+diff --git a/include/Makefile.am b/include/Makefile.am
+index 75e01ef..c66bad4 100644
+--- a/include/Makefile.am
++++ b/include/Makefile.am
+@@ -8,6 +8,7 @@ dist_noinst_HEADERS = \
+ 	carefulputc.h \
+ 	c.h \
+ 	cpuset.h \
++	crc64.h \
+ 	crc32.h \
+ 	env.h \
+ 	exitcodes.h \
+diff --git a/include/crc64.h b/include/crc64.h
+new file mode 100644
+index 0000000..40475d5
+--- /dev/null
++++ b/include/crc64.h
 @@ -0,0 +1,9 @@
 +#ifndef UTIL_LINUX_CRC64_H
 +#define UTIL_LINUX_CRC64_H
@@ -11,20 +25,11 @@ diff -uPr util-linux-2.20.1.orig/include/crc64.h util-linux-2.20.1/include/crc64
 +extern uint64_t crc64(uint64_t seed, const unsigned char *data, size_t len);
 +
 +#endif
-diff -uPr util-linux-2.20.1.orig/include/Makefile.am util-linux-2.20.1/include/Makefile.am
---- util-linux-2.20.1.orig/include/Makefile.am	2011-10-18 00:41:47.000000000 -0500
-+++ util-linux-2.20.1/include/Makefile.am	2015-09-09 15:07:07.631899584 -0500
-@@ -8,6 +8,7 @@
- 	carefulputc.h \
- 	c.h \
- 	cpuset.h \
-+	crc64.h \
- 	crc32.h \
- 	env.h \
- 	exitcodes.h \
-diff -uPr util-linux-2.20.1.orig/lib/crc64.c util-linux-2.20.1/lib/crc64.c
---- util-linux-2.20.1.orig/lib/crc64.c	1969-12-31 18:00:00.000000000 -0600
-+++ util-linux-2.20.1/lib/crc64.c	2015-09-09 15:03:24.207891900 -0500
+diff --git a/lib/crc64.c b/lib/crc64.c
+new file mode 100644
+index 0000000..0be78e6
+--- /dev/null
++++ b/lib/crc64.c
 @@ -0,0 +1,109 @@
 +#include "crc64.h"
 +
@@ -135,10 +140,11 @@ diff -uPr util-linux-2.20.1.orig/lib/crc64.c util-linux-2.20.1/lib/crc64.c
 +	return crc;
 +}
 +
-diff -uPr util-linux-2.20.1.orig/libblkid/src/Makefile.am util-linux-2.20.1/libblkid/src/Makefile.am
---- util-linux-2.20.1.orig/libblkid/src/Makefile.am	2011-09-26 04:50:22.000000000 -0500
-+++ util-linux-2.20.1/libblkid/src/Makefile.am	2015-09-09 15:06:03.611897383 -0500
-@@ -26,6 +26,7 @@
+diff --git a/libblkid/src/Makefile.am b/libblkid/src/Makefile.am
+index 543f2f6..3ccb92c 100644
+--- a/libblkid/src/Makefile.am
++++ b/libblkid/src/Makefile.am
+@@ -26,6 +26,7 @@ libblkid_la_SOURCES = cache.c dev.c devname.c devno.c getsize.c llseek.c  \
  		     $(top_srcdir)/lib/linux_version.c \
  		     $(top_srcdir)/lib/canonicalize.c \
  		     $(top_srcdir)/lib/md5.c \
@@ -146,10 +152,11 @@ diff -uPr util-linux-2.20.1.orig/libblkid/src/Makefile.am util-linux-2.20.1/libb
  		     $(top_srcdir)/lib/crc32.c \
  		     $(top_srcdir)/include/list.h \
  		     $(top_srcdir)/lib/env.c \
-diff -uPr util-linux-2.20.1.orig/libblkid/src/superblocks/Makefile.am util-linux-2.20.1/libblkid/src/superblocks/Makefile.am
---- util-linux-2.20.1.orig/libblkid/src/superblocks/Makefile.am	2011-10-18 00:41:47.000000000 -0500
-+++ util-linux-2.20.1/libblkid/src/superblocks/Makefile.am	2015-09-09 14:54:04.247872642 -0500
-@@ -40,6 +40,7 @@
+diff --git a/libblkid/src/superblocks/Makefile.am b/libblkid/src/superblocks/Makefile.am
+index 1501fab..a692c62 100644
+--- a/libblkid/src/superblocks/Makefile.am
++++ b/libblkid/src/superblocks/Makefile.am
+@@ -40,6 +40,7 @@ libblkid_superblocks_la_SOURCES = \
  			netware.c \
  			sysv.c \
  			btrfs.c \
@@ -157,10 +164,11 @@ diff -uPr util-linux-2.20.1.orig/libblkid/src/superblocks/Makefile.am util-linux
  			lvm.c \
  			zfs.c \
  			ubifs.c \
-diff -uPr util-linux-2.20.1.orig/libblkid/src/superblocks/superblocks.c util-linux-2.20.1/libblkid/src/superblocks/superblocks.c
---- util-linux-2.20.1.orig/libblkid/src/superblocks/superblocks.c	2011-10-18 00:41:47.000000000 -0500
-+++ util-linux-2.20.1/libblkid/src/superblocks/superblocks.c	2015-09-09 15:00:56.875886833 -0500
-@@ -91,6 +91,8 @@
+diff --git a/libblkid/src/superblocks/superblocks.c b/libblkid/src/superblocks/superblocks.c
+index 8a0edaa..685b6db 100644
+--- a/libblkid/src/superblocks/superblocks.c
++++ b/libblkid/src/superblocks/superblocks.c
+@@ -91,6 +91,8 @@ static const struct blkid_idinfo *idinfos[] =
  	&adraid_idinfo,
  	&jmraid_idinfo,
  
@@ -169,10 +177,11 @@ diff -uPr util-linux-2.20.1.orig/libblkid/src/superblocks/superblocks.c util-lin
  	&drbd_idinfo,
  	&lvm2_idinfo,
  	&lvm1_idinfo,
-diff -uPr util-linux-2.20.1.orig/libblkid/src/superblocks/superblocks.h util-linux-2.20.1/libblkid/src/superblocks/superblocks.h
---- util-linux-2.20.1.orig/libblkid/src/superblocks/superblocks.h	2011-10-18 00:41:47.000000000 -0500
-+++ util-linux-2.20.1/libblkid/src/superblocks/superblocks.h	2015-09-09 14:55:59.243876597 -0500
-@@ -60,6 +60,7 @@
+diff --git a/libblkid/src/superblocks/superblocks.h b/libblkid/src/superblocks/superblocks.h
+index a79d7cb..1a68ed4 100644
+--- a/libblkid/src/superblocks/superblocks.h
++++ b/libblkid/src/superblocks/superblocks.h
+@@ -60,6 +60,7 @@ extern const struct blkid_idinfo xenix_idinfo;
  extern const struct blkid_idinfo btrfs_idinfo;
  extern const struct blkid_idinfo ubifs_idinfo;
  extern const struct blkid_idinfo zfs_idinfo;
@@ -180,10 +189,12 @@ diff -uPr util-linux-2.20.1.orig/libblkid/src/superblocks/superblocks.h util-lin
  extern const struct blkid_idinfo bfs_idinfo;
  extern const struct blkid_idinfo vmfs_volume_idinfo;
  extern const struct blkid_idinfo vmfs_fs_idinfo;
-diff -uPr util-linux-2.20.1.orig/libblkid/src/superblocks/zdm.c util-linux-2.20.1/libblkid/src/superblocks/zdm.c
---- util-linux-2.20.1.orig/libblkid/src/superblocks/zdm.c	1969-12-31 18:00:00.000000000 -0600
-+++ util-linux-2.20.1/libblkid/src/superblocks/zdm.c	2015-09-09 15:25:25.839937354 -0500
-@@ -0,0 +1,90 @@
+diff --git a/libblkid/src/superblocks/zdm.c b/libblkid/src/superblocks/zdm.c
+new file mode 100644
+index 0000000..76d073f
+--- /dev/null
++++ b/libblkid/src/superblocks/zdm.c
+@@ -0,0 +1,92 @@
 +/*
 + * Copyright (C) 2015 Shaun Tancheff <shaun@tancheff.com>
 + *
@@ -223,6 +234,8 @@ diff -uPr util-linux-2.20.1.orig/libblkid/src/superblocks/zdm.c util-linux-2.20.
 +	u32 disk_type;   /* HA | HM */
 +	u32 zac_zbc;     /* if ZAC / ZBC is supported on backing device */
 +	char label[64];
++	u64 data_start;  /* zone # of first *DATA* zone */
++	u64 zone_size;   /* zone size in 512 byte blocks */
 +};
 +typedef struct zdm_super_block zdm_super_block_t;
 +

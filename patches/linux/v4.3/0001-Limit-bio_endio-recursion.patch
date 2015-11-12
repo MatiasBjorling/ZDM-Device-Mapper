@@ -1,4 +1,4 @@
-From b19719b0fa1efe590e791702e59ced5b559ffc0d Mon Sep 17 00:00:00 2001
+From 1173ed51547d28dc916d5f9d00bacc0d82622aae Mon Sep 17 00:00:00 2001
 From: Shaun Tancheff <shaun@tancheff.com>
 Date: Mon, 12 Oct 2015 00:43:30 -0500
 Subject: [PATCH 1/5] Limit bio_endio recursion
@@ -134,5 +134,5 @@ index ad3f276..22cd367 100644
  	}
  }
 -- 
-1.9.1
+2.6.2
 

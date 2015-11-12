@@ -1,6 +1,6 @@
-From 4a041933d1b6b16af1c70a5b38105b3a6a221d43 Mon Sep 17 00:00:00 2001
-From: Shaun Tancheff <shaun.tancheff@seagate.com>
-Date: Sun, 11 Oct 2015 21:23:52 -0500
+From a537529c0070d487e3732b1fd42ede94aea7c768 Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Thu, 12 Nov 2015 01:38:39 -0600
 Subject: [PATCH 2/5] Add ZBC <-> ZAC xlat support for report, open, close,
  reset, finish
 
@@ -16,7 +16,7 @@ Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
  3 files changed, 190 insertions(+), 1 deletion(-)
 
 diff --git a/drivers/ata/libata-scsi.c b/drivers/ata/libata-scsi.c
-index 0d7f0da..416799a 100644
+index 0d7f0da..851c9e0 100644
 --- a/drivers/ata/libata-scsi.c
 +++ b/drivers/ata/libata-scsi.c
 @@ -65,6 +65,7 @@ static struct ata_device *__ata_scsi_find_dev(struct ata_port *ap,
@@ -220,7 +220,7 @@ index 0d7f0da..416799a 100644
  	case START_STOP:
  		return ata_scsi_start_stop_xlat;
 +
-+	case RESET_WP:
++	case ZONE_COMMAND:
 +		return ata_scsi_zone_command_xlat;
 +
 +	case REPORT_ZONES:
@@ -266,7 +266,7 @@ index d2992bf..3dce69d 100644
  {
  	u16 tmp = dev_id[ATA_ID_CONFIG] & 0x3;
 diff --git a/include/scsi/scsi.h b/include/scsi/scsi.h
-index e0a3398..988c873 100644
+index e0a3398..f0fd6b6 100644
 --- a/include/scsi/scsi.h
 +++ b/include/scsi/scsi.h
 @@ -201,6 +201,10 @@ static inline int scsi_is_wlun(u64 lun)
@@ -274,12 +274,12 @@ index e0a3398..988c873 100644
  #define DRIVER_SENSE	    0x08
  
 +/* Op code for ZBC */
-+#define RESET_WP            0x94
-+#define REPORT_ZONES        0x95
++#define ZONE_COMMAND		0x94
++#define REPORT_ZONES		0x95
 +
  /*
   * Internal return values.
   */
 -- 
-1.9.1
+2.6.2
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-SCRIPTS="${PWD}/zdmadm ${PWD}/zdm-status ${PWD}/zdm-zones"
+SCRIPTS="${PWD}/zdmadm ${PWD}/zdm-status ${PWD}/zdm-zones ${PWD}/zdm-mlog"
 INSTALL_TO="${HOME}/bin"
 
 if [[ ! -d ${INSTALL_TO} ]]; then

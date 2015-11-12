@@ -103,8 +103,8 @@ struct zdm_super_block {
 	u8  magic[ARRAY_SIZE(zdm_magic)];
 	uuid_t  uuid;
 	u32 version;     /* 0xMMMMmmpt */
-	u64 sect_start;
-	u64 sect_size;
+	u64 sect_start;  /* in 512 byte sectors */
+	u64 sect_size;   /* in 512 byte sectors */
 	u32 mz_metadata_zones;     /* 3 (default) */
 	u32 mz_over_provision;     /* 5 (minimum) */
 	u64 zdm_blocks;  /* 0 -> <zdm_blocks> for dmsetup table entry */
@@ -112,6 +112,8 @@ struct zdm_super_block {
 	u32 disk_type;   /* HA | HM */
 	u32 zac_zbc;     /* if ZAC / ZBC is supported on backing device */
 	char label[64];
+	u64 data_start;  /* zone # of first *DATA* zone */
+	u64 zone_size;   /* zone size in 512 byte blocks */
 };
 typedef struct zdm_super_block zdm_super_block_t;
 
@@ -172,6 +174,7 @@ static void zdmadm_show(const char * dname, zdm_super_block_t *sblk)
 		printf("label   - %s\n", sblk->label );
 	}
 	printf("start   - %"PRIu64"\n", sblk->sect_start);
+	printf("data    - %"PRIu64"\n", sblk->data_start * sblk->zone_size);
 	printf("size    - %"PRIu64"\n", sblk->sect_size);
 	printf("zdm sz  - %"PRIu64"\n", sblk->zdm_blocks);
 	printf("resv    - %u [%u: metadata + %u: over provision]\n",
@@ -208,283 +211,6 @@ static int is_part(const char *dname)
 	}
 	return is_partition;
 }
-
-/**
- * An initial 'check' and 'repair' ZDM metadata ...
- */
-int my_debug_test(struct zoned * znd)
-{
-	int rc = 0;
-	u64 mz = 1;
-	u32 *data = ZDM_ALLOC(znd, Z_C4K, PG_09);
-	if (!data)
-		return -ENOMEM;
-
-	printf("Loading MZ #");
-	fflush(stdout);
-
-	if (mz < znd->mega_zones_count)	{
-		int err;
-		struct megazone * megaz = &znd->z_mega[mz];
-
-		printf(". %" PRIu64, mz);
-		fflush(stdout);
-
-		err = zdm_mapped_init(megaz);
-                if (!err) {
-			struct map_addr maddr;
-			struct crc_pg *crc_pg_blk;
-			u64 my_sector = 0x4020040ul; /* Is Rlut */
-			int crc_okay = 0;
-			int is_to = 0;
-			int use_wq = 0;
-			int crce;
-
-			map_addr_calc(my_sector, &maddr);
-			is_to = !is_reverse_table_zone(megaz, &maddr);
-			crce = (maddr.mz_off & 0xFFFF) % 2048;
-			crc_pg_blk = get_meta_pg_crc(megaz, &maddr, is_to, use_wq);
-			if (!crc_pg_blk) {
-				Z_ERR(megaz->znd, "%s: Out of space for metadata?", __func__);
-				return -ENOSPC;
-			}
-
-			REF(crc_pg_blk->refcount);
-			if (crc_pg_blk->crc_pg[crce]) {
-				u64 lba = z_lookup(megaz, &maddr);
-
-                                if (!lba) {
-					lba = z_lookup_cache(megaz, &maddr);
-				}
-                                if (!lba) {
-					lba = locate_sector(megaz, &maddr);
-				}
-
-	if (!lba) {
-		struct map_pg *mapped;
-
-		mapped = sector_map_entry(megaz, &maddr);
-		if (mapped) {
-			if (mapped->mdata) {
-				u32 delta = mapped->mdata[maddr.offentry];
-				u64 phy = map_value(megaz, delta);
-
-				Z_ERR(megaz->znd, "%s: Delta %x", __func__, delta);
-				Z_ERR(megaz->znd, "%s: Phy %" PRIx64, __func__, phy);
-			} else {
-				Z_ERR(megaz->znd, "%s: No BLOCK", __func__);
-			}
-		} else {
-			Z_ERR(megaz->znd, "%s: No SME", __func__);
-		}
-	}
-
-
-				if (lba) {
-					int count = 1;
-					int rd;
-
-					Z_ERR(znd, "MZ# %u Mapping found for: "
-					      "%"  PRIx64 " -> %" PRIx64 " [is_to %d]",
-					      megaz->mega_nr, my_sector,  lba, is_to );
-
-
-					rd = read_block(megaz->znd->ti,
-							DM_IO_KMEM, data, lba,
-							count, use_wq);
-					if (rd) {
-						rc = rd;
-						Z_ERR(znd, "Integrity ERR: "
-						      "%" PRIx64 " on disk %" PRIx64
-						      " read err %d", my_sector,
-						      lba, rd);
-					} else {
-						u16 crc = crc_md_le16(data, Z_CRC_4K);
-						if (crc == crc_pg_blk->crc_pg[crce]) {
-							crc_okay = 1;
-						} else {
-							Z_ERR(znd, "Integrity ERR: "
-							      "%04x != %04x "
-							      "at lba %" PRIx64 " "
-							      "lmap %" PRIx64,
-							      crc,
-							      crc_pg_blk->crc_pg[crce],
-							      lba, maddr.dm_s);
-							rc = -EIO;
-						}
-
-					}
-				} else {
-					Z_ERR(znd, "MZ# %u PhyLBA Not found for: "
-					      "0x%"  PRIx64 " is_to %d",
-					      megaz->mega_nr, my_sector,  is_to );
-				}
-			}
-			DEREF(crc_pg_blk->refcount);
-			(void)crc_okay;
-		}
-	}
-
-	ZDM_FREE(znd, data, Z_C4K, PG_09);
-
-	return rc;
-}
-
-
-/**
- * An initial 'check' and 'repair' ZDM metadata ...
- */
-int my_meta_integrity_test(struct megazone * megaz)
-{
-	int rc = 0;
-	u32 z_used = Z_BLKSZ;
-	u64 entry;
-	u64 s_base = 0x20000 + (megaz->mega_nr * Z_BLKSZ * 1024);
-
-	u32 *data = ZDM_ALLOC(megaz->znd, Z_C4K, PG_09);
-	if (!data)
-		return -ENOMEM;
-
-#if EXTRA_DEBUG
-	Z_ERR(megaz->znd, "MZ# %u integrity check in progress ..", megaz->mega_nr);
-#endif // EXTRA_DEBUG
-
-	for (entry = 0; entry < 0x20000; entry++) {
-		int crc_okay = 0;
-		int z_id = entry / 64;
-		int use_wq = 0;
-		int is_to;
-		int crce;
-		struct map_addr maddr;
-		struct crc_pg *crc_pg_blk;
-
-		map_addr_calc(s_base + entry, &maddr);
-		crce = (maddr.mz_off & 0xFFFF) % 2048;
-		is_to = !is_reverse_table_zone(megaz, &maddr);
-		crc_pg_blk = get_meta_pg_crc(megaz, &maddr, is_to, use_wq);
-		if (!crc_pg_blk) {
-			Z_ERR(megaz->znd, "%s: Out of space for metadata?", __func__);
-			return -ENOSPC;
-		}
-
-		if (!is_to) {
-			if (0 == (entry % 64)) {
-				z_used = Z_BLKSZ;
-			}
-		}
-
-		REF(crc_pg_blk->refcount);
-		if (crc_pg_blk->crc_pg[crce]) {
-			u64 lba = z_lookup(megaz, &maddr);
-			if (lba) {
-				int count = 1;
-				int rd;
-
-				rd = read_block(megaz->znd->ti,
-						DM_IO_KMEM, data, lba,
-						count, use_wq);
-				if (rd) {
-					rc = rd;
-					Z_ERR(megaz->znd, "Integrity ERR: "
-					      "%" PRIx64 " on disk %" PRIx64
-					      " read err %d", s_base + entry,
-					      lba, rd);
-				} else {
-					u16 crc = crc_md_le16(data, Z_CRC_4K);
-					if (crc == crc_pg_blk->crc_pg[crce]) {
-						crc_okay = 1;
-					} else {
-						Z_ERR(megaz->znd, "Integrity ERR: "
-						      "%04x != %04x "
-						      "at lba %" PRIx64 " "
-						      "lmap %" PRIx64,
-						      crc,
-						      crc_pg_blk->crc_pg[crce],
-						      lba, maddr.dm_s);
-						rc = -EIO;
-					}
-
-				}
-			} else {
-				Z_ERR(megaz->znd, "MZ# %u LBA Not found for: "
-				      "0x%" PRIx64 "+entry:%" PRIx64 " [%"
-				      PRIx64 "] is_to %d",
-				      megaz->mega_nr,
-				      s_base, entry, s_base + entry,
-				      is_to );
-			}
-
-			if (crc_okay && (!is_to)) {
-				int off;
-
-				if (0 == (entry % 64)) {
-					z_used = Z_BLKSZ;
-				}
-
-				for (off = 0; off < 1024; off++) {
-					u64 ORlba =
-					    (megaz->mega_nr * Z_BLKSZ * 1024)
-					    + (z_id * Z_BLKSZ)
-					    + ((entry % 64) * 1024)
-					    + off;
-
-					u32 enc = data[off];
-					if (enc == MZTEV_UNUSED) {
-						z_used--;
-					} else {
-						u64 dm_s =
-						    map_value(megaz, enc);
-						if (dm_s <
-						    megaz->znd->nr_blocks) {
-							struct map_pg *Smap;
-							struct map_addr Saddr;
-							map_addr_calc(dm_s,
-								      &Saddr);
-							Smap =
-							    sector_map_entry
-							    (megaz, &Saddr);
-							if (Smap && Smap->mdata) {
-								Z_DBG(megaz->znd, "lba: %"
-								     PRIx64
-								     " okay",
-								     ORlba);
-							} else {
-								Z_ERR(megaz->znd, "lba: %"
-								      PRIx64
-								      " ERROR",
-								      ORlba);
-							}
-						} else {
-							Z_ERR(megaz->znd,
-							      "Invalid rmap entry: %x.",
-							      enc);
-						}
-						BUG_ON(dm_s >=
-						       megaz->znd->nr_blocks);
-					}
-				}
-			}
-		}
-		DEREF(crc_pg_blk->refcount);
-
-		if (!is_to) {
-			if (63 == (entry % 64)) {
-				// update zone unused count
-				if (0 ==
-				    (megaz->z_ptrs[z_id] & Z_WP_FLAGS_MASK)) {
-					megaz->zfree_count[z_id] =
-					    Z_BLKSZ - z_used;
-				}
-			}
-		}
-	}
-
-	ZDM_FREE(megaz->znd, data, Z_C4K, PG_09);
-	return rc;
-}
-
-
-
 
 /* -------------------------------------------------------------------------- */
 /* -------------------------------------------------------------------------- */
@@ -627,7 +353,7 @@ int __btf(struct megazone * megaz, struct map_pg *mapped, u64 b_lba, int is_to)
 				continue;
 			}
 
-			map_addr_calc(lba, &maddr);
+			map_addr_calc(megaz->znd, lba, &maddr);
 			lba_addr = !is_to ? maddr.lut_s : maddr.lut_r;
 			lba_map = get_map_table_entry(megaz, lba_addr, !is_to);
 			if (lba_map && lba_map->mdata) {
@@ -890,7 +616,7 @@ int zdm_check_and_repair(struct zoned * znd)
 
 	printf("Loading MZ ");
 	fflush(stdout);
-	for (mz = 0; mz < znd->mega_zones_count; mz++) {
+	for (mz = 0; mz < znd->mz_count; mz++) {
 		printf("%"PRIu64".", mz);
 		fflush(stdout);
 
@@ -904,7 +630,7 @@ int zdm_check_and_repair(struct zoned * znd)
 	printf("done.\nZDM Check ");
 	fflush(stdout);
 
-	for (mz = 0; mz < znd->mega_zones_count; mz++) {
+	for (mz = 0; mz < znd->mz_count; mz++) {
 		printf("%"PRIu64".", mz);
 		fflush(stdout);
 
@@ -916,8 +642,6 @@ int zdm_check_and_repair(struct zoned * znd)
 	}
 
 	if (all_good) {
-		int do_tables = 1;
-
 		printf("Write clean SB\n");
 		if (znd->z_superblock) {
 			struct mz_superkey *key_blk = znd->z_superblock;
@@ -928,8 +652,8 @@ int zdm_check_and_repair(struct zoned * znd)
 		}
 		printf("Sync ... SB\n");
 
-		for (mz = 0; mz < znd->mega_zones_count; mz++) {
-			zdm_sync(&znd->z_mega[mz], do_tables);
+		for (mz = 0; mz < znd->mz_count; mz++) {
+			zdm_sync(&znd->z_mega[mz]);
 		}
 	}
 
@@ -949,7 +673,7 @@ int my_alt_test(struct zoned * znd, int verbose)
 	for (dm_s = 0x20000; dm_s < 0x60000; dm_s++) {
 		struct map_addr maddr;
 
-		zdm_map_addr(dm_s, &maddr);
+		zdm_map_addr(znd, dm_s, &maddr);
 		lba = zdm_lookup(megaz, &maddr);
 		if (lba && verbose) {
 			fprintf(stderr, "%"PRIx64" -> %"PRIx64"\n", dm_s, lba);
@@ -984,19 +708,11 @@ int zdm_metadata_check(struct zoned * znd)
 	printf("Magic   : %"PRIx64"\n",   le64_to_cpu(sblock->magic) );
 	printf("Version : %08x\n", le32_to_cpu(sblock->version) );
 	printf("N# Zones: %d\n",   le32_to_cpu(sblock->nr_zones) );
-	printf("First Zn: %"PRIx64"\n",   le64_to_cpu(sblock->first_zone) );
+	printf("First Zn: %"PRIx64"\n",   le64_to_cpu(sblock->zdstart) );
 	printf("Flags   : %08x\n", le32_to_cpu(sblock->flags) );
-	printf("          %s %s\n",
-			zdm_sb_test_flag(sblock, SB_DIRTY) ? "dirty" : "clean",
-			zdm_sb_test_flag(sblock, SB_Z0_RESERVED) ? "no Z0" : "open"
-			 );
+	printf("          %s\n", zdm_sb_test_flag(sblock, SB_DIRTY) ? "dirty" : "clean");
 
-	znd->first_zone  = le64_to_cpu(sblock->first_zone);
-	if (zdm_sb_test_flag(sblock, SB_Z0_RESERVED) && ! znd->preserve_z0) {
-		znd->preserve_z0 = zdm_sb_test_flag(sblock, SB_Z0_RESERVED);
-		printf("TODO: Must re-read sb checking for "
-		             "highest gen between Z1/Z2.\n");
-	}
+	znd->zdstart  = le64_to_cpu(sblock->zdstart);
 	return rcode;
 
 }
@@ -1127,6 +843,24 @@ static inline int is_conv_or_relaxed(unsigned int type)
 	return (type == 1 || type == 3) ? 1 : 0;
 }
 
+/* assuming 4k sectors aka ssize < 16TB */
+static int minimums(u64 ssize, u64 zonesz, u64 *mzc, u64 * cache, u64 * min, u64 * pref)
+{
+	u64 zonesz_4k   = zonesz / 8;
+	u64 full_zones  = ssize / zonesz;
+	u64 blks        = full_zones * zonesz_4k;
+	u64 cache_syncs = MAX_CACHE_INCR * CACHE_COPIES * MAX_MZ_SUPP;
+	u64 lut_blocks  = blks / 1024;
+	u64 lut_zones   = (lut_blocks + zonesz_4k - 1) / zonesz_4k;
+
+	*mzc = lut_zones;
+	*cache = cache_syncs;
+	*min = lut_zones + 1;
+	*pref = (lut_zones * 2) + 2; /* cache(1) + fwd(N) + rev(N) + crcs(1) */
+
+	return 0;
+}
+
 int zdmadm_probe_zones(int fd, zdm_super_block_t * sblk)
 {
 	int rcode = 0;
@@ -1142,33 +876,205 @@ int zdmadm_probe_zones(int fd, zdm_super_block_t * sblk)
 		if (rcode < 0) {
 			printf("report zones failure: %d\n", rcode);
 		} else  {
+			int zone = 0;
 			struct bdev_zone_report_result_t * info = &report->data.out;
-			struct bdev_zone_descriptor_entry_t * entry = &info->descriptors[0];
-
+			struct bdev_zone_descriptor_entry_t * entry = &info->descriptors[zone];
 			int is_be = zdm_is_big_endian_report(info);
 			u64 fz_at = is_be ? be64toh(entry->lba_start) : entry->lba_start;
+			u64 fz_sz = is_be ? be64toh(entry->length) : entry->length;
 			unsigned int type = entry->type & 0xF;
+			u64 cache, need, pref;
+			u64 mdzcount = 0;
+			u64 nmegaz = 0;
 
-			if (lba != fz_at) {
-				printf("Partition is not on zone boundary .. unsupported.\n");
-				printf("Next zone lba is at sector: 0x%" PRIx64 ".\n",
-					fz_at );
-				rcode = -1;
-			}
-
+			minimums(sblk->sect_size, fz_sz, &nmegaz, &cache, &need, &pref);
 			if ( !is_conv_or_relaxed(type) ) {
 				printf("Unsupported device: ZDM first zone must be conventional"
 				       " or sequential-write preferred\n");
 				rcode = -1;
+				goto out;
 			}
+
+			while (sblk->sect_start >= fz_at) {
+				entry = &info->descriptors[++zone];
+				fz_at = is_be ? be64toh(entry->lba_start) : entry->lba_start;
+				fz_sz = is_be ? be64toh(entry->length) : entry->length;
+			}
+
+			if ( (fz_at - sblk->sect_start) > (cache * 8) ) {
+ 				printf("Using non-aligned space start of partition for metadata.\n");
+				mdzcount++;
+				zone++;
+			}
+
+			for (; mdzcount < pref && zone < 200; zone++) {
+				u64 length;
+
+				entry = &info->descriptors[zone];
+				length = is_be ? be64toh(entry->length) : entry->length;
+				type = entry->type & 0xF;
+
+				if ( !is_conv_or_relaxed(type) ) {
+					printf("Unsupported device: ZDM first zone must be conventional"
+					       " or sequential-write preferred\n");
+					rcode = -1;
+					goto out;
+				}
+				if ( length != fz_sz ) {
+					printf("Unsupported device: all zones must be same size"
+					       " excluding last zone on the drive!\n");
+					rcode = -1;
+					goto out;
+				}
+				mdzcount++;
+			}
+			sblk->data_start = zone;
+			sblk->zone_size = fz_sz;
 		}
-		free(report);
 	}
+out:
+	if (report)
+		free(report);
+
 	return rcode;
 }
 
+int zdmadm_initmd(int fd, zdm_super_block_t * sblk, int use_force, int verbose)
+{
+	struct io_4k_block *io_vcache = NULL;
+	void *data = NULL;
+	int locations;
+	int iter;
+	int err = 0;
+	int rc;
+	u64 pool_lba;
+	u64 cache, need, pref;
+	u64 fz_sz = 1 << 19; /* in 512 byte sectors */
+	u64 zone = ((sblk->sect_start + fz_sz - 1) / fz_sz);
+	u64 fz_at = zone * fz_sz;
+	u64 mdzcount = 0;
+	u64 mz_count;
+	u64 lba = LBA_SB_START;
+	unsigned long wchunk = (Z_C4K*IO_VCACHE_PAGES);
+
+	io_vcache = calloc(IO_VCACHE_PAGES, Z_C4K);
+	data = calloc(1, Z_C4K);
+	if (!data || !io_vcache) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	/* pass through conventional ... no ZAC/ZBC report to check */
+	minimums(sblk->sect_size, fz_sz, &mz_count, &cache, &need, &pref);
+
+	lba = LBA_SB_START;
+	memset(data, 0, Z_C4K);
+	locations = mz_count * CACHE_COPIES;
+
+	printf("ZDM: Initialize Metadata pool\n");
+	printf(" ... initializing cache blocks from %" PRIx64 " - %" 
+		PRIx64 "\n", lba, lba + (locations*MAX_CACHE_INCR) );
+	
+	for (iter = 0; iter < locations; iter++) {
+		rc = pwrite64(fd, data, Z_C4K, lba << 12);
+		if (rc != Z_C4K) {
+			fprintf(stderr, "write error: %d writing %"
+				PRIx64 "\n", rc, lba);
+			err = -1;
+			goto out;
+		}
+		lba += MAX_CACHE_INCR;
+	}
+
+	pool_lba = fz_sz >> 3;
+	if ( (fz_at - sblk->sect_start) > (cache << 3) ) {
+		/* number of blocks until next zone begins */
+		pool_lba = (fz_at - sblk->sect_start) >> 3;
+		mdzcount++;
+		printf(" ... used 0x%" PRIx64 " 4k blocks for"
+		       " zone-alignment\n", pool_lba);
+	}
+
+	printf(" ... clearing %" PRIu64 " pool zones from %" 
+		PRIx64 " - %" PRIx64 "\n",
+		pref - 2, pool_lba, pool_lba + ((pref - 2) << 16) );
+
+	memset(io_vcache, 0xFF, wchunk);
+	locations = (mz_count << 16) / IO_VCACHE_PAGES;
+	if ( (pref - mdzcount) <= sblk->data_start) {
+		locations *= 2;
+		if (verbose)
+			printf(" ... including reverse pool zones\n");
+	}
+
+	printf(" ... %d writes of %d 4k blocks [%ld bytes]\n",
+		locations, IO_VCACHE_PAGES, wchunk);
+
+	lba = pool_lba;
+	for (iter = 0; iter < locations; iter++) {
+		rc = pwrite64(fd, io_vcache, wchunk, lba << 12);
+		if (rc != wchunk) {
+			printf("%s: clear sb @ %" PRIx64
+			       " failed:  %d\b", __func__, lba, rc);
+		}
+		
+		if (0 == (iter % 256)) {
+			printf("    ... writing .. %" PRIx64 "\n", lba );
+		}
+		
+		lba += IO_VCACHE_PAGES;
+	}
+
+	if ( (pref - mdzcount) <= sblk->data_start) {
+		__le16 crc;
+		__le16 *crcs = data;
+
+		printf(" ... inititalize Meta CRCs %" PRIx64 " - %" PRIx64 "\n",
+			lba, lba + (0x40 * mz_count));
+
+		memset(data, 0xFF, Z_C4K);
+		crc = crc_md_le16(data, Z_CRC_4K);
+
+		if (verbose)
+			printf(" ... Initial MetaCRC %04x\n", le16_to_cpu(crc));
+		
+		/* make page of CRCs */
+		for (iter = 0; iter < 2048; iter++) {
+			crcs[iter] = crc;
+		}
+
+		/* make IO_VCACHE_PAGES of CRCs */
+		for (iter = 0; iter < IO_VCACHE_PAGES; iter++) {
+			memcpy(io_vcache[iter].data, crcs, Z_C4K);
+		}
+		
+		if (verbose)
+			printf(" ... Initial MetaMetaCRC %04x\n", 
+				le16_to_cpu(crc_md_le16(crcs, Z_CRC_4K)));
+
+		locations = dm_div_up((0x40 * mz_count), IO_VCACHE_PAGES);
+		for (iter = 0; iter < locations; iter++) {
+			rc = pwrite64(fd, io_vcache, wchunk, lba << 12);
+			if (rc != wchunk) {
+				printf("%s: clear sb @ %" PRIx64
+					" failed:  %d\n", __func__,
+				lba, rc);
+			}
+			lba += IO_VCACHE_PAGES;
+		}
+	}
+	printf("Metadata pool initialized.\n");
+out:
+
+	if (io_vcache) free(io_vcache);
+	if (data) free(data);
+
+	return err;
+}
+
+
 int zdmadm_create(const char *dname, char *zname_opt,
-		  int fd, zdm_super_block_t * sblock, int use_force, int verbose)
+		  int fd, zdm_super_block_t * sblk, int use_force, int verbose)
 {
 	int rc = 0;
 	off_t lba = 0ul;
@@ -1177,8 +1083,8 @@ int zdmadm_create(const char *dname, char *zname_opt,
 	char * zname;
 
 	if (zname_opt) {
-		snprintf(sblock->label, sizeof(sblock->label), "%s", zname_opt);
-		sblock->crc64 = zdm_crc64(sblock);
+		snprintf(sblk->label, sizeof(sblk->label), "%s", zname_opt);
+		sblk->crc64 = zdm_crc64(sblk);
 		zname = zname_opt;
 	} else {
 		zname = strrchr(dname, '/');
@@ -1198,8 +1104,11 @@ int zdmadm_create(const char *dname, char *zname_opt,
 		rc = -2;
 		goto out;
 	}
+
+	zdmadm_initmd(fd, sblk, use_force, verbose);
+	
 	memset(data, 0, Z_C4K);
-	memcpy(data, sblock, sizeof(*sblock));
+	memcpy(data, sblk, sizeof(*sblk));
 
 	rc = pwrite64(fd, data, Z_C4K, lba);
 	if (rc != Z_C4K) {
@@ -1208,20 +1117,23 @@ int zdmadm_create(const char *dname, char *zname_opt,
 		rc = -1;
 		goto out;
 	}
+	
+	fsync(fd);
+	close(fd);
 
 	snprintf(cmd, sizeof(cmd),
 		"dmsetup create \"zdm_%s\" "
 			"--table \"0 %" PRIu64 " zoned %s %"PRIu64
 			        " create %s %s %s %s reserve=%d\"",
 		zname,
-		sblock->zdm_blocks,
+		sblk->zdm_blocks,
 		dname,
-		sblock->sect_start >> 19,
+		sblk->data_start,
 		use_force ? "force" : "",
-		sblock->discard ? "discard" : "nodiscard",
-		sblock->zac_zbc & MEDIA_ZAC ? "zac" : "nozac",
-		sblock->zac_zbc & MEDIA_ZBC ? "zbc" : "nozbc",
-		sblock->mz_metadata_zones + sblock->mz_over_provision);
+		sblk->discard ? "discard" : "nodiscard",
+		sblk->zac_zbc & MEDIA_ZAC ? "zac" : "nozac",
+		sblk->zac_zbc & MEDIA_ZBC ? "zbc" : "nozbc",
+		sblk->mz_metadata_zones + sblk->mz_over_provision);
 	if (verbose) {
 		printf("%s\n", cmd);
 	}
@@ -1229,7 +1141,7 @@ int zdmadm_create(const char *dname, char *zname_opt,
 	if (rc != 0) {
 		printf("** ERROR: Create ZDM instance failed: %d\n", rc);
 	}
-	zdmadm_show(dname, sblock);
+	zdmadm_show(dname, sblk);
 
 out:
 	if (data) {
@@ -1259,6 +1171,7 @@ int zdmadm_restore(const char *dname, int fd, zdm_super_block_t * sblock)
 		}
 	}
 
+	close(fd);
 
 	snprintf(cmd, sizeof(cmd),
 		"dmsetup create \"zdm_%s\" --table "
@@ -1267,7 +1180,7 @@ int zdmadm_restore(const char *dname, int fd, zdm_super_block_t * sblock)
 		zname,
 		sblock->zdm_blocks,
 		dname,
-		sblock->sect_start >> 19,
+		sblock->data_start,
 		sblock->discard ? "discard" : "nodiscard",
 		sblock->zac_zbc & MEDIA_ZAC ? "zac" : "nozac",
 		sblock->zac_zbc & MEDIA_ZBC ? "zbc" : "nozbc",
@@ -1390,14 +1303,64 @@ out:
 	return rc;
 }
 
+/* data sector (fs layer) -> mapper sector */
+/**
+ * s_nr is a logical sector that maps 1:1 to
+ * to the subset of the disk presented as a block device to
+ * an upper layer (typically a file-system or raid).
+ *
+ * read/write to this level are mapped onto dm_s
+ */
+static u64 map_onto_zdm(u64 prov, u64 zdstart, u64 s_nr)
+{
+#define LOW_CHUNK  ((0x400ul -  prov) << 16)
+#define EXPAND      (0x400ul          << 16)
 
-static void calculate_zdm_blocks(zdm_super_block_t * sblk)
+	u64 dm_s = 0;
+	u64 s = s_nr;
+	u64 mz0_Size = LOW_CHUNK;
+
+	if (s < mz0_Size) {
+		dm_s = s;
+	} else {
+		u64 jno;
+		u64 joff;
+
+		s -= mz0_Size;
+		jno = s / LOW_CHUNK;
+		joff = s - (jno * LOW_CHUNK);
+		jno++;
+		dm_s = (jno * EXPAND) + joff;
+	}
+	dm_s += zdstart << 16;
+
+	return dm_s;
+}
+
+static void calculate_zdm_blocks(zdm_super_block_t * sblk, int verbose)
 {
 	u64 mz_resv      = sblk->mz_metadata_zones + sblk->mz_over_provision;
 	u64 zone_count   = sblk->sect_size >> 19;
 	u64 megaz_count  = (zone_count + 1023) >> 10;
 	u64 zdm_reserved = mz_resv * megaz_count;
-	sblk->zdm_blocks = (zone_count << 19) - (zdm_reserved << 19);
+	u64 blocks       = (zone_count - zdm_reserved) << 19;
+	u64 part_sz      = (sblk->sect_size / 0x80000) * 0x80000;
+
+	if (sblk->data_start > 0) {
+		blocks -= (sblk->data_start - 1) << 19;
+		if (verbose)
+			printf("Reserved zones %"PRIu64" for metadata\n",
+				sblk->data_start - 1);
+	}
+	sblk->zdm_blocks = blocks;
+
+	map_onto_zdm(mz_resv, sblk->data_start, (blocks/8) - 1);
+
+	if (verbose)
+		printf("%" PRIu64 " blocks on ZDM - %"
+			   PRIu64" blocks on part\n",
+			sblk->zdm_blocks / 8,  (part_sz / 8) );
+
 }
 
 int zdmadm_probe_default(const char * dname, int fd, zdm_super_block_t * sblk,
@@ -1424,14 +1387,14 @@ int zdmadm_probe_default(const char * dname, int fd, zdm_super_block_t * sblk,
 		exCode = 1;
 		goto out;
 	}
-	sblk->sect_start = start;
+	sblk->sect_start = start; /* in 512 byte sectors */
 
 	if (blkdev_get_size(fd, &sz) < 0) {
 		printf("Failed to determine partition size!!\n");
 		exCode = 2;
 		goto out;
 	}
-	sblk->sect_size = sz >> 9;
+	sblk->sect_size = sz >> 9; /* in 512 byte sectors */
 
 	if (zaczbc_probe_media(fd, sblk, verbose) < 0) {
 		exCode = 3;
@@ -1442,8 +1405,6 @@ int zdmadm_probe_default(const char * dname, int fd, zdm_super_block_t * sblk,
 			sblk->sect_start, sblk->sect_size);
 	}
 
-	calculate_zdm_blocks(sblk);
-
 	if (sblk->zac_zbc) {
 		/* test 'size' for sanity */
 		if (zdmadm_probe_zones(fd, sblk) < 0) {
@@ -1451,9 +1412,26 @@ int zdmadm_probe_default(const char * dname, int fd, zdm_super_block_t * sblk,
 			goto out;
 		}
 	} else {
-		/* pass through conventional ... no checks */
-	}
+		u64 cache, need, pref;
+		u64 fz_sz = 0x80000;
+		u64 zone = ((sblk->sect_start + fz_sz - 1) / fz_sz);
+		u64 fz_at = zone * fz_sz;
+		u64 mdzcount = 0;
+		u64 nmegaz = 0;
 
+		/* pass through conventional ... no ZAC/ZBC report to check */
+		minimums(sblk->sect_size, fz_sz, &nmegaz, &cache, &need, &pref);
+
+		if ( (fz_at - sblk->sect_start) > (cache * 8) ) {
+			mdzcount++;
+			printf("Using non-aligned space start of partition for metadata.\n");
+		}
+		zone += (pref - mdzcount);
+
+		sblk->zone_size = fz_sz;
+		sblk->data_start = zone;
+	}
+	calculate_zdm_blocks(sblk, verbose);
 	sblk->crc64 = zdm_crc64(sblk);
 
 out:
@@ -1627,6 +1605,9 @@ int main(int argc, char *argv[])
 					exCode = 1;
 					goto out;
 				}
+				
+				/* does a lot of writing to fd and closes before
+				 * starting ZDM instance */
 				exCode = zdmadm_create(dname, label, fd, &sblk_def,
 							use_force, verbose);
 				if (exCode < 0) {
@@ -1640,6 +1621,10 @@ int main(int argc, char *argv[])
 					printf("ZDM No found. Nothing to restore.\n");
 					goto next;
 				}
+
+				/* closes fd before
+				 * starting ZDM instance */
+
 				exCode = zdmadm_restore(dname, fd, &sblk);
 				if (exCode < 0) {
 					printf("ZDM Restore failed.\n");

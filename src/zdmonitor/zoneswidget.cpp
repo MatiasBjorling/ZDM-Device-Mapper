@@ -1,20 +1,26 @@
-/**
- * ---------------------------------------------------------------------------------------------
- * Copyright (c) 2014 Honda R&D Americas, Inc.
- * All rights reserved.
+/*
+ * Visual Monitor for ZDM: Kernel Device Mapper
  *
- * No person may copy, distribute, publicly display, create derivative
- * works from or otherwise use or modify this software without first obtaining a license
- * from Honda R&D Americas, Inc.
+ * Copyright (C) 2015 Seagate Technology PLC
  *
- * To obtain a license, contact hsvl@hra.com
- * ---------------------------------------------------------------------------------------------
+ * Written by:
+ * Shaun Tancheff <shaun.tancheff@seagate.com>
+ *
+ * This file is licensed under  the terms of the GNU General Public
+ * License version 2. This program is licensed "as is" without any
+ * warranty of any kind, whether express or implied.
  */
 
 #include <QPainter>
 #include <QList>
 #include <QDebug>
 #include <cmath>
+
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <utypes.h>
+#include <libcrc.h>
 
 #include "zoneswidget.h"
 
@@ -24,7 +30,9 @@ ZonesWidget::ZonesWidget(QWidget *parent)
    m_fd(-1),
    m_count(0),
    m_zoom(-1),
-   m_zone_total(0ul)
+   m_zone_total(0ul),
+   m_playback(false),
+   m_record(NULL)
 {
 }
 
@@ -32,6 +40,8 @@ int ZonesWidget::setDevice(QString zdmDevice)
 {
     QByteArray ba = zdmDevice.toLocal8Bit();
     const char *device = ba.data();
+
+    struct stat m;
 
     if (m_fd != -1)
     {
@@ -41,10 +51,18 @@ int ZonesWidget::setDevice(QString zdmDevice)
         m_zone_total = 0ul;
         if (m_data) {
             delete[] m_data;
+
         }
+        if (m_record) {
+            free(m_record);
+        }
+        m_data = NULL;
+        m_record = NULL;
     }
     m_fd = ::open(device, O_RDWR);
     m_zdmDevice = zdmDevice;
+    ::fstat(m_fd, &m);
+    m_playback = S_ISREG(m.st_mode) ? true : false;
 
     return m_fd;
 }
@@ -64,51 +82,134 @@ void ZonesWidget::resizeEvent(QResizeEvent * event)
     (void) event;
 }
 
-int ZonesWidget::updateView(int zoom)
+int ZonesWidget::updatePlaybackView()
 {
     int err = 0;
-    int rcode = -1;
+    int64_t recsz;
+    off_t pos = lseek(m_fd, 0, SEEK_CUR);
+    uint32_t crc = 0;
 
-    m_zoom = zoom;
-    if (m_fd != -1)
+    if (!m_record)
     {
-        rcode = ioctl(m_fd, ZDM_IOC_MZCOUNT, 0);
-    }
+        struct zdm_record header;
 
-    if (rcode < 1)
-    {
-        qDebug("ERROR: ZDM_IOC_MZCOUNT -> %d [fd:%d]", rcode, m_fd);
-        err = -1;
-#if 1
-        m_count = 3;
-        if (!m_data)
+        int bytes = ::read(m_fd, &header, sizeof(header));
+        if (bytes != sizeof(header))
         {
-            m_data = new struct megazone_info[m_count];
-            memset(m_data, 0, sizeof(megazone_info) * m_count);
+            err = -1;
+            goto out;
         }
+        recsz = header.size;
 
-        for (int entry = 0; entry < m_count; entry++)
-        {
-            for (uint32_t val = 0; val < 1024; val++)
+        if (recsz > 0) {
+            qDebug("Size: %ld", recsz);
+            m_record = static_cast<struct zdm_record *>(malloc(recsz));
+            if (!m_record)
             {
-                m_data[entry].wps[val] = val * 64;
-                if (entry & 1) m_data[entry].wps[val] = 0x10000 - (val * 64);
-                m_data[entry].free[val] = 0x10000 - m_data[entry].wps[val];
-                if (entry & 1)
-                    m_data[entry].wps[val] |= 0x80 << 24;
-                else
-                    m_data[entry].wps[val] |= (val & 0xf8) << 24;
+                err = -1;
+                goto out;
             }
         }
-        m_data[2].wps[255] = ~0u;
-        m_data[2].wps[256] = ~0u;
-        m_data[2].wps[257] = ~0u;
 
-        m_zone_total = (1024 * m_count) - 768;
-        err = 0;
-#endif
+        lseek(m_fd, pos, SEEK_SET);
+        m_record->size = recsz;
     }
-    else
+
+    recsz = m_record->size;
+    qDebug("Read Size: %ld", recsz);
+
+    if (recsz != ::read(m_fd, m_record, recsz))
+    {
+        err = -1;
+        goto out;
+    }
+
+    crc = m_record->crc32;
+    m_record->crc32 = 0u;
+    m_record->crc32 = crc32c(~0u, m_record, m_record->size);
+
+    qDebug("CRC: %08x vs calc: %08x", crc, m_record->crc32);
+
+
+    /* bail on corrupt records (for now) */
+    if (crc != m_record->crc32 || recsz != m_record->size)
+    {
+        free(m_record);
+        m_record = NULL;
+
+        qDebug("Corrupt entry (bad CRC or record size)");
+
+        lseek(m_fd, pos, SEEK_SET);
+        err = -1;
+        goto out;
+    }
+
+    if (0ul == m_zone_total)
+    {
+        int last = m_record->mz_count - 1;
+
+        m_zone_total = last * 1024ul;
+        for (int entry = 0; entry < 1024; entry++)
+        {
+            uint32_t wp = m_record->data[last].wps[entry];
+            if (~0u == wp)
+            {
+                m_zone_total += entry;
+                break;
+            }
+        }
+        qDebug("MZ count: %d - total zones: %" PRIu64,
+               m_count, m_zone_total );
+    }
+    m_count = m_record->mz_count;
+
+out:
+    return err;
+}
+
+int ZonesWidget::updateFakeDemoView()
+{
+    int err = -1;
+
+#if 1
+    qDebug("ERROR: Displaying FakeDemo Display");
+    m_count = 3;
+    if (!m_data)
+    {
+        m_data = new struct megazone_info[m_count];
+        memset(m_data, 0, sizeof(megazone_info) * m_count);
+    }
+
+    for (int entry = 0; entry < m_count; entry++)
+    {
+        for (uint32_t val = 0; val < 1024; val++)
+        {
+            m_data[entry].wps[val] = val * 64;
+            if (entry & 1) m_data[entry].wps[val] = 0x10000 - (val * 64);
+            m_data[entry].free[val] = 0x10000 - m_data[entry].wps[val];
+            if (entry & 1)
+                m_data[entry].wps[val] |= 0x80 << 24;
+            else
+                m_data[entry].wps[val] |= (val & 0xf8) << 24;
+        }
+    }
+    m_data[2].wps[255] = ~0u;
+    m_data[2].wps[256] = ~0u;
+    m_data[2].wps[257] = ~0u;
+
+    m_zone_total = (1024 * m_count) - 768;
+    err = 0;
+#endif
+
+    return err;
+}
+
+int ZonesWidget::updateLiveDeviceView()
+{
+    int err = -1;
+    int rcode = ioctl(m_fd, ZDM_IOC_MZCOUNT, 0);
+
+    if (rcode > 0)
     {
         m_count = rcode;
 
@@ -134,24 +235,23 @@ int ZonesWidget::updateView(int zoom)
             if (rcode < 0)
             {
                 qDebug("ERROR: ZDM_IOC_WPS -> %d", rcode);
-                err = -1;
                 break;
             }
             rcode = ioctl(m_fd, ZDM_IOC_FREE, req_free);
             if (rcode < 0)
             {
                 printf("ERROR: %d\n", rcode);
-                err = -1;
                 break;
             }
             rcode = ioctl(m_fd, ZDM_IOC_STATUS, req_status);
             if (rcode < 0)
             {
                 qDebug("ERROR: ZDM_IOC_STATUS -> %d", rcode);
-                err = -1;
                 break;
             }
         }
+
+        err = rcode;
 
         if (0ul == m_zone_total)
         {
@@ -171,6 +271,29 @@ int ZonesWidget::updateView(int zoom)
                    m_count, m_zone_total );
         }
     }
+    return err;
+}
+
+int ZonesWidget::updateView(int zoom)
+{
+    int err = 0;
+    int rcode = -1;
+
+    m_zoom = zoom;
+
+    if (m_fd == -1)
+    {
+        err = updateFakeDemoView();
+    }
+    else if (m_playback)
+    {
+        err = updatePlaybackView();
+    }
+    else
+    {
+        err = updateLiveDeviceView();
+    }
+
     if (!err)
     {
         this->update();
@@ -233,7 +356,9 @@ void ZonesWidget::doDrawZones(QPainter& painter, QRect& area)
     }
 //    qDebug("c_max: %" PRIu64 ", columns: %d, h_needed: %d, row_h: %d", c_max, columns, h_needed, row_h );
 
-    int entry = (0 == mzone) ? 1 : 0;
+    int entry = 0; // (0 == mzone) ? 1 : 0;
+
+    struct megazone_info * draw = getMZData();
 
     for (int row = 2; row < height && mzone < last_mzone; row += row_h)
     {
@@ -246,8 +371,8 @@ void ZonesWidget::doDrawZones(QPainter& painter, QRect& area)
             }
             if (mzone < last_mzone)
             {
-                uint32_t wp = m_data[mzone].wps[entry];
-                uint32_t fr = m_data[mzone].free[entry];
+                uint32_t wp = draw[mzone].wps[entry];
+                uint32_t fr = draw[mzone].free[entry];
 
                 if (~0u == wp)
                 {

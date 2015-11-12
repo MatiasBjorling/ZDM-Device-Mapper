@@ -1,14 +1,14 @@
-/**
- * ---------------------------------------------------------------------------------------------
- * Copyright (c) 2014 Honda R&D Americas, Inc.
- * All rights reserved.
+/*
+ * Visual Monitor for ZDM: Kernel Device Mapper
  *
- * No person may copy, distribute, publicly display, create derivative
- * works from or otherwise use or modify this software without first obtaining a license
- * from Honda R&D Americas, Inc.
+ * Copyright (C) 2015 Seagate Technology PLC
  *
- * To obtain a license, contact hsvl@hra.com
- * ---------------------------------------------------------------------------------------------
+ * Written by:
+ * Shaun Tancheff <shaun.tancheff@seagate.com>
+ *
+ * This file is licensed under  the terms of the GNU General Public
+ * License version 2. This program is licensed "as is" without any
+ * warranty of any kind, whether express or implied.
  */
 
 #ifndef _ZONESWIDGET_H_
@@ -54,55 +54,7 @@
 #include <sys/mman.h>
 #include <sys/time.h>
 
-
-// request an info dump from ZDM:
-#define ZDM_IOC_MZCOUNT          0x5a4e0001
-#define ZDM_IOC_WPS              0x5a4e0002
-#define ZDM_IOC_FREE             0x5a4e0003
-#define ZDM_IOC_STATUS           0x5a4e0004
-
-#define Z_WP_GC_FULL            (1u << 31)
-#define Z_WP_GC_ACTIVE          (1u << 30)
-#define Z_WP_GC_TARGET          (1u << 29)
-#define Z_WP_GC_READY           (1u << 28)
-#define Z_WP_NON_SEQ            (1u << 27)
-
-
-/**
- */
-struct zdm_ioc_status {
-	uint64_t b_used;
-	uint64_t b_available;
-	uint64_t b_discard;
-	uint64_t m_used;
-	uint64_t mc_entries;
-	uint64_t mlut_blocks;
-	uint64_t crc_blocks;
-	uint64_t inpool;
-	uint32_t bins[40];
-};
-
-/**
- */
-struct zdm_ioc_request {
-    uint32_t result_size;
-    uint32_t megazone_nr;
-};
-
-/**
- */
-union zdm_ioc_state {
-	struct zdm_ioc_request request;
-	struct zdm_ioc_status  status;
-};
-
-/**
- */
-struct megazone_info {
-        uint32_t wps[1024];
-        uint32_t free[1024];
-        union zdm_ioc_state state;
-};
+#include <zdmioctl.h>
 
 /**
  */
@@ -120,9 +72,13 @@ public:
     }
     struct megazone_info * getMZData(void)
     {
-	return m_data;
+        struct megazone_info * draw = m_data;
+        if (!draw && m_record) {
+            draw = m_record->data;
+        }
+	return draw;
     }
-    
+
 
     virtual QSize sizeHint();
     virtual QSize minimumSizeHint();
@@ -132,6 +88,9 @@ protected:
     virtual void paintEvent(QPaintEvent *e);
     void doPaint(QPaintEvent *e);
     void doDrawZones(QPainter& painter, QRect& area);
+    int updatePlaybackView();
+    int updateFakeDemoView();
+    int updateLiveDeviceView();
 
 private:
     QString m_zdmDevice;
@@ -141,6 +100,9 @@ private:
     int m_count;
     int m_zoom;
     uint64_t m_zone_total;
+
+    bool m_playback;
+    struct zdm_record *m_record;
 };
 
 #endif // _ZONESWIDGET_H_

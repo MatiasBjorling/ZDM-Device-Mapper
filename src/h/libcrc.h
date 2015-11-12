@@ -14,7 +14,15 @@
 
 #include "utypes.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 u16 crc16(u16 crc, const void *buffer, size_t len);
 u32 crc32c(u32 crc, const void *data, unsigned int length);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // _LIB_CRC_H_

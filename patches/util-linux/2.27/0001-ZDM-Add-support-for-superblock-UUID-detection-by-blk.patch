@@ -1,21 +1,27 @@
-From 86e84646c076bfc63d51383f5487029281e1f38e Mon Sep 17 00:00:00 2001
+From 52da02d91bf386832ce4272745ec47a85ceeb24b Mon Sep 17 00:00:00 2001
 From: Shaun Tancheff <shaun.tancheff@seagate.com>
-Date: Mon, 17 Aug 2015 19:23:10 -0500
-Subject: [PATCH 1/2] Initial support for ZDM.
+Date: Sat, 31 Oct 2015 15:25:06 -0500
+Subject: [PATCH] ZDM: Add support for superblock UUID detection by blkid
 
+    ZDM is a new device mapper that blkid isn't aware.
+    Adding support for ZDM will allow programs that use blkid for
+    detection (such as mount, ceph, LVM, etc) determine how to
+    configure the block device for use.
+
+Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
 ---
  libblkid/src/Makemodule.am             |  1 +
  libblkid/src/superblocks/superblocks.c |  1 +
  libblkid/src/superblocks/superblocks.h |  1 +
- libblkid/src/superblocks/zdm.c         | 89 ++++++++++++++++++++++++++++++++++
- 4 files changed, 92 insertions(+)
+ libblkid/src/superblocks/zdm.c         | 92 ++++++++++++++++++++++++++++++++++
+ 4 files changed, 95 insertions(+)
  create mode 100644 libblkid/src/superblocks/zdm.c
 
 diff --git a/libblkid/src/Makemodule.am b/libblkid/src/Makemodule.am
-index 7682958..aaeaa05 100644
+index 52d0b0a..ef3d18a 100644
 --- a/libblkid/src/Makemodule.am
 +++ b/libblkid/src/Makemodule.am
-@@ -92,6 +92,7 @@ libblkid_la_SOURCES = \
+@@ -93,6 +93,7 @@ libblkid_la_SOURCES = \
  	libblkid/src/superblocks/vmfs.c \
  	libblkid/src/superblocks/vxfs.c \
  	libblkid/src/superblocks/xfs.c \
@@ -24,7 +30,7 @@ index 7682958..aaeaa05 100644
  	\
  	libblkid/src/topology/topology.c \
 diff --git a/libblkid/src/superblocks/superblocks.c b/libblkid/src/superblocks/superblocks.c
-index 334d673..8c129f5 100644
+index 0d970f1..abb3aaa 100644
 --- a/libblkid/src/superblocks/superblocks.c
 +++ b/libblkid/src/superblocks/superblocks.c
 @@ -102,6 +102,7 @@ static const struct blkid_idinfo *idinfos[] =
@@ -33,13 +39,13 @@ index 334d673..8c129f5 100644
  	&bcache_idinfo,
 +	&zdm_idinfo,
  	&drbd_idinfo,
+ 	&drbdmanage_idinfo,
  	&drbdproxy_datalog_idinfo,
- 	&lvm2_idinfo,
 diff --git a/libblkid/src/superblocks/superblocks.h b/libblkid/src/superblocks/superblocks.h
-index 238a9ff..fe97ccc 100644
+index 79dba1a..8df25ee 100644
 --- a/libblkid/src/superblocks/superblocks.h
 +++ b/libblkid/src/superblocks/superblocks.h
-@@ -74,6 +74,7 @@ extern const struct blkid_idinfo nilfs2_idinfo;
+@@ -75,6 +75,7 @@ extern const struct blkid_idinfo nilfs2_idinfo;
  extern const struct blkid_idinfo exfat_idinfo;
  extern const struct blkid_idinfo f2fs_idinfo;
  extern const struct blkid_idinfo bcache_idinfo;
@@ -49,10 +55,10 @@ index 238a9ff..fe97ccc 100644
   * superblock functions
 diff --git a/libblkid/src/superblocks/zdm.c b/libblkid/src/superblocks/zdm.c
 new file mode 100644
-index 0000000..a458cb4
+index 0000000..469301c
 --- /dev/null
 +++ b/libblkid/src/superblocks/zdm.c
-@@ -0,0 +1,89 @@
+@@ -0,0 +1,92 @@
 +/*
 + * Copyright (C) 2015 Shaun Tancheff <shaun@tancheff.com>
 + *
@@ -91,6 +97,9 @@ index 0000000..a458cb4
 +	u32 discard;     /* if discard support is enabled */
 +	u32 disk_type;   /* HA | HM */
 +	u32 zac_zbc;     /* if ZAC / ZBC is supported on backing device */
++	char label[64];
++	u64 data_start;  /* zone # of first *DATA* zone */
++	u64 zone_size;   /* zone size in 512 byte blocks */
 +};
 +typedef struct zdm_super_block zdm_super_block_t;
 +
@@ -143,5 +152,5 @@ index 0000000..a458cb4
 +	}
 +};
 -- 
-1.9.1
+2.6.2
 

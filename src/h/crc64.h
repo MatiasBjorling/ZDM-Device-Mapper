@@ -15,6 +15,14 @@
 #include <sys/types.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 extern uint64_t crc64(uint64_t seed, const unsigned char *data, size_t len);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

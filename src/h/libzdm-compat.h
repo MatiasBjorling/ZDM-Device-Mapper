@@ -15,6 +15,10 @@
 #ifndef _LIBZDM_COMPAT_H_
 #define _LIBZDM_COMPAT_H_
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define EXTRA_DEBUG              0
 
 #define MZ_MEMPOOL_SZ           64
@@ -115,10 +119,11 @@ void * _zdm_calloc(struct zoned * znd, size_t n, size_t sz, int code);
 
 #define sb_check(a) \
 	zdm_superblock_check( (a) )
-#define map_addr_calc(a, b) \
-	zdm_map_addr(a, b)
-#define do_sync_tables(a, b) \
-	zdm_sync_tables(a, b)
+#define map_addr_calc(a, b, c) \
+	zdm_map_addr(a, b, c)
+
+// #define do_sync_tables(a) zdm_sync_tables(a)
+
 #define sync_crc_pages(megaz) \
 	zdm_sync_crc_pages(megaz)
 #define unused_phy(a, b) \
@@ -131,8 +136,8 @@ void * _zdm_calloc(struct zoned * znd, size_t n, size_t sz, int code);
 	zdm_mapped_addmany(megaz, dm_s, lba, count)
 #define z_mapped_discard(megaz, dm_s, lba) \
 	zdm_mapped_discard(megaz, dm_s, lba)
-#define z_mapped_to_list(megaz, dm_s, lba, purge) \
-	zdm_mapped_to_list(megaz, dm_s, lba, purge)
+#define z_mapped_to_list(megaz, dm_s, lba) \
+	zdm_mapped_to_list(megaz, dm_s, lba)
 #define z_mapped_sync(megaz) \
 	zdm_mapped_sync(megaz)
 #define z_mapped_init(megaz) \
@@ -190,6 +195,11 @@ static inline struct zoned *get_znd(struct dm_target *ti)
 	zdm_locate_sector(megaz, maddr)
 #define load_page(megaz, mapped, lba, is_to) \
 	zdm_load_page(megaz, mapped, lba, is_to)
+
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _LIBZDM_COMPAT_H_ */
 

@@ -1,0 +1,240 @@
+diff --git a/src/ceph-disk b/src/ceph-disk
+index 4a48520..36be19e 100755
+--- a/src/ceph-disk
++++ b/src/ceph-disk
+@@ -81,6 +81,7 @@ JOURNAL_UUID =              '45b0969e-9b03-4f30-b4c6-b4b80ceff106'
+ DMCRYPT_JOURNAL_UUID =      '45b0969e-9b03-4f30-b4c6-5ec00ceff106'
+ DMCRYPT_LUKS_JOURNAL_UUID = '45b0969e-9b03-4f30-b4c6-35865ceff106'
+ OSD_UUID =                  '4fbd7e29-9d25-41b8-afd0-062c0ceff05d'
++ZDM_OSD_UUID =              '4fbd7e29-9d25-41b8-afd0-7ad6dceff05d'
+ DMCRYPT_OSD_UUID =          '4fbd7e29-9d25-41b8-afd0-5ec00ceff05d'
+ DMCRYPT_LUKS_OSD_UUID =     '4fbd7e29-9d25-41b8-afd0-35865ceff05d'
+ TOBE_UUID =                 '89c57f98-2fe5-4dc0-89c1-f3ad0ceff2be'
+@@ -887,6 +888,61 @@ def dmcrypt_unmap(
+         raise Error('unable to unmap device', _uuid, e)
+ 
+ 
++def zdm_load(dev):
++    zdmdev = None
++    fstype = None
++    try:
++        command_check_call(
++            [
++                '/home/shaun/bin/zdmadm',
++                '-r',
++                dev,
++            ],
++        )
++        
++        devname = dev
++        if devname[:5] == "/dev/":
++            devname = devname[5:] 
++        zdmdev = "/dev/mapper/zdm_%s" % (devname,)
++        fstype = detect_fstype(dev=zdmdev)
++    except subprocess.CalledProcessError as e:
++        raise Error(e)
++    return zdmdev, fstype
++
++
++def zdm_unmap(rawdev):
++    try:
++        command_check_call(
++            [
++                '/home/shaun/bin/zdmadm',
++                '-u',
++                rawdev,
++            ],
++        )
++    except subprocess.CalledProcessError as e:
++        raise Error(e)
++
++
++def zdm_init(rawdev):
++    zdmdev = None
++    try:
++        command_check_call(
++            [
++                '/home/shaun/bin/zdmadm',
++                '-F',
++                '-c',
++                rawdev,
++            ],
++        )
++        devname = rawdev
++        if devname[:5] == "/dev/":
++            devname = devname[5:] 
++        zdmdev = "/dev/mapper/zdm_%s" % (devname,)
++    except subprocess.CalledProcessError as e:
++        raise Error(e)
++    return zdmdev
++
++
+ def mount(
+     dev,
+     fstype,
+@@ -1363,7 +1419,8 @@ def prepare_dev(
+     journal_dmcrypt,
+     osd_dm_keypath,
+     cryptsetup_parameters,
+-    luks
++    luks,
++    zdm
+     ):
+     """
+     Prepare a data/journal combination to be used for an OSD.
+@@ -1383,18 +1440,43 @@ def prepare_dev(
+             ptype_osd = DMCRYPT_LUKS_OSD_UUID
+         else:
+             ptype_osd = DMCRYPT_OSD_UUID
++    elif zdm:
++        ptype_osd = ZDM_OSD_UUID
+ 
+     rawdev = None
++    zdmdev = None
+     if is_partition(data):
+         LOG.debug('OSD data device %s is a partition', data)
+         rawdev = data
+     else:
+         LOG.debug('Creating osd partition on %s', data)
+         try:
++            part1 = '--largest-new=1'
++            if zdm:
++                LOG.debug('Creating aligned partition for ZDMADM on %s', data)
++                first_last, code = command(
++                    [
++                        'sgdisk',
++                        '--first-aligned-in-largest',
++                        '--end-of-largest',
++                        data,
++                    ],
++                )
++                if code == 0:
++                    sstart = int(first_last.split()[-2])
++                    slast = int(first_last.split()[-1])
++                    print "Staring sector %d." % sstart
++                    print "Ending sector %d [SLAST]." % slast
++                    slast = slast >> 11
++                    slast = slast * 2048
++                    send = slast - 1
++                    print "Ending aligned sector %d." % send
++                    part1 = '--new=1:%u:%u' % (sstart, send)
++            
+             command_check_call(
+                 [
+                     'sgdisk',
+-                    '--largest-new=1',
++                    part1,
+                     '--change-name=1:ceph data',
+                     '--partition-guid=1:{osd_uuid}'.format(
+                         osd_uuid=osd_uuid,
+@@ -1417,11 +1499,22 @@ def prepare_dev(
+ 
+         rawdev = get_partition_dev(data, 1)
+ 
++    if zdm:
++        LOG.debug('Creating osd ZDMADM on %s', data)
++        zdmdev = zdm_init(rawdev)
++
+     dev = None
++    dmcrypt_enabled = False
+     if osd_dm_keypath:
+-        dev = dmcrypt_map(rawdev, osd_dm_keypath, osd_uuid, cryptsetup_parameters, luks)
++        ondev = rawdev
++        if zdmdev:
++            ondev = zdmdev
++        dev = dmcrypt_map(ondev, osd_dm_keypath, osd_uuid, cryptsetup_parameters, luks)
++        dmcrypt_enabled = True
+     else:
+         dev = rawdev
++        if zdmdev:
++            dev = zdmdev
+ 
+     try:
+         args = [
+@@ -1463,8 +1556,10 @@ def prepare_dev(
+         finally:
+             unmount(path)
+     finally:
+-        if rawdev != dev:
++        if dmcrypt_enabled:
+             dmcrypt_unmap(osd_uuid)
++        if zdmdev:
++            zdm_unmap(rawdev)
+ 
+     if not is_partition(data):
+         try:
+@@ -1671,7 +1766,8 @@ def main_prepare(args):
+                 journal_dmcrypt=journal_dmcrypt,
+                 osd_dm_keypath=osd_dm_keypath,
+                 cryptsetup_parameters=cryptsetup_parameters,
+-                luks=luks
++                luks=luks,
++                zdm=args.zdm,
+                 )
+         else:
+             raise Error('not a dir or block device', args.data)
+@@ -1925,6 +2021,9 @@ def mount_activate(
+             e,
+             )
+ 
++    if fstype == "zdm":
++        dev, fstype = zdm_load(dev=dev)
++
+     # TODO always using mount options from cluster=ceph for
+     # now; see http://tracker.newdream.net/issues/3253
+     mount_options = get_conf(
+@@ -2284,13 +2383,18 @@ def main_activate_all(args):
+             continue
+         (tag, uuid) = name.split('.')
+ 
+-        if tag == OSD_UUID or tag == DMCRYPT_OSD_UUID or tag == DMCRYPT_LUKS_OSD_UUID:
++        if tag in (OSD_UUID, ZDM_OSD_UUID, DMCRYPT_OSD_UUID, DMCRYPT_LUKS_OSD_UUID):
+ 
+             if tag == DMCRYPT_OSD_UUID or tag == DMCRYPT_LUKS_OSD_UUID:
+                 path = os.path.join('/dev/mapper', uuid)
+             else:
+                 path = os.path.join(dir, name)
+ 
++            if tag == ZDM_OSD_UUID:
++                print("**FIXME** ZDM:", dir, uuid, name)
++                
++
++
+             LOG.info('Activating %s', path)
+             activate_lock.acquire()  # noqa
+             try:
+@@ -2507,6 +2611,16 @@ def list_dev(dev, uuid_map, journal_map):
+             desc = ['ceph data'] + desc
+         else:
+             desc = ['ceph data', 'unprepared']
++    elif ptype == ZDM_OSD_UUID:
++        holders = is_held(dev)
++        if not holders:
++            desc = ['ceph data (zdm)', 'not currently mapped']
++        elif len(holders) == 1:
++            holder = '/dev/' + holders[0]
++            fs_desc = list_dev_osd(holder, uuid_map)
++            desc = ['ceph data (zdm %s)' % holder] + fs_desc
++        else:
++            desc = ['ceph data (zdm)', 'holders: ' + ','.join(holders)]
+     elif ptype == DMCRYPT_OSD_UUID:
+         holders = is_held(dev)
+         if not holders:
+@@ -2809,6 +2923,11 @@ def parse_args():
+         help='verify that JOURNAL is a block device',
+         )
+     prepare_parser.add_argument(
++        '--zdm',
++        action='store_true', default=None,
++        help='use ZDM on disk partition before other DM or FS',
++        )
++    prepare_parser.add_argument(
+         '--dmcrypt',
+         action='store_true', default=None,
+         help='encrypt DATA and/or JOURNAL devices with dm-crypt',
+diff --git a/src/erasure-code/jerasure/jerasure b/src/erasure-code/jerasure/jerasure
+--- a/src/erasure-code/jerasure/jerasure
++++ b/src/erasure-code/jerasure/jerasure
+@@ -1 +1 @@
+-Subproject commit 02731df4c1eae1819c4453c9d3ab6d408cadd085
++Subproject commit 02731df4c1eae1819c4453c9d3ab6d408cadd085-dirty

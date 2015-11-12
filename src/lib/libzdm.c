@@ -132,7 +132,7 @@ void * _zdm_calloc(struct zoned * znd, size_t n, size_t sz, int code)
 
 int zdm_is_reverse_table_zone(struct megazone * megaz, struct map_addr * maddr)
 {
-	return is_reverse_table_zone(megaz, maddr);
+	return is_revmap(megaz, maddr);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -157,7 +157,7 @@ int zdm_zone_ctrl(struct megazone * megaz, u64 z_id, int command_id)
 	int fd = megaz->znd->ti->fd;
 
 	if (megaz->znd->zinqtype == Z_TYPE_SMR_HA) {
-		u64 mapped_zoned = z_id + megaz->znd->first_zone;
+		u64 mapped_zoned = z_id + megaz->znd->zdstart;
 		u64 lba = Z_BLKSZ * ((megaz->mega_nr * 1024) + mapped_zoned);
 		u64 s_addr = lba * Z_BLOCKS_PER_DM_SECTOR;
 		int do_ata = megaz->znd->ata_passthrough;
@@ -251,15 +251,22 @@ struct zoned * zoned_alloc(int fd, char * name)
 		znd->ti->fd = fd;
 		znd->ti->private = znd;
 		znd->nr_blocks = nbytes / 4096;
-		znd->device_zone_count = znd->nr_blocks / Z_BLKSZ;
 
-		mzcount   = dm_div_up(znd->device_zone_count, MAX_ZONES_PER_MZ);
-		remainder = znd->device_zone_count % MAX_ZONES_PER_MZ;
+
+/* MUST do report zones against parition start to determine zdstart !! */
+
+		znd->data_zones = (znd->nr_blocks >> Z_BLKBITS) - znd->zdstart;
+		znd->mz_count = znd->nr_blocks / Z_BLKSZ;
+
+/* FIXME: zones, data_zones, mz_count et. all */
+
+		mzcount   = dm_div_up(znd->data_zones, MAX_ZONES_PER_MZ);
+		remainder = znd->data_zones % MAX_ZONES_PER_MZ;
 		if ( 0 < remainder && remainder < 5 ) {
 			DMERR("Final MZ contains too few zones!\n");
 			mzcount--;
 		}
-		znd->mega_zones_count = mzcount;
+		znd->mz_count = mzcount;
 
 		znd->gc_io_buf = vmalloc(GC_MAX_STRIPE * Z_C4K);
 		znd->io_wq = create_singlethread_workqueue("kzoned");
@@ -378,14 +385,14 @@ int zdm_map_onto_zdm(struct zoned *znd, u64 sector_nr, struct map_addr * out)
 	return map_addr_to_zdm(znd, sector_nr, out);
 }
 
-int zdm_map_addr(u64 dm_s, struct map_addr * out)
+int zdm_map_addr(struct zoned * znd, u64 dm_s, struct map_addr * out)
 {
-	return map_addr_calc(dm_s, out);
+	return map_addr_calc(znd, dm_s, out);
 }
 
-int zdm_sync_tables(struct megazone * megaz, int need_table_push)
+int zdm_sync_tables(struct megazone * megaz)
 {
-	return do_sync_tables(megaz, need_table_push);
+	return do_sync_metadata(megaz);
 }
 
 int zdm_sync_crc_pages(struct megazone * megaz)
@@ -398,10 +405,10 @@ int zdm_unused_phy(struct megazone * megaz, u64 block_nr, u64 orig)
 	return unused_phy(megaz, block_nr, orig);
 }
 
-int zdm_unused_addr(struct megazone * megaz, u64 dm_s)
-{
-	return unused_addr(megaz, dm_s);
-}
+// int zdm_unused_addr(struct megazone * megaz, u64 dm_s)
+// {
+// 	return unused_addr(megaz, dm_s);
+// }
 
 u64 zdm_lookup(struct megazone * megaz, struct map_addr * maddr)
 {
@@ -418,9 +425,9 @@ int zdm_mapped_discard(struct megazone * megaz, u64 dm_s, u64 lba)
 	return z_mapped_discard(megaz, dm_s, lba);
 }
 
-int zdm_mapped_to_list(struct megazone * megaz, u64 dm_s, u64 lba, int purge)
+int zdm_mapped_to_list(struct megazone * megaz, u64 dm_s, u64 lba)
 {
-	return z_mapped_to_list(megaz, dm_s, lba, purge);
+	return z_mapped_to_list(megaz, dm_s, lba);
 }
 
 int zdm_mapped_sync(struct megazone * megaz)
@@ -443,9 +450,9 @@ int zdm_release_table_pages(struct megazone * megaz)
 	return release_table_pages(megaz);
 }
 
-int zdm_sync(struct megazone * megaz, int do_tables)
+int zdm_sync(struct megazone * megaz)
 {
-	return do_SYNC(megaz, do_tables);
+	return _megaz_sync_to_disk(megaz);
 }
 
 u32 zdm_sb_crc32(struct zdm_superblock *sblock)
@@ -496,7 +503,7 @@ struct crc_pg *zdm_get_meta_pg_crc(struct megazone * megaz, struct map_addr * ma
 
 int zdm_free_unused(struct megazone * megaz, int allowed_pages)
 {
-	return fpages(megaz, allowed_pages);
+	return keep_active_pages(megaz, allowed_pages);
 }
 
 int zdm_mz_integrity_check(struct megazone * megaz)
@@ -564,7 +571,7 @@ int zdm_meta_test(struct zoned * znd)
 	int verbose = 1;
 	struct megazone * megaz = &znd->z_mega[mz];
 
-	for (mz = 0; mz < znd->mega_zones_count; mz++) {
+	for (mz = 0; mz < znd->mz_count; mz++) {
 		int err = zdm_mapped_init(&znd->z_mega[mz]);
 		if (err) {
 			printf("MZ #%"PRIu64" Init failed -> %d\n", mz, err);
@@ -580,7 +587,7 @@ int zdm_meta_test(struct zoned * znd)
 	for (dm_s = 0x20000; dm_s < 0x60000; dm_s++) {
 		struct map_addr maddr;
 
-		zdm_map_addr(dm_s, &maddr);
+		zdm_map_addr(znd, dm_s, &maddr);
 		lba = zdm_lookup(megaz, &maddr);
 		if (lba && verbose) {
 			fprintf(stderr, "%"PRIx64" -> %"PRIx64"\n", dm_s, lba);
@@ -615,20 +622,12 @@ int zdm_do_something(struct zoned * znd)
 	printf("Magic   : %"PRIx64"\n",   le64_to_cpu(sblock->magic) );
 	printf("Version : %08x\n", le32_to_cpu(sblock->version) );
 	printf("N# Zones: %d\n",   le32_to_cpu(sblock->nr_zones) );
-	printf("First Zn: %"PRIx64"\n",   le64_to_cpu(sblock->first_zone) );
+	printf("First Zn: %"PRIx64"\n",   le64_to_cpu(sblock->zdstart) );
 	printf("Flags   : %08x\n", le32_to_cpu(sblock->flags) );
-	printf("          %s %s\n",
-			zdm_sb_test_flag(sblock, SB_DIRTY) ? "dirty" : "clean",
-			zdm_sb_test_flag(sblock, SB_Z0_RESERVED) ? "no Z0" : "open"
-			 );
+	printf("          %s\n",
+	       zdm_sb_test_flag(sblock, SB_DIRTY) ? "dirty" : "clean");
 
-	znd->first_zone  = le64_to_cpu(sblock->first_zone);
-	if (zdm_sb_test_flag(sblock, SB_Z0_RESERVED) && ! znd->preserve_z0) {
-		znd->preserve_z0 = zdm_sb_test_flag(sblock, SB_Z0_RESERVED);
-		printf("TODO: Must re-read sb checking for "
-		             "highest gen between Z1/Z2.\n");
-	}
-
+	znd->zdstart  = le64_to_cpu(sblock->zdstart);
 	zdm_meta_test(znd);
 
 	return 0;

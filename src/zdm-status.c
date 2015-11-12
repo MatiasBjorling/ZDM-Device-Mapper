@@ -84,9 +84,9 @@ int do_show_megaz(int fd, int megaz, int sram)
 			int ii;
 
 			printf(" using %'" PRIu64
-				" bytes of RAM\n", status->inpool );
+				" bytes of RAM\n", status->memstat );
 			printf("   %'" PRIu64
-				" 4k blocks\n", (status->inpool + 4095)/4096 );
+				" 4k blocks\n", (status->memstat + 4095)/4096 );
 
 			for (ii = 0; ii < 40; ii++) {
 				if (status->bins[ii]) {
