@@ -12,7 +12,7 @@
  * warranty of any kind, whether express or implied.
  */
 
-#define BUILD_NO		96
+#define BUILD_NO		97
 
 #define EXTRA_DEBUG		0
 
@@ -3716,7 +3716,12 @@ static int gc_immediate(struct megazone *megaz)
 	struct zoned *znd = megaz->znd;
 	int queued;
 
-	atomic_inc(&megaz->znd->gc_throttle);
+	atomic_inc(&znd->gc_throttle);
+
+	if (znd->gc_throttle.counter > 1) {
+		Z_ERR(znd, " ... GC immediate .. in progress.");
+		goto out;
+	}
 
 	mutex_unlock(&megaz->mz_io_mutex);
 	flush_delayed_work(&znd->gc_work);
@@ -3736,7 +3741,7 @@ static int gc_immediate(struct megazone *megaz)
 		Z_ERR(znd, " ... GC flushed.");
 
 out:
-	atomic_dec(&megaz->znd->gc_throttle);
+	atomic_dec(&znd->gc_throttle);
 
 	return can_retry;
 }

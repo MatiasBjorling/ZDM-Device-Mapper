@@ -1,4 +1,4 @@
-From 7273d631d8779d8217501b20d2f77d88efcf7053 Mon Sep 17 00:00:00 2001
+From afe703d6b0178eca75c80891cd7c80196dc442c6 Mon Sep 17 00:00:00 2001
 From: Shaun Tancheff <shaun@tancheff.com>
 Date: Thu, 12 Nov 2015 01:49:58 -0600
 Subject: [PATCH 4/5] Provide ioctl access for ZAC/ZBC commands.
@@ -27,7 +27,7 @@ Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
  5 files changed, 224 insertions(+)
 
 diff --git a/block/blk-zoned-ctrl.c b/block/blk-zoned-ctrl.c
-index 5f41ca7..b2f6e96 100644
+index a41bbb9..7e976f7 100644
 --- a/block/blk-zoned-ctrl.c
 +++ b/block/blk-zoned-ctrl.c
 @@ -469,3 +469,187 @@ int blk_zoned_reset_wp_ata(struct gendisk *disk, u64 start_lba)

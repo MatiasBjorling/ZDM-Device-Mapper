@@ -1,6 +1,6 @@
-From 834bc7b424929c0d44adca7ec243596e227164ff Mon Sep 17 00:00:00 2001
+From 59f0219e6471d72176fb8f850d8a42e13ff09479 Mon Sep 17 00:00:00 2001
 From: Shaun Tancheff <shaun@tancheff.com>
-Date: Thu, 12 Nov 2015 03:19:45 -0600
+Date: Sat, 14 Nov 2015 22:45:08 -0600
 Subject: [PATCH 5/5] ZDM: New DM target 'zoned'
 
     ZDM presents a traditional block device for ZBC/ZAC zone based
@@ -16,8 +16,8 @@ Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
  drivers/md/Makefile                   |    1 +
  drivers/md/dm-zoned.c                 | 1986 ++++++++++++
  drivers/md/dm-zoned.h                 |  626 ++++
- drivers/md/libzoned.c                 | 5436 +++++++++++++++++++++++++++++++++
- 7 files changed, 8144 insertions(+), 2 deletions(-)
+ drivers/md/libzoned.c                 | 5441 +++++++++++++++++++++++++++++++++
+ 7 files changed, 8149 insertions(+), 2 deletions(-)
  create mode 100644 Documentation/device-mapper/zoned.txt
  create mode 100644 drivers/md/dm-zoned.c
  create mode 100644 drivers/md/dm-zoned.h
@@ -2794,10 +2794,10 @@ index 0000000..2d97633
 +#endif /* _DM_ZONED_H */
 diff --git a/drivers/md/libzoned.c b/drivers/md/libzoned.c
 new file mode 100644
-index 0000000..523ea08
+index 0000000..44b0ecb
 --- /dev/null
 +++ b/drivers/md/libzoned.c
-@@ -0,0 +1,5436 @@
+@@ -0,0 +1,5441 @@
 +/*
 + * Kernel Device Mapper for abstracting ZAC/ZBC devices as normal
 + * block devices for linux file systems.
@@ -2812,7 +2812,7 @@ index 0000000..523ea08
 + * warranty of any kind, whether express or implied.
 + */
 +
-+#define BUILD_NO		96
++#define BUILD_NO		97
 +
 +#define EXTRA_DEBUG		0
 +
@@ -6516,7 +6516,12 @@ index 0000000..523ea08
 +	struct zoned *znd = megaz->znd;
 +	int queued;
 +
-+	atomic_inc(&megaz->znd->gc_throttle);
++	atomic_inc(&znd->gc_throttle);
++
++	if (znd->gc_throttle.counter > 1) {
++		Z_ERR(znd, " ... GC immediate .. in progress.");
++		goto out;
++	}
 +
 +	mutex_unlock(&megaz->mz_io_mutex);
 +	flush_delayed_work(&znd->gc_work);
@@ -6536,7 +6541,7 @@ index 0000000..523ea08
 +		Z_ERR(znd, " ... GC flushed.");
 +
 +out:
-+	atomic_dec(&megaz->znd->gc_throttle);
++	atomic_dec(&znd->gc_throttle);
 +
 +	return can_retry;
 +}

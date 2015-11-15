@@ -16,8 +16,8 @@ Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
  drivers/md/Makefile                   |    1 +
  drivers/md/dm-zoned.c                 | 2033 ++++++++++++
  drivers/md/dm-zoned.h                 |  626 ++++
- drivers/md/libzoned.c                 | 5436 +++++++++++++++++++++++++++++++++
- 7 files changed, 8191 insertions(+), 2 deletions(-)
+ drivers/md/libzoned.c                 | 5441 +++++++++++++++++++++++++++++++++
+ 7 files changed, 8196 insertions(+), 2 deletions(-)
  create mode 100644 Documentation/device-mapper/zoned.txt
  create mode 100644 drivers/md/dm-zoned.c
  create mode 100644 drivers/md/dm-zoned.h
@@ -2844,7 +2844,7 @@ new file mode 100644
 index 0000000..523ea08
 --- /dev/null
 +++ b/drivers/md/libzoned.c
-@@ -0,0 +1,5436 @@
+@@ -0,0 +1,5441 @@
 +/*
 + * Kernel Device Mapper for abstracting ZAC/ZBC devices as normal
 + * block devices for linux file systems.
@@ -2859,7 +2859,7 @@ index 0000000..523ea08
 + * warranty of any kind, whether express or implied.
 + */
 +
-+#define BUILD_NO		96
++#define BUILD_NO		97
 +
 +#define EXTRA_DEBUG		0
 +
@@ -6563,7 +6563,12 @@ index 0000000..523ea08
 +	struct zoned *znd = megaz->znd;
 +	int queued;
 +
-+	atomic_inc(&megaz->znd->gc_throttle);
++	atomic_inc(&znd->gc_throttle);
++
++	if (znd->gc_throttle.counter > 1) {
++		Z_ERR(znd, " ... GC immediate .. in progress.");
++		goto out;
++	}
 +
 +	mutex_unlock(&megaz->mz_io_mutex);
 +	flush_delayed_work(&znd->gc_work);
@@ -6583,7 +6588,7 @@ index 0000000..523ea08
 +		Z_ERR(znd, " ... GC flushed.");
 +
 +out:
-+	atomic_dec(&megaz->znd->gc_throttle);
++	atomic_dec(&znd->gc_throttle);
 +
 +	return can_retry;
 +}

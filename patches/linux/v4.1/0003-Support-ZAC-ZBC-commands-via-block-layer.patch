@@ -525,7 +525,7 @@ index 0000000..5f41ca7
 +		 sub_command, disk->disk_name, start_lba);
 +
 +	cmd[0] = ZAC_PASS_THROUGH16_OPCODE;
-+	cmd[1] = ata16byte1(0, ATA_PROT_NODATA, 1);
++	cmd[1] = ata16byte1(0, 3, 1);
 +	cmd[4] = sub_command; /* [feature] */
 +
 +	if (start_lba == ~0ul || start_lba == ~1ul)
