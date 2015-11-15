@@ -26,10 +26,10 @@ BE_QUIET=@
 endif
 
 ## Targets ##
-TARGETS		+= sd_report_zones
+TARGETS		+= sd_identify
 
 ## Source Files ##
-SOURCES		 = sd_report_zones
+SOURCES		 = sd_identify
 
 ## Output directory ##
 OBJECTS_DIR	 =
@@ -48,7 +48,7 @@ LIBS=
 
 all: $(TARGETS)
 
-sd_report_zones: sd_report_zones.o
+sd_identify: sd_identify.o
 	@echo "Linking $@"
 	$(BE_QUIET)$(LD) $(LFLAGS) -o $@ $^ $(LIBS)
 
@@ -60,9 +60,9 @@ sd_report_zones: sd_report_zones.o
 	@echo "Compiling $<"
 	$(BE_QUIET)$(CC) $(DEFINES) $(CFLAGS) $(INCPATH) -c $< -o $@
 
-test: sd_report_zones
+test: sd_identify
 	echo "Assumes /dev/sdm is an SMR drive."
-	./sd_report_zones 0 /dev/sdm
+	./sd_identify /dev/sdm
 
 check: test
 

@@ -1,3 +1,16 @@
+/*
+ * Linux Kernel ioctl tools for ZAC/ZBC devices.
+ *
+ * Copyright (C) 2015 Seagate Technology PLC
+ *
+ * Written by:
+ * Shaun Tancheff <shaun.tancheff@seagate.com>
+ *
+ * This file is licensed under  the terms of the GNU General Public
+ * License version 2. This program is licensed "as is" without any
+ * warranty of any kind, whether express or implied.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,13 +23,9 @@
 #include <linux/fs.h>
 #include <linux/blk-zoned-ctrl.h>
 
-/* Used for Zone based SMR devices */
-#define SCSI_IOCTL_INQUIRY		0x10000
-#define SCSI_IOCTL_CLOSE_ZONE		0x10001
-#define SCSI_IOCTL_FINISH_ZONE		0x10002
-#define SCSI_IOCTL_OPEN_ZONE		0x10003
-#define SCSI_IOCTL_RESET_WP		0x10004
-#define SCSI_IOCTL_REPORT_ZONES		0x10005
+#include "sdtools.h"
+
+#define PGM_NAME "sd_report_zones"
 
 const char * same_text[] = {
 	"all zones are different",
@@ -212,8 +221,11 @@ int do_report_zones_ioctl(const char * pathname, uint64_t lba, uint8_t ropt, int
 
 static void usage(void)
 {
+	printf(PGM_NAME " %d.%d\n",
+	       sdtools_VERSION_MAJOR, sdtools_VERSION_MINOR );
+
 	printf("Usage:\n");
-	printf("  sd_report_zones [-r opt] [ata] [<lba>] <device>\n");
+	printf("  " PGM_NAME " [-r opt] [ata] [<lba>] <device>\n");
 	printf("\nwhere:\n"
 	       "    opt is the numeric value from \"enum zone_report_option\".\n"
 	       "             0 - non seq. and reset (default)\n"
@@ -238,6 +250,8 @@ static void usage(void)
 	printf("     report zone information starting with lba 0, using scsi commands\n");
 	printf("\nNOTE: maximum report size is 8091 zones.\n\n");
 }
+
+
 
 /*
  *

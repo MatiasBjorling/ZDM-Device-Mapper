@@ -1,0 +1,3 @@
+
+#define zdm_VERSION_MAJOR @zdm_VERSION_MAJOR@
+#define zdm_VERSION_MINOR @zdm_VERSION_MINOR@

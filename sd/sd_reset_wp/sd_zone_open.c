@@ -1,3 +1,16 @@
+/*
+ * Linux Kernel ioctl tools for ZAC/ZBC devices.
+ *
+ * Copyright (C) 2015 Seagate Technology PLC
+ *
+ * Written by:
+ * Shaun Tancheff <shaun.tancheff@seagate.com>
+ *
+ * This file is licensed under  the terms of the GNU General Public
+ * License version 2. This program is licensed "as is" without any
+ * warranty of any kind, whether express or implied.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,8 +21,10 @@
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <linux/fs.h>
-
 #include "is_mounted.h"
+#include "sdtools.h"
+
+#define PGM_NAME "sd_zone_open"
 
 /* Used for Zone based SMR devices */
 #define SCSI_IOCTL_INQUIRY		0x10000
@@ -48,6 +63,7 @@ int do_zone_open_ioctl(const char * pathname, uint64_t lba, int do_ata)
 	return rc;
 }
 
+
 /*
  *
  */
@@ -82,8 +98,10 @@ int main(int argc, char *argv[])
 	}
 
 	if (argc == 1 || !fname) {
+		printf(PGM_NAME " %d.%d\n",
+		       sdtools_VERSION_MAJOR, sdtools_VERSION_MINOR );
 		printf("Usage:\n"
-		       "  sd_zone_open [ata] <lba> <device>\n\n"
+		       "  " PGM_NAME " [ata] <lba> <device>\n\n"
                        "where:\n"
 		       "   ata will cause ATA ZAC commands to be used instead of SCSI ZBC.\n"
 		       "   lba can be ~0 or ~1 for to reset all WPs\n\n"

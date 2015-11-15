@@ -38,6 +38,7 @@
 #include "zbc-ctrl.h"
 #include "crc64.h"
 #include "is_mounted.h"
+#include "zdm_version.h"
 
 #ifndef MAJOR
   #define MAJOR(dev)	((dev)>>8)
@@ -972,9 +973,9 @@ int zdmadm_initmd(int fd, zdm_super_block_t * sblk, int use_force, int verbose)
 	locations = mz_count * CACHE_COPIES;
 
 	printf("ZDM: Initialize Metadata pool\n");
-	printf(" ... initializing cache blocks from %" PRIx64 " - %" 
+	printf(" ... initializing cache blocks from %" PRIx64 " - %"
 		PRIx64 "\n", lba, lba + (locations*MAX_CACHE_INCR) );
-	
+
 	for (iter = 0; iter < locations; iter++) {
 		rc = pwrite64(fd, data, Z_C4K, lba << 12);
 		if (rc != Z_C4K) {
@@ -995,7 +996,7 @@ int zdmadm_initmd(int fd, zdm_super_block_t * sblk, int use_force, int verbose)
 		       " zone-alignment\n", pool_lba);
 	}
 
-	printf(" ... clearing %" PRIu64 " pool zones from %" 
+	printf(" ... clearing %" PRIu64 " pool zones from %"
 		PRIx64 " - %" PRIx64 "\n",
 		pref - 2, pool_lba, pool_lba + ((pref - 2) << 16) );
 
@@ -1017,11 +1018,11 @@ int zdmadm_initmd(int fd, zdm_super_block_t * sblk, int use_force, int verbose)
 			printf("%s: clear sb @ %" PRIx64
 			       " failed:  %d\b", __func__, lba, rc);
 		}
-		
+
 		if (0 == (iter % 256)) {
 			printf("    ... writing .. %" PRIx64 "\n", lba );
 		}
-		
+
 		lba += IO_VCACHE_PAGES;
 	}
 
@@ -1037,7 +1038,7 @@ int zdmadm_initmd(int fd, zdm_super_block_t * sblk, int use_force, int verbose)
 
 		if (verbose)
 			printf(" ... Initial MetaCRC %04x\n", le16_to_cpu(crc));
-		
+
 		/* make page of CRCs */
 		for (iter = 0; iter < 2048; iter++) {
 			crcs[iter] = crc;
@@ -1047,9 +1048,9 @@ int zdmadm_initmd(int fd, zdm_super_block_t * sblk, int use_force, int verbose)
 		for (iter = 0; iter < IO_VCACHE_PAGES; iter++) {
 			memcpy(io_vcache[iter].data, crcs, Z_C4K);
 		}
-		
+
 		if (verbose)
-			printf(" ... Initial MetaMetaCRC %04x\n", 
+			printf(" ... Initial MetaMetaCRC %04x\n",
 				le16_to_cpu(crc_md_le16(crcs, Z_CRC_4K)));
 
 		locations = dm_div_up((0x40 * mz_count), IO_VCACHE_PAGES);
@@ -1106,7 +1107,7 @@ int zdmadm_create(const char *dname, char *zname_opt,
 	}
 
 	zdmadm_initmd(fd, sblk, use_force, verbose);
-	
+
 	memset(data, 0, Z_C4K);
 	memcpy(data, sblk, sizeof(*sblk));
 
@@ -1117,7 +1118,7 @@ int zdmadm_create(const char *dname, char *zname_opt,
 		rc = -1;
 		goto out;
 	}
-	
+
 	fsync(fd);
 	close(fd);
 
@@ -1472,6 +1473,8 @@ int main(int argc, char *argv[])
 	int use_force = 0;
 	int verbose = 0;
 
+	printf("zdmadm %d.%d\n", zdm_VERSION_MAJOR, zdm_VERSION_MINOR );
+
 	/* Parse command line */
 	errno = EINVAL; // Assume invalid Argument if we die
 	while ((opt = getopt(argc, argv, "t:R:l:Fpcrkuwv")) != -1) {
@@ -1605,7 +1608,7 @@ int main(int argc, char *argv[])
 					exCode = 1;
 					goto out;
 				}
-				
+
 				/* does a lot of writing to fd and closes before
 				 * starting ZDM instance */
 				exCode = zdmadm_create(dname, label, fd, &sblk_def,
