@@ -1,0 +1,4 @@
+#!/bin/bash
+# This is for RPM packaging .. normally we build out-of-tree with cmake."
+echo "Using cmake"
+cmake .
