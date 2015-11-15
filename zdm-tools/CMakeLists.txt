@@ -22,7 +22,7 @@ set(LIBSRC lib/crc64.c lib/is_mounted.c lib/libcrc.c lib/libsort.c lib/libzdm.c 
 add_library(zdm ${LIBSRC})
 
 set (zdm_VERSION_MAJOR 0)
-set (zdm_VERSION_MINOR 96)
+set (zdm_VERSION_MINOR 97)
 
 # configure a header file to pass some of the CMake settings
 # to the source code
