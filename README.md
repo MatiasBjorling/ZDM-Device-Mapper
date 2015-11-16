@@ -159,3 +159,7 @@ If not, please see http://www.gnu.org/licenses/.
     * Numerous bug fixes and better stability.
     * More GC / zone compaction improvements.
     * Patches provided to apply cleanly against 4.1 (stable), 4.2, and 4.3.
+
+  - ZDM #97
+    * Fix block ata zoned_command (Reset WP). Using wrong psudo constant.
+    * Fix a deadlock when gc_immediate is called from multple threads.
