@@ -9,7 +9,7 @@ project (smrffs_tools)
 if (EXISTS /usr/include/linux/blk-zoned-ctrl.h)
    message ("System provided blk-zoned-ctrl.h GOOD.")
 else (EXISTS /usr/include/linux/blk-zoned-ctrl.h)
-   message ("No blk-zoned-ctrl.h using local verson.")
+   message ("No blk-zoned-ctrl.h using local version.")
    include_directories ("${PROJECT_SOURCE_DIR}/uapi-missing")
 endif (EXISTS /usr/include/linux/blk-zoned-ctrl.h)
 
