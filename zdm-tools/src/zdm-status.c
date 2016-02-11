@@ -58,125 +58,141 @@
 typedef struct zdm_ioc_status zdm_ioc_status_t;
 typedef struct zdm_ioc_request zdm_ioc_request_t;
 
-typedef union zdm_ioc {
-	zdm_ioc_request_t request;
-	zdm_ioc_status_t  status;
+typedef union zdm_ioc
+{
+    zdm_ioc_request_t request;
+    zdm_ioc_status_t  status;
 } zdm_ioc_t;
 
-
-int do_show_megaz(int fd, int megaz, int sram)
+void print_status(struct zdm_ioc_status * status, int sram)
 {
-	int rcode = 0;
-	zdm_ioc_t * req_status = malloc(sizeof(zdm_ioc_t));
+    if (sram)
+    {
+        int ii;
 
-	req_status->request.result_size = sizeof(*req_status);
-	req_status->request.megazone_nr = megaz;
+        printf(" using %'" PRIu64
+               " bytes of RAM\n", status->memstat );
+        printf("   %'" PRIu64
+               " 4k blocks\n", (status->memstat + 4095)/4096 );
 
-	rcode = ioctl(fd, ZDM_IOC_STATUS, req_status);
-	if (rcode < 0) {
-		printf("ERROR: %d\n", rcode);
-		goto out;
-	}
-	if (rcode == 0) {
-		zdm_ioc_status_t * status = &req_status->status;
+        for (ii = 0; ii < 40; ii++)
+        {
+            if (status->bins[ii])
+            {
+                printf("  ..  %'d [in %d]\n",
+                       status->bins[ii], ii );
+            }
+        }
 
-		if (sram) {
-			int ii;
+    }
 
-			printf(" using %'" PRIu64
-				" bytes of RAM\n", status->memstat );
-			printf("   %'" PRIu64
-				" 4k blocks\n", (status->memstat + 4095)/4096 );
 
-			for (ii = 0; ii < 40; ii++) {
-				if (status->bins[ii]) {
-					printf("  ..  %'d [in %d]\n",
-						status->bins[ii], ii );
-				}
-			}
+    printf("   b_used       %'" PRIu64 "\n", status->b_used );
+    printf("   b_available  %'" PRIu64 "\n", status->b_available );
+    printf("   b_discard    %'" PRIu64 "\n", status->b_discard );
+    printf("   m_zones      %'" PRIu64 "\n", status->m_zones );
+    printf("   mc_entries   %'" PRIu64 "\n", status->mc_entries );
+    printf("   mlut_blocks  %'" PRIu64 "\n", status->mlut_blocks );
+    printf("   crc_blocks   %'" PRIu64 "\n", status->crc_blocks );
 
-		}
-
-		printf(" MZ# %d: (in 4k blocks)\n", megaz );
-		printf("   b_used       %'" PRIu64 "\n", status->b_used );
-		printf("   b_available  %'" PRIu64 "\n", status->b_available );
-		printf("   b_discard    %'" PRIu64 "\n", status->b_discard );
-		printf("   m_used       %'" PRIu64 "\n", status->m_used );
-		printf("   mc_entries   %'" PRIu64 "\n", status->mc_entries );
-		printf("   mlut_blocks  %'" PRIu64 "\n", status->mlut_blocks );
-		printf("   crc_blocks   %'" PRIu64 "\n", status->crc_blocks );
-
-	}
-out:
-	return rcode;
 }
 
-int do_query_wps(int fd, int megaz)
+
+int do_query_wps(int fd, int delay)
 {
-	int rcode = ioctl(fd, ZDM_IOC_MZCOUNT, 0);
-	if (rcode < 0) {
-		printf("ERROR: %d\n", rcode);
-	} else {
-		u32 count = rcode;
+    int rcode = 0;
 
-		printf("Got %u megazones ..", rcode);
+    ssize_t in;
+    off_t pos = 0ul;
+    struct zdm_ioc_status  status;
 
-		if (-1 == megaz) {
-			u32 entry;
-			for (entry = 0; entry < count; entry++) {
-				rcode = do_show_megaz(fd, entry, entry==0);
-			}
-		} else if (megaz < rcode) {
-			rcode = do_show_megaz(fd, megaz, 1);
-		}
-	}
-	return rcode;
+    do
+    {
+        in = read(fd, &status, sizeof(status));
+        if (in  == sizeof(status))
+        {
+            print_status(&status, 1);
+        }
+        else
+        {
+            fprintf(stderr, "Read -> %ld\n", in );
+        }
+        if (delay == 0)
+        {
+            break;
+        }
+        sleep(delay);
+        lseek(fd, pos, SEEK_SET);
+
+    }
+    while (1);
+
+    return rcode;
+}
+
+void version(void)
+{
+}
+
+void usage(void)
+{
+    printf("USAGE:\n"
+           "    zdm-zones -d <repeat seconds> proc_path ...\n"
+           "Defaults are: -d 0 [does not repeat]\n"
+           "\n"
+           "  Ex: zdm-status /proc/zdm_sdf1/stats.bin\n" );
 }
 
 int main(int argc, char *argv[])
 {
-	int opt;
-	int index;
-	int loglevel;
-	int megaz  = -1;
-	int exCode = 0;
+    int opt;
+    int index;
+    int exCode = 0;
+    int delay = 0;
 
-	setlocale(LC_NUMERIC, "");
+    setlocale(LC_NUMERIC, "");
 
-	/* Parse command line */
-	errno = EINVAL; // Assume invalid Argument if we die
-	while ((opt = getopt(argc, argv, "m:l:")) != -1) {
-		switch (opt) {
-		case 'm':
-			megaz = atoi(optarg);
-			break;
-		case 'l':
-			loglevel = atoi(optarg);
-			break;
-		default:
-			printf("USAGE:\n"
-			       "    verify -l loglevel files...\n"
-			       "Defaults are: -l 0\n");
-			break;
-		} /* switch */
-	} /* while */
+    /* Parse command line */
+    errno = EINVAL;
+    while ((opt = getopt(argc, argv, "Vd:")) != -1)
+    {
+        switch (opt)
+        {
+        case 'V':
+            version();
+            exit(exCode);
+            break;
+        case 'd':
+            delay = strtol(optarg, NULL, 0);
+            break;
+        default:
+            usage();
+            exCode = 1;
+            exit(exCode);
+            break;
+        } /* switch */
+    } /* while */
 
-	for (index = optind; index < argc; index++) {
-		int fd;
+    for (index = optind; index < argc; index++)
+    {
+        int fd;
 
-		printf("Do something with %s\n", argv[index] );
-		fd = open(argv[index], O_RDWR);
-		if (fd) {
-			do_query_wps(fd, megaz);
-		} else {
-			perror("Failed to open file");
-			fprintf(stderr, "file: %s", argv[index]);
-		}
-	}
+        fd = open(argv[index], O_RDONLY);
+        if (fd)
+        {
+            do_query_wps(fd, delay);
+        }
+        else
+        {
+            perror("Failed to open file");
+            fprintf(stderr, "file: %s", argv[index]);
+        }
+    }
 
-	(void) loglevel;
+    if (argc == 1 || optind == 0)
+    {
+        usage();
+    }
 
-	return exCode;
+    return exCode;
 }
-
-

@@ -15,12 +15,22 @@
 #ifndef _DM_ZONED_H
 #define _DM_ZONED_H
 
+#define USE_KTHREAD		0
+
+#define CRIT			GFP_ATOMIC
+#define NORMAL			0
+
 #define ZDM_IOC_MZCOUNT		0x5a4e0001
 #define ZDM_IOC_WPS		0x5a4e0002
 #define ZDM_IOC_FREE		0x5a4e0003
 #define ZDM_IOC_STATUS		0x5a4e0004
 
 #define DM_MSG_PREFIX		"zoned"
+
+#define PROC_WP			"wp.bin"
+#define PROC_FREE		"free.bin"
+#define PROC_DATA		"data.bin"
+#define PROC_STATUS		"status"
 
 #define ZDM_RESERVED_ZNR	0
 #define ZDM_CRC_STASH_ZNR	1 /* first 64 blocks */
@@ -34,6 +44,8 @@
 #define Z_WP_GC_READY		(1u << 28)
 #define Z_WP_GC_BITS		(0xFu << 28)
 
+#define Z_WP_RRECALC		(1u << 31)
+
 #define Z_WP_GC_PENDING		(Z_WP_GC_FULL|Z_WP_GC_ACTIVE)
 #define Z_WP_NON_SEQ		(1u << 27)
 #define Z_WP_RESV_01		(1u << 26)
@@ -42,15 +54,21 @@
 
 #define Z_WP_VALUE_MASK		(~0u >> 8)
 #define Z_WP_FLAGS_MASK		(~0u << 24)
+#define Z_WP_STREAM_MASK        Z_WP_FLAGS_MASK
 
 #define Z_AQ_GC			(1u << 31)
 #define Z_AQ_META		(1u << 30)
-#define Z_AQ_NORMAL		(0)
+#define Z_AQ_NORMAL		(1u << 29)
+#define Z_AQ_STREAM_ID		(1u << 28)
+#define Z_AQ_STREAM_MASK	(0xFF)
+#define Z_AQ_META_STREAM	(Z_AQ_META | Z_AQ_STREAM_ID | 0xFE)
 
 #define Z_C4K			(4096ul)
 #define Z_UNSORTED		(Z_C4K / sizeof(struct map_sect_to_lba))
 #define Z_BLOCKS_PER_DM_SECTOR	(Z_C4K/512)
 #define MZ_METADATA_ZONES	(8ul)
+#define Z_SHFT4K		(3)
+
 
 #define LBA_SB_START		1
 
@@ -71,9 +89,12 @@
 #define MAX_CACHE_INCR		320ul
 #define CACHE_COPIES		3
 #define MAX_MZ_SUPP		64
+#define FWD_TM_KEY_BASE		4096ul
 
-#define IO_VCACHE_ORDER         8
-#define IO_VCACHE_PAGES        (1 << IO_VCACHE_ORDER)  /* 256 pages => 1MiB */
+#define Z_HASH_SZ		1
+
+#define IO_VCACHE_ORDER		8
+#define IO_VCACHE_PAGES		(1 << IO_VCACHE_ORDER)  /* 256 pages => 1MiB */
 
 enum superblock_flags_t {
 	SB_DIRTY = 1,
@@ -89,25 +110,30 @@ struct z_io_req_t {
 #define Z_LOWER48 (~0ul >> 16)
 #define Z_UPPER16 (~Z_LOWER48)
 
+#define STREAM_SIZE	256
+
 /* -------------------------------------------------------------------------- */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * enum pg_flag_enum - Map Pg flags
+ */
 enum pg_flag_enum {
 	IS_DIRTY,
 	IS_GC,
 	IS_STALE,
+
+	IS_FWD,
+	IS_REV,
+	IS_CRC,
+	IS_LUT,
+
+	IS_MEMPOOL,
 };
 
-enum work_flags_enum {
-	DO_JOURNAL_MOVE,
-	DO_MEMPOOL,
-	DO_SYNC,
-	DO_JOURNAL_LOAD,
-	DO_META_CHECK,
-	DO_GC_NO_PURGE,
-	DO_METAWORK_QD,
-};
-
+/**
+ * enum gc_flags_enum - GC/Compaction states
+ */
 enum gc_flags_enum {
 	DO_GC_NEW,
 	DO_GC_PREPARE,		/* -> READ or COMPLETE state */
@@ -116,11 +142,27 @@ enum gc_flags_enum {
 	DO_GC_COMPLETE,
 };
 
+/**
+ * enum znd_flags_enum - zoned state/feature/action flags
+ */
 enum znd_flags_enum {
 	ZF_FREEZE,
 	ZF_POOL_FWD,
 	ZF_POOL_REV,
 	ZF_POOL_CRCS,
+
+	ZF_RESV_1,
+	ZF_RESV_2,
+	ZF_RESV_3,
+	ZF_RESV_4,
+
+	DO_JOURNAL_MOVE,
+	DO_MEMPOOL,
+	DO_SYNC,
+	DO_JOURNAL_LOAD,
+
+	DO_GC_NO_PURGE,
+	DO_METAWORK_QD,
 };
 
 /* -------------------------------------------------------------------------- */
@@ -130,35 +172,54 @@ struct zoned;
 
 /**
  * struct gc_state - A page of map table
- * @megaz:
- * @gc_flags:
- * @r_ptr:
- * @w_ptr:
- * @nblks:
- * @result:
- * @z_gc:
- * @tag:
+ * @znd: ZDM Instance
+ * @gc_flags: See gc_flags_enum
+ * @r_ptr: Next read in zone.
+ * @w_ptr: Next write in target zone.
+ * @nblks: Number of blocks in I/O
+ * @result: GC operation result.
+ * @z_gc: Zone undergoing compacation
+ * @tag: System wide serial number (debugging).
  *
  * Longer description of this structure.
  */
 struct gc_state {
-	struct megazone *megaz;
+	struct zoned *znd;
 	unsigned long gc_flags;
 
 	u32 r_ptr;
 	u32 w_ptr;
 
 	u32 nblks;		/* 1-65536 */
-	int result;
+	u32 z_gc;
 
-	u16 z_gc;
+	int result;
 	u16 tag;
 };
 
 /**
+ * struct map_addr - A page of map table
+ * @dm_s:    full map on dm layer
+ * @zone_id: z_id match zone_list_t.z_id
+ * @pg_idx:  entry in lut (0-1023)
+ * @lut_s:   sector table lba
+ * @lut_r:   reverse table lba
+ *
+ * Longer description of this structure.
+ */
+struct map_addr {
+	u64 dm_s;
+	u64 lut_s;
+	u64 lut_r;
+
+	u32 zone_id;
+	u32 pg_idx;
+};
+
+/**
  * struct map_sect_to_lba - Sector to LBA mapping.
- * @logical:
- * @physical:
+ * @tlba: tlba
+ * @physical: blba or number of blocks
  *
  * Longer description of this structure.
  */
@@ -166,6 +227,46 @@ struct map_sect_to_lba {
 	__le64 logical;		/* record type [16 bits] + logical sector # */
 	__le64 physical;	/* csum 16 [16 bits] + 'physical' block lba */
 } __packed;
+
+/**
+ * enum gc_flags_enum - Garbage Collection [GC] states.
+ */
+enum map_type_enum {
+	IS_MAP,
+	IS_DISCARD,
+	MAP_COUNT,
+};
+
+/**
+ * struct map_cache - A page of map table
+ * @mclist:
+ * @jdata: 4k page of data
+ * @refcount:
+ * @cached_lock:
+ * @busy_locked:
+ * @jcount:
+ * @jsorted:
+ * @jsize:
+ *
+ * Longer description of this structure.
+ */
+struct map_cache {
+	struct list_head mclist;
+	struct map_sect_to_lba *jdata;
+	atomic_t refcount;
+	struct mutex cached_lock;
+	atomic_t busy_locked;
+	u32 jcount;
+	u32 jsorted;
+	u32 jsize;
+};
+
+
+union map_pg_data {
+	__le32 *addr;
+	__le16 *crc;
+};
+
 
 /**
  * struct map_pg - A page of map table
@@ -176,115 +277,83 @@ struct map_sect_to_lba {
  * @lba:          logical position (use lookups to find actual)
  * @md_lock:      lock mdata i/o
  * @last_write:   last known position on disk
- * @flags:        is dirty flag
+ * @flags:        is dirty flag, is fwd, is rev, is crc, is lut
  * @inpool:
  *
  * Longer description of this structure.
  */
 struct map_pg {
-	__le32 *mdata;
+	union map_pg_data data;
 	atomic_t refcount;
 	u64 age;
 	u64 lba;
-	struct mutex md_lock;
 	u64 last_write;
+	struct mutex md_lock;
 	unsigned long flags;
 	struct list_head inpool;
+
+	/* in flight tracking */
+	struct zoned *znd;
+	struct map_pg *crc_pg;
+	__le16 md_crc;
 };
 
 /**
- * struct map_addr - A page of map table
- * @dm_s:    full map on dm layer
- * @zone_id: z_id match zone_list_t.z_id
- * @crc: CRC Entry within the CRC PG
- * @mz_id:    mega zone #
- * @offentry: entry in lut (0-1023)
- * @lut_s:    sector table lba
- * @lut_r:    reverse table lba
+ * struct map_crc - Map to backing crc16.
+ *
+ * @table:        Maybe via table
+ * @pg_no:        Page [index] of table entry if applicable.
+ * @pg_idx:       Offset within page (From: zoned::md_crcs when table is null)
  *
  * Longer description of this structure.
  */
-struct map_addr {
-	u64 dm_s;
-	u64 zone_id;
-	u64 crc;
-	u64 mz_id;
-	u64 offentry;
-	u64 lut_s;
-	u64 lut_r;
+struct map_crc {
+	struct map_pg **table;
+	int pg_no;
+	int pg_idx;
 };
 
 /**
- * struct mzlam - A page of map table
- * @mz_base:
- * @r_base:
- * @s_base:
- * @sk_low:
- * @sk_high:
- * @crc_low:
- * @crc_hi:
+ * struct map_info - Map to backing lookup table.
+ *
+ * @table:        backing table
+ * @crc:          backing crc16 detail.
+ * @index:        index [page] of table entry. Use map_addr::pg_idx for offset.
+ * @bit_type:     IS_LUT or IS_CRC
+ * @bit_dir:      IS_FWD or IS_REV
  *
  * Longer description of this structure.
  */
-struct mzlam {
-	u64 mz_base;
-	u64 r_base;
-	u64 s_base;
-	u64 sk_low;
-	u64 sk_high;
-	u64 crc_low;
-	u64 crc_hi;
+struct mpinfo {
+	struct map_pg **table;
+	struct map_crc crc;
+	int index;
+	int bit_type;
+	int bit_dir;
 };
 
-/**
- * struct map_cache - A page of map table
- * @jlist:
- * @jdata: 4k page of data
- * @refcount:
- * @cached_lock:
- * @no_sort_flag:
- * @jcount:
- * @jsorted:
- * @jsize:
- *
- * Longer description of this structure.
- */
-struct map_cache {
-	struct list_head jlist;
-	struct map_sect_to_lba *jdata;
-	atomic_t refcount;
-	struct mutex cached_lock;
-	unsigned long no_sort_flag;
-	u32 jcount;
-	u32 jsorted;
-	u32 jsize;
-};
 
 /**
- * struct crc_pg - A page of map table
+ * struct meta_pg - A page of zone WP mapping.
  *
- * @age: most recent access in jiffies
- * @lba: logical lba. Use lookups for actual.
+ * @wp_alloc: Bits 23-0: wp alloc location.   Bits 31-24: GC Flags, Type Flags
+ * @zf_est:   Bits 23-0: free block count.    Bits 31-24: Stream Id
+ * @wp_used:  Bits 23-0: wp written location. Bits 31-24: Ratio ReCalc flag.
+ * @lba: pinned LBA in conventional/preferred zone.
+ * @wplck: spinlock held during data updates.
  * @flags: IS_DIRTY flag
- * @refcount: REF count (move to flags?)
- * @last_write: last known lba on disk
- * @lock_pg:
- * @cdata: attached 4K page: [2048] entries
  *
- * Longer description of this structure.
+ * One page is used per 1024 zones on media.
+ * For an 8TB drive this uses 30 entries or about 360k RAM.
  */
-struct crc_pg {
-	u64 age;
+struct meta_pg {
+	__le32 *wp_alloc;
+	__le32 *zf_est;
+	__le32 *wp_used;
 	u64 lba;
+	struct mutex wplck;
 	unsigned long flags;
-	atomic_t refcount;
-	u64 last_write;
-	struct mutex lock_pg;
-	__le16 *cdata;
 };
-
-#define MZKY_NBLKS  64
-#define MZKY_NCRC   32
 
 /**
  * struct zdm_superblock - A page of map table
@@ -303,7 +372,8 @@ struct zdm_superblock {
 	u8 uuid[UUID_LEN];	/* 16 */
 	__le64 nr_zones;	/*  8 */
 	__le64 magic;		/*  8 */
-	__le64 zdstart;		/*  8 */
+	__le32 resvd;		/*  4 */
+	__le32 zdstart;		/*  4 */
 	__le32 version;		/*  4 */
 	__le32 packed_meta;	/*  4 */
 	__le32 flags;		/*  4 */
@@ -316,19 +386,11 @@ struct zdm_superblock {
  * struct mz_superkey - A page of map table
  * @sig0:           8 - Native endian
  * @sig1:           8 - Little endian
- * @stm_keys:     512 - LBA64 for each key page of the Sector Table
- * @stm_crc_lba:  256 - LBA64 for each CRC page
- * @stm_crc_pg:    64 - CRC16 for each CRC page
- * @rtm_crc_lba:  256 - LBA64 for each CRC page
- * @rtm_crc_pg:    64 - CRC16 for each CRC page
- * @crcs:         816 - Testing worst case so far - 142 entries.
- * @reserved:    2040 -
- * @gc_resv:        8 -
- * @meta_resv:      8 -
- * @n_crcs:         2 -
- * @zp_crc:         2 -
- * @free_crc:       2 -
  * @sblock:        56 -
+ * @stream:      1024 -
+ * @reserved:    2982 -
+ * @gc_resv:        4 -
+ * @meta_resv:      4 -
  * @generation:     8 -
  * @key_crc:        2 -
  * @magic:          8 -
@@ -338,36 +400,19 @@ struct zdm_superblock {
 struct mz_superkey {
 	u64 sig0;
 	__le64 sig1;
-	__le64 stm_keys[MZKY_NBLKS];
-	__le64 stm_crc_lba[MZKY_NCRC];
-	__le16 stm_crc_pg[MZKY_NCRC];
-	__le64 rtm_crc_lba[MZKY_NCRC];
-	__le16 rtm_crc_pg[MZKY_NCRC];
-	__le16 crcs[MAX_CACHE_SYNC];
-	u16 reserved[1020];
-	u32 gc_resv;
-	u32 meta_resv;
-	__le16 n_crcs;
-	__le16 zp_crc;
-	__le16 free_crc;
 	struct zdm_superblock sblock;
+	__le32 stream[STREAM_SIZE];
+	__le32 gc_resv;
+	__le32 meta_resv;
+	__le16 n_crcs;
+	__le16 crcs[MAX_CACHE_SYNC];
+	__le16 md_crc;
+	__le16 wp_crc[64];
+	__le16 zf_crc[64];
+	u8 reserved[1912];
+	__le32 crc32;
 	__le64 generation;
-	__le16 key_crc;
 	__le64 magic;
-} __packed;
-
-/**
- * struct mz_state - Sector to LBA mapping.
- * @bmkeys:
- * @z_ptrs:
- * @zfree:
- *
- * Longer description of this structure.
- */
-struct mz_state {
-	struct mz_superkey bmkeys;
-	u32                z_ptrs[1024];  /* future: __le32 */
-	u32                zfree[1024];   /* future: __le32 */
 } __packed;
 
 /**
@@ -390,87 +435,12 @@ struct io_dm_block {
 	u8 data[512];
 };
 
-/**
- * struct megazone - A page of map table
- * @flags:
- * @znd:
- * @jlist: list of pages of in-memory LBA mappings.
- * @smtpool: pages of lookup table entries
- * @sectortm:
- * @reversetm:
- * @sync_io:
- * @z_ptrs:
- * @zfree_count:
- * @z_commit:
- * @bmkeys:
- * @logical_map:
- * @stm_crc:
- * @rtm_crc:
- * @meta_work:
- * @last_w:        Fixup non-4k aligned write
- * @cow_block:     4k page
- * @cow_addr:      LBA for I/O of cow_block
- * @mapkey_lock:   CRC PG/Block Map Keys lock
- * @mz_io_mutex:   for normal i/o
- * @zp_lock:       general lock (block acquire)
- * @vcio_lock:     Write cache (dm_io) on write()
- * @jlock:         journal lock
- * @map_pool_lock: smtpool: memory pool lock
- * @discard_lock:  serializer in unused_phy can be removed ?
- * @age: most recent (W) access in jiffies
- * @mega_nr:
- * @z_count:        # of zones in megazone.
- * @z_gc_free:      current empty zone count
- * @z_data:         first non-metadata zone (0)
- * @z_current:      active open zone in MZ
- * @z_gc_resv:      current GC only zone
- * @z_meta_resv:    current ZDM MD-only
- * @incore_count:   # of table pages in RAM
- * @discard_count:  stale blocks in MZ
- * @mc_entries:     number of memcache pages in RAM
- * @meta_result:    last non-map() path [error] result
- *
- * Longer description of this structure.
- */
-struct megazone {
-	unsigned long flags;
-	struct zoned *znd;
-	struct list_head jlist;
-	struct list_head smtpool;
-	struct map_pg **sectortm;
-	struct map_pg **reversetm;
-	struct mz_state *sync_io;
-	u32 *z_ptrs;
-	u32 *zfree_count;
-	u32  z_commit[1024];
-	struct mz_superkey *bmkeys;
-	struct mzlam       logical_map;
-	struct crc_pg stm_crc[MZKY_NCRC];
-	struct crc_pg rtm_crc[MZKY_NCRC];
-	struct work_struct meta_work;
-	sector_t last_w;
-	u8 *cow_block;
-	u64 cow_addr;
-	struct mutex mapkey_lock;
-	struct mutex mz_io_mutex;
-	struct mutex zp_lock;
-	struct mutex vcio_lock;
-	spinlock_t jlock;
-	spinlock_t map_pool_lock;
-	struct mutex discard_lock;
-	u64 age;
-	u32 mega_nr;
-	u32 z_count;
-	u32 z_gc_free;
-	u32 z_data;
-	u32 z_current;
-	u32 z_gc_resv;
-	u32 z_meta_resv;
-	s32 incore_count;
-	u32 discard_count;
-	int mc_entries;
-	int meta_result;
+struct stale_tracking {
+	u32 binsz;
+	u32 count;
+	int bins[STREAM_SIZE];
 };
+
 
 /*
  *
@@ -490,26 +460,34 @@ struct megazone {
  * @ti:
  * @callbacks:
  * @dev:
- * @bg_work: background worker (periodic GC/Mem purge)
- * @bg_wq:   background work queue
+ * @mclist:	list of pages of in-memory LBA mappings.
+ * @mclck:	in memory map-cache lock (spinlock)
+
+ * @smtpool:		pages of lookup table entries
+ * @map_pool_lock:	smtpool: memory pool lock
+ * @fwd_tm:
+ * @rev_tm:
+
+ * @bg_work:	background worker (periodic GC/Mem purge)
+ * @bg_wq:	background work queue
  * @stats_lock:
- * @gc_active: Current GC state
- * @gc_lock:   GC Lock
- * @gc_work:   GC Worker
- * @gc_wq:     GC Work Queue
- * @data_zones: # of data zones on device
- * @mz_count:   # of 256G mega-zones
- * @nr_blocks:  4k blocks on backing device
- * @pool_lba:	LBA at start of metadata pool
+ * @gc_active:	Current GC state
+ * @gc_lock:	GC Lock
+ * @gc_work:	GC Worker
+ * @gc_wq:	GC Work Queue
+ * @data_zones:	# of data zones on device
+ * @gz_count:	# of 256G mega-zones
+ * @nr_blocks:	4k blocks on backing device
+ * @md_start:	LBA at start of metadata pool
  * @data_lba:	LBA at start of data pool
  * @zdstart:	ZONE # at start of data pool (first Possible WP ZONE)
- * @start_sect: where ZDM partition starts (RAW LBA)
+ * @start_sect:	where ZDM partition starts (RAW LBA)
  * @flags:	See: enum znd_flags_enum
  * @gc_backlog:
  * @gc_io_buf:
  * @io_vcache[32]:
  * @io_vcache_flags:
- * @z_superblock:
+ * @z_sballoc:
  * @super_block:
  * @z_mega:
  * @meta_wq:
@@ -517,15 +495,15 @@ struct megazone {
  * @io_client:
  * @io_wq:
  * @timer:
- * @bins:
+ * @bins:	Memory usage accounting/reporting.
  * @bdev_name:
  * @memstat:
  * @suspended:
  * @gc_mz_pref:
- * @mz_provision:
+ * @mz_provision:	Number of zones per 1024 of over-provisioning.
  * @zinqtype:
  * @ata_passthrough:
- * @is_empty:  for fast discards on initial format
+ * @is_empty:		For fast discards on initial format
  *
  * Longer description of this structure.
  */
@@ -534,51 +512,109 @@ struct zoned {
 	struct dm_target_callbacks callbacks;
 	struct dm_dev *dev;
 
+	struct list_head mclist[Z_HASH_SZ];
+	spinlock_t       mclck[Z_HASH_SZ];
+	struct mutex     mcmutex[Z_HASH_SZ];
+
+	struct list_head smtpool;
+	struct mutex map_pool_lock;
+
 	struct work_struct bg_work;
 	struct workqueue_struct *bg_wq;
 	spinlock_t stats_lock;
+
+	struct mutex mapkey_lock; /* access LUT and CRC array of pointers */
+	struct mutex ct_lock; /* access LUT and CRC array of pointers */
+	struct mutex mz_io_mutex;
+	struct mutex vcio_lock;
+	struct mutex io_lock;
+
+#if USE_KTHREAD
+	struct bio *bio_queue[512];
+	u32 bio_in;
+	u32 bio_out;
+	struct task_struct *bio_kthread;
+	wait_queue_head_t bio_wait;
+	spinlock_t bio_qlck;
+#endif
 
 	struct gc_state *gc_active;
 	spinlock_t gc_lock;
 	struct delayed_work gc_work;
 	struct workqueue_struct *gc_wq;
 
-	u64 data_zones;
-	u64 mz_count;
 	u64 nr_blocks;
-	u64 pool_lba;
+	u64 start_sect;
+
+	u64 md_start;
+	u64 md_end;
 	u64 data_lba;
 
-	u64 zdstart;
-	u64 start_sect;
 	unsigned long flags;
+
+	u64 r_base;
+	u64 s_base;
+	u64 c_base;
+	u64 c_mid;
+	u64 c_end;
+
+	u64 sk_low;   /* unused ? */
+	u64 sk_high;  /* unused ? */
+
+	struct meta_pg *wp;
+
+	struct map_pg **fwd_tm;  /* nr_blocks / 1024 */
+	struct map_pg **rev_tm;  /* nr_blocks / 1024 */
+	struct map_pg **fwd_crc; /* (nr_blocks / 1024) / 2048 */
+	struct map_pg **rev_crc; /* (nr_blocks / 1024) / 2048 */
+	__le16 *md_crcs;   /* one of crc16's for fwd, 1 for rev */
+	u32 crc_count;
+	u32 map_count;
+
+	void *z_sballoc;
+	struct mz_superkey *bmkeys;
+	struct zdm_superblock *super_block;
+
+	struct work_struct meta_work;
+	sector_t last_w;
+	u8 *cow_block;
+	u64 cow_addr;
+	u32 data_zones;
+	u32 gz_count;
+	u32 zdstart;
+	u32 z_gc_free;
+	s32 incore_count;
+	u32 discard_count;
+	u32 z_current;
+	u32 z_meta_resv;
+	u32 z_gc_resv;
+	int mc_entries;
+	int meta_result;
+	struct stale_tracking stale;
 
 	int gc_backlog;
 	void *gc_io_buf;
+	struct mutex gc_vcio_lock;
 	struct io_4k_block *io_vcache[32];
 	unsigned long io_vcache_flags;
-	struct mutex gc_vcio_lock;
-
-
-	void *z_superblock;
-	struct zdm_superblock *super_block;
-
-	struct megazone *z_mega;
+	u64 age;
 	struct workqueue_struct *meta_wq;
-
 	struct map_cache gc_postmap;
-
 	struct dm_io_client *io_client;
 	struct workqueue_struct *io_wq;
 	struct timer_list timer;
 
 	u32 bins[40];
 	char bdev_name[BDEVNAME_SIZE];
+	char proc_name[BDEVNAME_SIZE+4];
+	struct proc_dir_entry *proc_fs;
+	loff_t wp_proc_at;
+	loff_t used_proc_at;
 
 	size_t memstat;
 	atomic_t suspended;
 	atomic_t gc_throttle;
-	u16 gc_mz_pref;
+
 	u16 mz_provision;
 	u8 zinqtype;
 	u8 ata_passthrough;
@@ -599,24 +635,27 @@ struct zdm_ioc_request {
 
 /**
  * struct zdm_ioc_status - Sector to LBA mapping.
- * @b_used:
- * @b_available:
- * @b_discard:
- * @m_used:
- * @mc_entries:
+ * @b_used: Number of blocks used
+ * @b_available: Number of blocks free
+ * @b_discard: Number of blocks stale
+ * @m_zones: Number of zones.
+ * @mc_entries: Mem cache blocks in use
+ * @dc_entries: Discard cache blocks in use.
  * @mlut_blocks:
  * @crc_blocks:
- * @memstat:
- * @bins:
+ * @memstat: Total memory in use by ZDM via *alloc()
+ * @bins: Allocation by subsystem.
  *
- * Longer description of this structure.
+ * This status structure is used to pass run-time information to
+ * user spaces tools (zdm-tools) for diagnostics and tuning.
  */
 struct zdm_ioc_status {
 	u64 b_used;
 	u64 b_available;
 	u64 b_discard;
-	u64 m_used;
-	u64 mc_entries;
+	u64 m_zones;
+	u32 mc_entries;
+	u32 dc_entries;
 	u64 mlut_blocks;
 	u64 crc_blocks;
 	u64 memstat;

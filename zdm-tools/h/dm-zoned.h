@@ -15,6 +15,11 @@
 #ifndef _DM_ZONED_H
 #define _DM_ZONED_H
 
+#define USE_KTHREAD		0
+
+#define CRIT			GFP_ATOMIC
+#define NORMAL			0
+
 #define ZDM_IOC_MZCOUNT		0x5a4e0001
 #define ZDM_IOC_WPS		0x5a4e0002
 #define ZDM_IOC_FREE		0x5a4e0003
@@ -34,6 +39,13 @@
 #define Z_WP_GC_READY		(1u << 28)
 #define Z_WP_GC_BITS		(0xFu << 28)
 
+#define Z_WP_RRECALC		(1u << 31)
+// #define Z_WP_RA_ACTIVE		(1u << 30)
+// #define Z_WP_RA_TARGET		(1u << 29)
+// #define Z_WP_RA_READY		(1u << 28)
+// #define Z_WP_RA_BITS		(0xFu << 28)
+
+
 #define Z_WP_GC_PENDING		(Z_WP_GC_FULL|Z_WP_GC_ACTIVE)
 #define Z_WP_NON_SEQ		(1u << 27)
 #define Z_WP_RESV_01		(1u << 26)
@@ -42,15 +54,21 @@
 
 #define Z_WP_VALUE_MASK		(~0u >> 8)
 #define Z_WP_FLAGS_MASK		(~0u << 24)
+#define Z_WP_STREAM_MASK        Z_WP_FLAGS_MASK
 
 #define Z_AQ_GC			(1u << 31)
 #define Z_AQ_META		(1u << 30)
-#define Z_AQ_NORMAL		(0)
+#define Z_AQ_NORMAL		(1u << 29)
+#define Z_AQ_STREAM_ID		(1u << 28)
+#define Z_AQ_STREAM_MASK	(0xFF)
+#define Z_AQ_META_STREAM	(Z_AQ_META | Z_AQ_STREAM_ID | 0xFE)
 
 #define Z_C4K			(4096ul)
 #define Z_UNSORTED		(Z_C4K / sizeof(struct map_sect_to_lba))
 #define Z_BLOCKS_PER_DM_SECTOR	(Z_C4K/512)
 #define MZ_METADATA_ZONES	(8ul)
+#define Z_SHFT4K		(3)
+
 
 #define LBA_SB_START		1
 
@@ -71,9 +89,11 @@
 #define MAX_CACHE_INCR		320ul
 #define CACHE_COPIES		3
 #define MAX_MZ_SUPP		64
+#define FWD_TM_KEY_BASE		4096ul
+// #define CRC_KEY_BASE		4096ul
 
-#define IO_VCACHE_ORDER         8
-#define IO_VCACHE_PAGES        (1 << IO_VCACHE_ORDER)  /* 256 pages => 1MiB */
+#define IO_VCACHE_ORDER		8
+#define IO_VCACHE_PAGES		(1 << IO_VCACHE_ORDER)  /* 256 pages => 1MiB */
 
 #ifdef __cplusplus
 extern "C" {
@@ -603,14 +623,14 @@ struct zoned {
 struct zdm_ioc_request {
 	u32 result_size;
 	u32 megazone_nr;
-};
+} __attribute__((packed));
 
 /**
  * struct zdm_ioc_status - Sector to LBA mapping.
  * @b_used:
  * @b_available:
  * @b_discard:
- * @m_used:
+ * @m_zones:
  * @mc_entries:
  * @mlut_blocks:
  * @crc_blocks:
@@ -623,13 +643,13 @@ struct zdm_ioc_status {
 	u64 b_used;
 	u64 b_available;
 	u64 b_discard;
-	u64 m_used;
+	u64 m_zones;
 	u64 mc_entries;
 	u64 mlut_blocks;
 	u64 crc_blocks;
 	u64 memstat;
 	u32 bins[40];
-};
+} __attribute__((packed));
 
 #ifdef __cplusplus
 }

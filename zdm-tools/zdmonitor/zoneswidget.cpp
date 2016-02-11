@@ -14,57 +14,165 @@
 #include <QPainter>
 #include <QList>
 #include <QDebug>
+#include <QDir>
 #include <cmath>
 
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <utypes.h>
+
 #include <libcrc.h>
 
 #include "zoneswidget.h"
 
 ZonesWidget::ZonesWidget(QWidget *parent)
- : QWidget(parent),
-   m_data(0),
-   m_fd(-1),
-   m_count(0),
-   m_zoom(-1),
-   m_zone_total(0ul),
-   m_playback(false),
-   m_record(NULL)
+    : QWidget(parent),
+      m_data(0),
+      m_fd(-1),
+      m_count(0),
+      m_zoom(-1),
+      m_zone_total(0ul),
+      m_playback(false),
+      m_record(NULL)
 {
+}
+
+int ZonesWidget::getMZCount(void)
+{
+    return m_count;
+}
+
+struct megazone_info * ZonesWidget::getMZData(void)
+{
+    struct megazone_info * draw = m_data;
+
+    if (!draw && m_record)
+    {
+        draw = m_record->data;
+    }
+    return draw;
+}
+
+int ZonesWidget::openProcWpEntry(QString zdmDevice)
+{
+    int rcode = 0;
+    QString procPath;
+    procPath.sprintf("/proc/%ls/" PROC_WP, (wchar_t*)zdmDevice.utf16());
+    QByteArray ba = procPath.toLocal8Bit();
+    const char *device = ba.data();
+
+    m_wpf = ::open(device, O_RDONLY);
+    if (m_wpf != -1)
+    {
+        rcode = 1;
+    }
+
+    return rcode;
+}
+
+int ZonesWidget::openProcUsedEntry(QString zdmDevice)
+{
+    int rcode = 0;
+    QString procPath;
+    procPath.sprintf("/proc/%ls/" PROC_FREE, (wchar_t*)zdmDevice.utf16());
+    QByteArray ba = procPath.toLocal8Bit();
+    const char *device = ba.data();
+
+    m_usedf = ::open(device, O_RDONLY);
+    if (m_usedf != -1)
+    {
+        rcode = 1;
+    }
+
+    return rcode;
+}
+
+int ZonesWidget::openProcStatusEntry(QString zdmDevice)
+{
+    int rcode = 0;
+    QString procPath;
+    procPath.sprintf("/proc/%ls/" PROC_DATA, (wchar_t*)zdmDevice.utf16());
+    QByteArray ba = procPath.toLocal8Bit();
+    const char *device = ba.data();
+
+    m_statusf = ::open(device, O_RDONLY);
+    if (m_statusf != -1)
+    {
+        rcode = 1;
+    }
+
+    return rcode;
 }
 
 int ZonesWidget::setDevice(QString zdmDevice)
 {
-    QByteArray ba = zdmDevice.toLocal8Bit();
-    const char *device = ba.data();
+    int rcode = -1;
+    QString procPath;
 
-    struct stat m;
-
+    /* close any active file/device */
     if (m_fd != -1)
     {
         ::close(m_fd);
         m_fd = -1;
         m_count = 0;
         m_zone_total = 0ul;
-        if (m_data) {
-            delete[] m_data;
-
-        }
-        if (m_record) {
-            free(m_record);
-        }
-        m_data = NULL;
-        m_record = NULL;
     }
-    m_fd = ::open(device, O_RDWR);
-    m_zdmDevice = zdmDevice;
-    ::fstat(m_fd, &m);
-    m_playback = S_ISREG(m.st_mode) ? true : false;
 
-    return m_fd;
+    if (m_data)
+    {
+        delete[] m_data;
+    }
+    if (m_record)
+    {
+        free(m_record);
+    }
+    m_data = NULL;
+    m_record = NULL;
+
+    if (m_wpf)
+    {
+        ::close(m_wpf);
+    }
+    if (m_usedf)
+    {
+        ::close(m_usedf);
+    }
+    if (m_statusf)
+    {
+        ::close(m_statusf);
+    }
+
+    /* see if the user is asking for a /proc/zdm_* entry */
+    procPath.sprintf("/proc/%ls", (wchar_t*)zdmDevice.utf16());
+    QDir folder(procPath);
+
+    if (folder.exists())
+    {
+        /* take the new path */
+        if (openProcWpEntry(zdmDevice) &&
+                openProcUsedEntry(zdmDevice) &&
+                openProcStatusEntry(zdmDevice) )
+        {
+            rcode = 0;
+            m_zdmDevice = zdmDevice;
+        }
+    }
+    else
+    {
+        /* follow the old path, or playback file */
+        QByteArray ba = zdmDevice.toLocal8Bit();
+        const char *device = ba.data();
+
+        struct stat m;
+
+        m_fd = ::open(device, O_RDWR);
+        m_zdmDevice = zdmDevice;
+        ::fstat(m_fd, &m);
+        m_playback = S_ISREG(m.st_mode) ? true : false;
+        rcode = m_fd;
+    }
+    return rcode;
 }
 
 QSize ZonesWidget::sizeHint()
@@ -101,7 +209,8 @@ int ZonesWidget::updatePlaybackView()
         }
         recsz = header.size;
 
-        if (recsz > 0) {
+        if (recsz > 0)
+        {
             qDebug("Size: %ld", recsz);
             m_record = static_cast<struct zdm_record *>(malloc(recsz));
             if (!m_record)
@@ -158,10 +267,11 @@ int ZonesWidget::updatePlaybackView()
                 break;
             }
         }
-        qDebug("MZ count: %d - total zones: %" PRIu64,
-               m_count, m_zone_total );
     }
     m_count = m_record->mz_count;
+
+    qDebug("MZ count: %d - total zones: %" PRIu64,
+           m_count, m_zone_total );
 
 out:
     return err;
@@ -185,12 +295,19 @@ int ZonesWidget::updateFakeDemoView()
         for (uint32_t val = 0; val < 1024; val++)
         {
             m_data[entry].wps[val] = val * 64;
-            if (entry & 1) m_data[entry].wps[val] = 0x10000 - (val * 64);
+            if (entry & 1)
+            {
+                m_data[entry].wps[val] = 0x10000 - (val * 64);
+            }
             m_data[entry].free[val] = 0x10000 - m_data[entry].wps[val];
             if (entry & 1)
+            {
                 m_data[entry].wps[val] |= 0x80 << 24;
+            }
             else
+            {
                 m_data[entry].wps[val] |= (val & 0xf8) << 24;
+            }
         }
     }
     m_data[2].wps[255] = ~0u;
@@ -204,7 +321,10 @@ int ZonesWidget::updateFakeDemoView()
     return err;
 }
 
-int ZonesWidget::updateLiveDeviceView()
+/*
+ *  Get data from /proc entries *OR* from ioctl calls (pre 4.4 kernel)
+ */
+int ZonesWidget::getLiveDeviceDataIoctl()
 {
     int err = -1;
     int rcode = ioctl(m_fd, ZDM_IOC_MZCOUNT, 0);
@@ -274,6 +394,121 @@ int ZonesWidget::updateLiveDeviceView()
     return err;
 }
 
+struct zone_value_entry
+{
+    u32 zone;
+    u32 value;
+};
+
+int ZonesWidget::getLiveDeviceDataProcFs()
+{
+    int err = 0;
+    QList<u32> used;
+    QList<u32> wp;
+    struct zone_value_entry entry;
+    struct zdm_ioc_status  status;
+    ssize_t in;
+    off_t pos = 0ul;
+    int no;
+
+    do
+    {
+        in = read(m_usedf, &entry, sizeof(entry));
+        if (in == sizeof(entry))
+        {
+            used.append(entry.value);
+        }
+    }
+    while (in > 0);
+
+    if (in < 0)
+    {
+        err--;
+    }
+
+    do
+    {
+        in = read(m_wpf, &entry, sizeof(entry));
+        if (in == sizeof(entry))
+        {
+            wp.append(entry.value);
+        }
+    }
+    while (in > 0);
+
+    if (in < 0)
+    {
+        err--;
+    }
+
+    in = read(m_statusf, &status, sizeof(status));
+    if (in != sizeof(status))
+    {
+        err--;
+    }
+
+    lseek(m_usedf,   pos, SEEK_SET);
+    lseek(m_wpf,     pos, SEEK_SET);
+    lseek(m_statusf, pos, SEEK_SET);
+
+    if (err == 0 && used.count() != m_zone_total)
+    {
+        if (m_data)
+        {
+            delete[] m_data;
+            m_data = NULL;
+        }
+        else
+        {
+            qDebug("New total: %d", used.count());
+        }
+        m_zone_total = used.count();
+        m_count = (m_zone_total + 1023) / 1024;
+        qDebug("MZ count %d, total zones: %" PRIu64,
+               m_count, m_zone_total );
+    }
+
+    if (err == 0 && m_zone_total > 0)
+    {
+        if (!m_data)
+        {
+            m_data = new struct megazone_info[m_count];
+        }
+        if (m_data)
+        {
+            int mz = 0;
+            int dzoff = 0;
+
+            for (int entry = 0; entry < used.count(); entry++)
+            {
+                mz = entry / 1024;
+                dzoff = entry % 1024;
+
+                m_data[mz].wps[dzoff]  = wp[entry];
+                m_data[mz].free[dzoff] = used[entry];
+                memcpy(&m_data[mz].state.status, &status, sizeof(status));
+            }
+        }
+    }
+    return err;
+}
+
+
+int ZonesWidget::updateLiveDeviceView()
+{
+    int err;
+
+    if (m_fd != -1)
+    {
+        err = getLiveDeviceDataIoctl();
+    }
+    else
+    {
+        err = getLiveDeviceDataProcFs();
+    }
+    return err;
+}
+
 int ZonesWidget::updateView(int zoom)
 {
     int err = 0;
@@ -281,7 +516,7 @@ int ZonesWidget::updateView(int zoom)
 
     m_zoom = zoom;
 
-    if (m_fd == -1)
+    if (m_fd == -1 && m_wpf == -1)
     {
         err = updateFakeDemoView();
     }
@@ -364,7 +599,8 @@ void ZonesWidget::doDrawZones(QPainter& painter, QRect& area)
     {
         for (int col = 0; col < columns; col++)
         {
-            if (entry >= 1024) {
+            if (entry >= 1024)
+            {
                 mzone++;
                 entry %= 1024;
                 break; /* go to next row */
@@ -372,19 +608,37 @@ void ZonesWidget::doDrawZones(QPainter& painter, QRect& area)
             if (mzone < last_mzone)
             {
                 uint32_t wp = draw[mzone].wps[entry];
-                uint32_t fr = draw[mzone].free[entry];
+                uint32_t fr = draw[mzone].free[entry] & 0xFFFFFF;
 
                 if (~0u == wp)
                 {
                     break;
                 }
 
-                if       ( Z_WP_GC_FULL & wp )   usage = gc_full;
-                else if  ( Z_WP_GC_ACTIVE & wp ) usage = gc_active;
-                else if  ( Z_WP_GC_TARGET & wp ) usage = gc_target;
-                else if  ( Z_WP_GC_READY & wp )  usage = gc_ready;
-                else if  ( Z_WP_NON_SEQ & wp )   usage = non_seq;
-                else                             usage = non_flag;
+                if       ( Z_WP_GC_FULL & wp )
+                {
+                    usage = gc_full;
+                }
+                else if  ( Z_WP_GC_ACTIVE & wp )
+                {
+                    usage = gc_active;
+                }
+                else if  ( Z_WP_GC_TARGET & wp )
+                {
+                    usage = gc_target;
+                }
+                else if  ( Z_WP_GC_READY & wp )
+                {
+                    usage = gc_ready;
+                }
+                else if  ( Z_WP_NON_SEQ & wp )
+                {
+                    usage = non_seq;
+                }
+                else
+                {
+                    usage = non_flag;
+                }
 
                 wp &= 0xFFFFFF;
                 int free_row = row + row_h - 1;

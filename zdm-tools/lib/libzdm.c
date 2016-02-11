@@ -194,7 +194,7 @@ int zdm_zoned_inq(struct zoned *znd)
 	int is_host_aware = 0;
 	int fd = znd->ti->fd;
 	int do_ata = znd->ata_passthrough;
-	zoned_inquiry_t * inq = zdm_device_inquiry(fd, do_ata);
+	struct zoned_inquiry *inq = zdm_device_inquiry(fd, do_ata);
 	if (inq) {
 		is_host_aware = zdm_is_ha_device(inq, 0);
 	}

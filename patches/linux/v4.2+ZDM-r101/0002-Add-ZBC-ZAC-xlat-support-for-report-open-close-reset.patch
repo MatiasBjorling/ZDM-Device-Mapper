@@ -1,0 +1,285 @@
+From 6f3f13c4aa6278d6736c6993b6d2947b7835aeec Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Thu, 12 Nov 2015 01:38:39 -0600
+Subject: [PATCH 2/7] Add ZBC <-> ZAC xlat support for report, open, close,
+ reset, finish
+
+Provide SCSI <-> ATA translation layer for ZBC commands:
+  - Report Zones
+  - Open, Close, Reset and Finish zones
+
+Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
+---
+ drivers/ata/libata-scsi.c | 169 +++++++++++++++++++++++++++++++++++++++++++++-
+ include/linux/ata.h       |  18 +++++
+ include/scsi/scsi.h       |   4 ++
+ 3 files changed, 190 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/ata/libata-scsi.c b/drivers/ata/libata-scsi.c
+index 0d7f0da..851c9e0 100644
+--- a/drivers/ata/libata-scsi.c
++++ b/drivers/ata/libata-scsi.c
+@@ -65,6 +65,7 @@ static struct ata_device *__ata_scsi_find_dev(struct ata_port *ap,
+ 					const struct scsi_device *scsidev);
+ static struct ata_device *ata_scsi_find_dev(struct ata_port *ap,
+ 					    const struct scsi_device *scsidev);
++static void scsi_16_lba_len(const u8 *cdb, u64 *plba, u32 *plen);
+ 
+ #define RW_RECOVERY_MPAGE 0x1
+ #define RW_RECOVERY_MPAGE_LEN 12
+@@ -969,7 +970,7 @@ static void ata_to_sense_error(unsigned id, u8 drv_stat, u8 drv_err, u8 *sk,
+  *	passthrough command, so we use the following sense data:
+  *	sk = RECOVERED ERROR
+  *	asc,ascq = ATA PASS-THROUGH INFORMATION AVAILABLE
+- *      
++ *
+  *
+  *	LOCKING:
+  *	None.
+@@ -1443,6 +1444,160 @@ static unsigned int ata_scsi_flush_xlat(struct ata_queued_cmd *qc)
+ }
+ 
+ /**
++ *	ata_scsi_zone_command_xlat - Translate SCSI Reset Write Pointer command
++ *	@qc: Storage for translated ATA taskfile
++ *
++ *	Sets up an ATA taskfile to issue Reset Write Pointers Ext command.
++ *	May need change when zac specs is available.
++ *
++ *	LOCKING:
++ *	spin_lock_irqsave(host lock)
++ *
++ *	RETURNS:
++ *	Zero on success, non-zero on error.
++ */
++static unsigned int ata_scsi_zone_command_xlat(struct ata_queued_cmd *qc)
++{
++	struct scsi_cmnd *scmd = qc->scsicmd;
++	struct ata_taskfile *tf = &qc->tf;
++	const u8 *cdb = scmd->cmnd;
++	u8 sa; /* service action */
++	u8 all_bit;
++
++	if (scmd->cmd_len < 16)
++		goto invalid_fld;
++
++	sa = cdb[1] & 0x1f;
++
++	if (!(sa == ATA_SUBCMD_CLOSE_ZONES ||
++	      sa == ATA_SUBCMD_FINISH_ZONES ||
++	      sa == ATA_SUBCMD_OPEN_ZONES ||
++	      sa == ATA_SUBCMD_RESET_WP))
++		goto invalid_fld;
++
++	all_bit = cdb[14] & 0x01;
++	if (!all_bit) {
++		struct ata_device *dev = qc->dev;
++		u64 max_lba = dev->n_sectors;     /* Maximal LBA supported */
++		u64 slba;
++		u32 slen;
++
++		scsi_16_lba_len(cdb, &slba, &slen);
++		if (slba > max_lba) {
++			ata_dev_err(dev,
++				"Zone start LBA %llu > %llu (Max LBA)\n",
++				slba, max_lba);
++			goto out_of_range;
++		}
++
++		tf->hob_lbah = (slba >> 40) & 0xff;
++		tf->hob_lbam = (slba >> 32) & 0xff;
++		tf->hob_lbal = (slba >> 24) & 0xff;
++		tf->lbah = (slba >> 16) & 0xff;
++		tf->lbam = (slba >> 8) & 0xff;
++		tf->lbal = slba & 0xff;
++	}
++
++
++	tf->flags |= ATA_TFLAG_DEVICE | ATA_TFLAG_LBA48;
++	tf->protocol = ATA_PROT_NODATA;
++
++	tf->command = ATA_CMD_ZONE_MAN_OUT;
++	tf->feature = sa;
++	tf->hob_feature = all_bit;
++
++	return 0;
++
++ invalid_fld:
++	ata_scsi_set_sense(scmd, ILLEGAL_REQUEST, 0x24, 0x0);
++	/* "Invalid field in cbd" */
++	return 1;
++ out_of_range:
++	ata_scsi_set_sense(scmd, ILLEGAL_REQUEST, 0x21, 0x0);
++	/* LBA out of range */
++	return 1;
++}
++
++/**
++ *	ata_scsi_report_zones_xlat - Translate SCSI Report Zones command
++ *	@qc: Storage for translated ATA taskfile
++ *
++ *	Sets up an ATA taskfile to issue Report Zones Ext command.
++ *	May need change when zac specs is updated.
++ *
++ *	LOCKING:
++ *	spin_lock_irqsave(host lock)
++ *
++ *	RETURNS:
++ *	Zero on success, non-zero on error.
++ */
++static unsigned int ata_scsi_report_zones_xlat(struct ata_queued_cmd *qc)
++{
++	struct ata_device *dev = qc->dev;
++	struct scsi_cmnd *scmd = qc->scsicmd;
++	struct ata_taskfile *tf = &qc->tf;
++	const u8 *cdb = scmd->cmnd;
++	u64 max_lba = dev->n_sectors;     /* Maximal LBA supported */
++	u64 slba;       /* Start LBA in scsi command */
++	u32 alloc_len;  /* Alloc length (in bytes) */
++	u8 reporting_option;
++
++	if (scmd->cmd_len < 16) {
++		ata_dev_err(dev, "ZAC Error: Command length is less than 16\n");
++		goto invalid_fld;
++	}
++	if (unlikely(!dev->dma_mode)) {
++		ata_dev_err(dev, "ZAC Error: No DMA mode is set\n");
++		goto invalid_fld;
++	}
++	if (!scsi_sg_count(scmd)) {
++		ata_dev_err(dev, "ZAC Error: SCSI sg count is zero\n");
++		goto invalid_fld;
++	}
++	scsi_16_lba_len(cdb, &slba, &alloc_len);
++	if (slba > max_lba) {
++		ata_dev_err(dev, "Zone start LBA %llu > %llu (Max LBA)\n",
++			    slba, max_lba);
++		goto out_of_range;
++	}
++
++	reporting_option = cdb[14] & 0x3f;
++
++	tf->flags |= ATA_TFLAG_DEVICE | ATA_TFLAG_LBA48 | ATA_TFLAG_ISADDR;
++	tf->protocol = ATA_PROT_DMA;
++
++	tf->command = ATA_CMD_ZONE_MAN_IN;
++
++	tf->hob_lbah = (slba >> 40) & 0xff;
++	tf->hob_lbam = (slba >> 32) & 0xff;
++	tf->hob_lbal = (slba >> 24) & 0xff;
++	tf->lbah = (slba >> 16) & 0xff;
++	tf->lbam = (slba >> 8) & 0xff;
++	tf->lbal = slba & 0xff;
++
++	tf->feature = 0x00;
++	tf->hob_feature = reporting_option;
++
++	alloc_len    /= 512; /* bytes in scsi, blocks in ata */
++	tf->nsect     = alloc_len & 0xff;
++	tf->hob_nsect = alloc_len >> 8;
++
++	ata_qc_set_pc_nbytes(qc);
++
++	return 0;
++
++ invalid_fld:
++	ata_scsi_set_sense(scmd, ILLEGAL_REQUEST, 0x24, 0x0);
++	/* "Invalid field in cbd" */
++	return 1;
++ out_of_range:
++	ata_scsi_set_sense(scmd, ILLEGAL_REQUEST, 0x21, 0x0);
++	/* LBA out of range */
++	return 1;
++}
++
++
++/**
+  *	scsi_6_lba_len - Get LBA and transfer length
+  *	@cdb: SCSI command to translate
+  *
+@@ -2232,12 +2387,17 @@ static unsigned int ata_scsiop_inq_b1(struct ata_scsi_args *args, u8 *rbuf)
+ {
+ 	int form_factor = ata_id_form_factor(args->id);
+ 	int media_rotation_rate = ata_id_rotation_rate(args->id);
++	bool zac_ha = ata_drive_zac_ha(args->id);
+ 
+ 	rbuf[1] = 0xb1;
+ 	rbuf[3] = 0x3c;
+ 	rbuf[4] = media_rotation_rate >> 8;
+ 	rbuf[5] = media_rotation_rate;
+ 	rbuf[7] = form_factor;
++	if (zac_ha) {
++		rbuf[8] &= 0xcf;
++		rbuf[8] |= 0x10;  /* SBC4: 0x01 for zoned host aware device */
++	}
+ 
+ 	return 0;
+ }
+@@ -3415,6 +3575,13 @@ static inline ata_xlat_func_t ata_get_xlat_func(struct ata_device *dev, u8 cmd)
+ 
+ 	case START_STOP:
+ 		return ata_scsi_start_stop_xlat;
++
++	case ZONE_COMMAND:
++		return ata_scsi_zone_command_xlat;
++
++	case REPORT_ZONES:
++		return ata_scsi_report_zones_xlat;
++	  break;
+ 	}
+ 
+ 	return NULL;
+diff --git a/include/linux/ata.h b/include/linux/ata.h
+index d2992bf..3dce69d 100644
+--- a/include/linux/ata.h
++++ b/include/linux/ata.h
+@@ -305,6 +305,17 @@ enum {
+ 	/* marked obsolete in the ATA/ATAPI-7 spec */
+ 	ATA_CMD_RESTORE		= 0x10,
+ 
++	/* ZAC commands - need update when ZAC spec is available */
++	ATA_CMD_ZONE_MAN_OUT	= 0x9F,
++
++	ATA_SUBCMD_CLOSE_ZONES	= 0x01,
++	ATA_SUBCMD_FINISH_ZONES	= 0x02,
++	ATA_SUBCMD_OPEN_ZONES	= 0x03,
++	ATA_SUBCMD_RESET_WP	= 0x04,
++
++	ATA_CMD_ZONE_MAN_IN	= 0x4A,
++	ATA_SUBCMD_REP_ZONES	= 0x00,
++
+ 	/* Subcmds for ATA_CMD_FPDMA_SEND */
+ 	ATA_SUBCMD_FPDMA_SEND_DSM            = 0x00,
+ 	ATA_SUBCMD_FPDMA_SEND_WR_LOG_DMA_EXT = 0x02,
+@@ -899,6 +910,13 @@ static inline bool ata_drive_40wire_relaxed(const u16 *dev_id)
+ 	return true;
+ }
+ 
++static inline bool ata_drive_zac_ha(const u16 *dev_id)
++{
++	if ((dev_id[69] & 0x0003) == 0x0001)
++		return true;
++	return false;
++}
++
+ static inline int atapi_cdb_len(const u16 *dev_id)
+ {
+ 	u16 tmp = dev_id[ATA_ID_CONFIG] & 0x3;
+diff --git a/include/scsi/scsi.h b/include/scsi/scsi.h
+index e0a3398..f0fd6b6 100644
+--- a/include/scsi/scsi.h
++++ b/include/scsi/scsi.h
+@@ -201,6 +201,10 @@ static inline int scsi_is_wlun(u64 lun)
+ #define DRIVER_HARD         0x07
+ #define DRIVER_SENSE	    0x08
+ 
++/* Op code for ZBC */
++#define ZONE_COMMAND		0x94
++#define REPORT_ZONES		0x95
++
+ /*
+  * Internal return values.
+  */
+-- 
+2.7.0
+

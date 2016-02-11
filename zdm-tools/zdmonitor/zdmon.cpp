@@ -116,6 +116,9 @@ void ZDMon::args(QStringList args)
             qDebug() << "No parsing options " << arg << " .. yet?";
         } else {
             qDebug() << "Trying to open " << arg << " as a ZDM instance." << arg;
+            if (arg.startsWith("/proc/")) {
+                arg = arg.mid(6);
+            }
             int fd = ui->zones->setDevice(arg);
             if (fd != -1) {
                 QString title;

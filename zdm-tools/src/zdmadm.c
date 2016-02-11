@@ -175,7 +175,8 @@ static void zdmadm_show(const char * dname, zdm_super_block_t *sblk)
 		printf("label   - %s\n", sblk->label );
 	}
 	printf("start   - %"PRIu64"\n", sblk->sect_start);
-	printf("data    - %"PRIu64"\n", sblk->data_start * sblk->zone_size);
+	printf("data    - %"PRIu64" [zone %" PRIu64 "]\n",
+		sblk->data_start * sblk->zone_size, sblk->data_start);
 	printf("size    - %"PRIu64"\n", sblk->sect_size);
 	printf("zdm sz  - %"PRIu64"\n", sblk->zdm_blocks);
 	printf("resv    - %u [%u: metadata + %u: over provision]\n",
@@ -802,7 +803,7 @@ int zaczbc_probe_media(int fd, zdm_super_block_t * sblk, int verbose)
 	int do_ata = 0;
 	int rcode = -1;
 
-	zoned_inquiry_t * inq = zdm_device_inquiry(fd, do_ata);
+	struct zoned_inquiry *inq = zdm_device_inquiry(fd, do_ata);
 	if (inq) {
 		if (zdm_is_ha_device(inq, 0)) {
 			sblk->zac_zbc |= MEDIA_ZBC;
@@ -866,7 +867,7 @@ int zdmadm_probe_zones(int fd, zdm_super_block_t * sblk)
 {
 	int rcode = 0;
 	size_t size = 128 * 4096;
-	struct bdev_zone_report_ioctl_t * report = malloc(size);
+	struct bdev_zone_report_io *report = malloc(size);
 	if (report) {
 		int opt = ZOPT_NON_SEQ_AND_RESET;
 		u64 lba = sblk->sect_start;
@@ -878,8 +879,8 @@ int zdmadm_probe_zones(int fd, zdm_super_block_t * sblk)
 			printf("report zones failure: %d\n", rcode);
 		} else  {
 			int zone = 0;
-			struct bdev_zone_report_result_t * info = &report->data.out;
-			struct bdev_zone_descriptor_entry_t * entry = &info->descriptors[zone];
+			struct bdev_zone_report *info = &report->data.out;
+			struct bdev_zone_descriptor *entry = &info->descriptors[zone];
 			int is_be = zdm_is_big_endian_report(info);
 			u64 fz_at = is_be ? be64toh(entry->lba_start) : entry->lba_start;
 			u64 fz_sz = is_be ? be64toh(entry->length) : entry->length;
@@ -1304,40 +1305,6 @@ out:
 	return rc;
 }
 
-/* data sector (fs layer) -> mapper sector */
-/**
- * s_nr is a logical sector that maps 1:1 to
- * to the subset of the disk presented as a block device to
- * an upper layer (typically a file-system or raid).
- *
- * read/write to this level are mapped onto dm_s
- */
-static u64 map_onto_zdm(u64 prov, u64 zdstart, u64 s_nr)
-{
-#define LOW_CHUNK  ((0x400ul -  prov) << 16)
-#define EXPAND      (0x400ul          << 16)
-
-	u64 dm_s = 0;
-	u64 s = s_nr;
-	u64 mz0_Size = LOW_CHUNK;
-
-	if (s < mz0_Size) {
-		dm_s = s;
-	} else {
-		u64 jno;
-		u64 joff;
-
-		s -= mz0_Size;
-		jno = s / LOW_CHUNK;
-		joff = s - (jno * LOW_CHUNK);
-		jno++;
-		dm_s = (jno * EXPAND) + joff;
-	}
-	dm_s += zdstart << 16;
-
-	return dm_s;
-}
-
 static void calculate_zdm_blocks(zdm_super_block_t * sblk, int verbose)
 {
 	u64 mz_resv      = sblk->mz_metadata_zones + sblk->mz_over_provision;
@@ -1352,10 +1319,10 @@ static void calculate_zdm_blocks(zdm_super_block_t * sblk, int verbose)
 		if (verbose)
 			printf("Reserved zones %"PRIu64" for metadata\n",
 				sblk->data_start - 1);
+	} else {
+		printf("Data Start is 0. Must be WHOLE DRIVE!!\n");
 	}
 	sblk->zdm_blocks = blocks;
-
-	map_onto_zdm(mz_resv, sblk->data_start, (blocks/8) - 1);
 
 	if (verbose)
 		printf("%" PRIu64 " blocks on ZDM - %"
@@ -1428,6 +1395,9 @@ int zdmadm_probe_default(const char * dname, int fd, zdm_super_block_t * sblk,
 			printf("Using non-aligned space start of partition for metadata.\n");
 		}
 		zone += (pref - mdzcount);
+
+		if (sblk->sect_start == 0) /* whole drive fixup. */
+			zone++;
 
 		sblk->zone_size = fz_sz;
 		sblk->data_start = zone;

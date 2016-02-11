@@ -56,6 +56,13 @@
 
 #include <zdmioctl.h>
 
+// CentOS g++ is funky
+
+#ifndef PRIu64
+#define PRIu64 "llu"
+#endif
+
+
 /**
  */
 class ZonesWidget : public QWidget
@@ -66,20 +73,8 @@ public:
 
     int setDevice(QString zdmDevice);
     int updateView(int zoom);
-    int getMZCount(void)
-    {
-	return m_count;
-    }
-    struct megazone_info * getMZData(void)
-    {
-        struct megazone_info * draw = m_data;
-        if (!draw && m_record) {
-            draw = m_record->data;
-        }
-	return draw;
-    }
-
-
+    int getMZCount(void);
+    struct megazone_info * getMZData(void);
     virtual QSize sizeHint();
     virtual QSize minimumSizeHint();
 
@@ -92,10 +87,19 @@ protected:
     int updateFakeDemoView();
     int updateLiveDeviceView();
 
+    int openProcWpEntry(QString zdmDevice);
+    int openProcUsedEntry(QString zdmDevice);
+    int openProcStatusEntry(QString zdmDevice);
+    int getLiveDeviceDataIoctl();
+    int getLiveDeviceDataProcFs();
+
 private:
     QString m_zdmDevice;
 
     struct megazone_info *m_data;
+    int m_wpf;
+    int m_usedf;
+    int m_statusf;
     int m_fd;
     int m_count;
     int m_zoom;

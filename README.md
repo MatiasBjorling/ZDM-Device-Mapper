@@ -2,40 +2,65 @@
 ## Introduction
 
 Device Mapper for Zoned based devices: ZDM for short.
-
-This project aims to present a traditional block device for Host Aware and
-Host Managed drives.
+This project aims to present a traditional block device for Host Aware and Host
+Managed zoned block device drives. ZDM presents to the drive a workload that
+conforms to the Host Aware intended use or Host Managed constraints.
 
 ## Architecture
 
-ZDM treats a zoned device as a collection of 1024 zones [256GiB], referred to internally as 'megazones'. The last megazone may be less than 1024 zones in size. Each megazone reserves a minimum 8 zones for meta data and over-provisioning [less than 1% of a disk].
+ZDM implements a translation layer between a the tradition block interface
+and a zoned block device (ZBD) supporting the ZBC or ZAC command set. ZDM
+utilizes the available conventional space on a ZBD drive for storing the
+translation layer mapping data. The device configuration should include a
+minimum of 0.1% of the drive capacity  as conventional space, however 0.2%
+is currently preferred and most tested. The current design assumes the
+conventional space is located at the low LBA range of the partition or the
+drive. The preferred layout is a typical GPT partitioned drive with a large
+single partition [ex: parted -s /dev/sdX mkpart 1MiB -- -1].
 
-Device trim [aka discard] support is enabled by default. It is recommended to increase the over-provision ratio when discard support is disabled.
+It is recommended that ZDM be configured to allocate 1%, the default, of the
+drive capacity as over provisioning used to manage the garbage collection of
+stale blocks.
 
-The initial implementation focuses on drives with same sized zones of 256MB which is 65536 4k blocks. In future the zone size of 256MB will be relaxed to allow any size of zone as long as they are all the same.
-Internally all addressing is on 4k boundaries. Currently a 4k PAGE_SIZE is assumed. Architectures with 8k (or other) PAGE_SIZE values have not been tested and are likely broken at the moment.
+ZDM supports the BLKDISCARD IOCTL issued by blkdiscard(). It is recommended
+that filesystems are mounted with the -o discard option.
 
-Host Managed drives should work if the zone type at the start of the partition is Conventional, or Preferred.
+The initial implementation focuses on drives with same sized zones of 256 MiB.
+In future the support for other zones sizes will be added.
+Internally all addressing is on 4-KiB (4k) boundaries. Currently a 4k PAGE_SIZE
+is assumed. Architectures with 8k (or other) PAGE_SIZE values have not been
+tested and are likely broken at the moment.
+
+Drives of the more restrictive Host Managed device type are expected to work
+provided the required amount of conventional space is available.
 
 ## Software Requirements
 
-  - Current Linux Kernel (4.2) with ZDM patches
-  - Recommended: sg3utils (1.41 or later)
+  - Current Linux Kernel v4.1 to v.4.3 with ZDM patches
+  - Recommended: sg3utils (1.41 or later) or sd-tools.
 
 ## Caveat Emptor - Warning
 
-  - ZDM software is a work in progress, subject to change without notice and is provided without warranty for any particular intended purpose beyond testin and reference. The ZDM may become unstable, resulting in system crash or hang, including the possibiliy of data loss.  No responsibility for lost data or system damage is assummed by the creators or distributors of ZDM software.  Users explicitly assume all risk associated with running the ZDM software.
+  - ZDM software is a work in progress, subject to change without
+    notice and is provided without warranty for any particular
+    intended purpose beyond testing and reference. The ZDM may
+    become unstable, resulting in system crash or hang, including
+    the possibility of data loss.
+    No responsibility for lost data or system damage is assumed by
+    the creators or distributors of ZDM software.
+    Users explicitly assume all risk associated with running
+    the ZDM software.
 
 ## Current restrictions/assumptions
 
-  - Zone size (256MiB).
-  - 4k page / block size.
-  - Host Aware, Conventional
-  - Host Managed w/partition starting on a Conventional, or Preferred zone type.
-  - Currently 1 GiB of RAM per drive is recommeneded.
+  - All zones are 256 MiB.
+  - 4k page or block size.
+  - Host Aware zoned block device, possibly with conventional zones.
+  - Host Managed zoned block device with conventional zones.
+  - Currently 256 MiB of RAM per drive is recommended.
 
 ## Userspace utilities
-  - zdm-tools: zdmadm, zdm-status, zdm-zones ...
+  - zdm-tools: zdmadm, zdm-status, zdm-zones, zdmon and others ...
   - zbc/zac tools (sd_* tools)
 
 ## Typical Setup
@@ -55,14 +80,13 @@ or
 
   - Partition the drive to start the partition at a WP boundary.
 ```
-      parted /dev/sdX
-      mklabel gpt
-      mkpart primary 256MiB 7452GiB
+      parted -s /dev/sdX mklabel gpt
+      parted -s mkpart primary 1MiB -- -1
 ```
 
   - Place ZDM drive mapper on /dev/sdX
 ```
-      zdmadm -c /dev/sdX1
+      zdmadm -F -c /dev/sdX1
 ```
 
   - Format:
@@ -101,42 +125,36 @@ If not, please see http://www.gnu.org/licenses/.
 
 ## Contact and Bug Reports
 
- - Adrian Palmer [adrian.palmer@seagate.com](mailto:adrian.palmer@seagate.com)
+  - Adrian Palmer [adrian.palmer@seagate.com](mailto:adrian.palmer@seagate.com)
 
-## Observations and Known Issues
+## ZDM Patches for other projects
 
- - Issue
-    * System: 	Dual 6 core Xeon 64 GB RAM LSI HBA
-    * Software:	Ubuntu 14.10 (GNU/Linux 4.2.0-rc8-zdm x86_64)
-    * File system: ext4 ``mkfs -E discard`` and  ``mount -o discard``
-    * Test load: Python 2.7 file create, appending writes, close. OS deletes No file reads.
-    * Results: No data corruption detected. Kenrel panic with heavy write/delete load with file system > 75% full.
+  - CEPH: Enable ceph to created and used an OSD that used ZDM. NOTE: depends on blkid support from util-linux or util-linux-ng.
+    * 0.94.5 [ceph patch](/patches/ceph)
+  - util-linux
+    * 2.20.1 [2.20.1 in use by Ubuntu 14.04](/patches/util-linux/2.20.1)
+    * 2.27 [2.27 development](/patches/util-linux/2.27)
+  - util-linux-ng
+    * 2.17.2 [2.17.2 in use by CentOS 6.7](/patches/util-linux-ng)
 
- - Issue
-    * System: 	Dual 6 core Xeon 64 GB RAM LSI HBA
-    * Software:	Ubuntu 14.10 (GNU/Linux 4.2.0-rc8-zdm x86_64)
-    * File system: ext4 ``mkfs -E discard`` and  ``mount -o discard``
-    * Test: LevelDB PUT/GET
-    * Method: LeveDB Python binding.  Sequential PUTs, random GETs. No DELs
-    * Results: No data corruption, no errors.
-    * Overall data throughput slightly (15%) better than 4TB desktop SATA. See table.
-|-|zdm|desktop|delta|
-|total bytes put/get in 8000 seconds|252969405|221489766|1.142126833|
-|median put MB/sec|37.237|30.073|1.238220331|
-|average put MB/sec|38.13009984|30.08739469|1.267311451|
-|median get MB/sec|101.048|97.415|1.037294051|
-|average get MB/sec|1054.253523|1355.445637|0.7777910782|
+## ZDM Linux Kernel
 
- - Issue
-    * System: SDS-6037R-E1R16L using onboard LSI/Avago 2308 HBA chipset
-    * Test: Single drive with ext4 running multiple 50GB file writes, compares, and deletes.
-    * Result: Observed no degradation in performance or miscompares.
+  - Patches
+    * v4.1 [ZDM r101 patches for linux v4.1](/patches/linux/v4.1+ZDM-r101)
+    * v4.2 [ZDM r101 patches for linux v4.2](/patches/linux/v4.2+ZDM-r101)
+    * v4.3 [ZDM r101 patches for linux v4.3](/patches/linux/v4.3+ZDM-r101)
+  - Linux kernel with ZDM patches applied.
+    * v4.1 https://seagit.okla.seagate.com/ZDM-Release/zdm-kernel/tree/v4.1+ZDM-r101
+    * v4.2 https://seagit.okla.seagate.com/ZDM-Release/zdm-kernel/tree/v4.2+ZDM-r101
+    * v4.3 https://seagit.okla.seagate.com/ZDM-Release/zdm-kernel/tree/v4.2+ZDM-r101
 
- - Issue
-    * System: SDS-6037R-E1R16L using onboard LSI/Avago 2308 HBA chipset
-    * Test: RAID 5 across 4 drives with ZDM
-    * Result: Observed degrading performance and occasional miscompare.
-    * Notes: ZDM is currently not optimized for the complexity of RAID5. Furthermore, it appears that one drive is stressed more during writes to the filesystem than the other 3 drives.
+## Observations and Known Issues in this release (#101)
+
+  - XFS Hang on v4.3 and v4.4 kernels
+    * ZDM is known to cause XFS to hang during I/O.
+    * Hangs appear to happen quickly following discard handling in ZDM.
+  - Bug: Write back of metadata could cause inconsitency in case of sudden power loss between SYNC's
+  - Bug: A race condition exists causing corrupt metadata and -ENOSPC will be reported and halting writes.
 
 ## Changes from Initial Release
 
@@ -163,3 +181,8 @@ If not, please see http://www.gnu.org/licenses/.
   - ZDM #97
     * Fix block ata zoned_command (Reset WP). Using wrong psudo constant.
     * Fix a deadlock when gc_immediate is called from multple threads.
+
+  - ZDM #101
+    * Added Stream Id to manage co-location of data with similar expected lifetimes.
+    * Remove the fixed address segmentation (Megazone) scheme.
+    * Added support for large conventional space in low LBAs and utilize the space for translation tables.

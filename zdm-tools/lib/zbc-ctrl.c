@@ -79,9 +79,9 @@ static unsigned char r_opts[] = {
 
 
 #define Z_VPD_INFO_BYTE 8
-#define DATA_OFFSET (offsetof(zoned_inquiry_t, result))
+#define DATA_OFFSET (offsetof(struct zoned_inquiry, result))
 
-int zdm_is_ha_device(zoned_inquiry_t * inquire, int verbose)
+int zdm_is_ha_device(struct zoned_inquiry *inquire, int verbose)
 {
 	int is_smr = 0;
 	int is_ha  = 0;
@@ -108,11 +108,11 @@ int zdm_is_ha_device(zoned_inquiry_t * inquire, int verbose)
 }
 
 
-zoned_inquiry_t * zdm_device_inquiry(int fd, int do_ata)
+struct zoned_inquiry *zdm_device_inquiry(int fd, int do_ata)
 {
 	int sz = 64;
 	int bytes = sz + DATA_OFFSET;
-	zoned_inquiry_t * inquire;
+	struct zoned_inquiry *inquire;
 
 	inquire = malloc(bytes);
 	if (inquire) {
@@ -190,12 +190,12 @@ static u32 endian32(u32 in)
 	return fix_endian ? be32toh(in) : in;
 }
 
-static void test_endian(struct bdev_zone_report_result_t * info)
+static void test_endian(struct bdev_zone_report *info)
 {
 	fix_endian = zdm_is_big_endian_report(info);
 }
 
-void print_zones(struct bdev_zone_report_result_t * info, uint32_t size)
+void print_zones(struct bdev_zone_report *info, uint32_t size)
 {
 	u32 count = endian32(info->descriptor_count);
 	u32 max_count;
@@ -207,8 +207,8 @@ void print_zones(struct bdev_zone_report_result_t * info, uint32_t size)
 		same_code, same_text[same_code],
 		endian64(info->maximum_lba & (~0ul >> 16)) );
 
-	max_count = (size - sizeof(struct bdev_zone_report_result_t))
-                        / sizeof(struct bdev_zone_descriptor_entry_t);
+	max_count = (size - sizeof(struct bdev_zone_report))
+                        / sizeof(struct bdev_zone_descriptor);
 	if (count > max_count) {
 		fprintf(stderr, "Truncating report to %d of %d zones.\n",
 			max_count, count );
@@ -216,7 +216,7 @@ void print_zones(struct bdev_zone_report_result_t * info, uint32_t size)
 	}
 
 	for (iter = 0; iter < count; iter++ ) {
-		struct bdev_zone_descriptor_entry_t * entry =
+		struct bdev_zone_descriptor * entry =
 			&info->descriptors[iter];
 		unsigned int type  = entry->type & 0xF;
 		unsigned int flags = entry->flags;
@@ -232,10 +232,10 @@ void print_zones(struct bdev_zone_report_result_t * info, uint32_t size)
 	}
 }
 
-int zdm_is_big_endian_report(struct bdev_zone_report_result_t * info)
+int zdm_is_big_endian_report(struct bdev_zone_report *info)
 {
 	int is_big = 0;
-	struct bdev_zone_descriptor_entry_t * entry = &info->descriptors[0];
+	struct bdev_zone_descriptor * entry = &info->descriptors[0];
 	u64 be_len;
 	be_len = be64toh(entry->length);
 	if ( be_len == 0x080000 ||
@@ -249,7 +249,7 @@ int zdm_is_big_endian_report(struct bdev_zone_report_result_t * info)
 	return is_big;
 }
 
-int zdm_report_zones(int fd, struct bdev_zone_report_ioctl_t * zone_info,
+int zdm_report_zones(int fd, struct bdev_zone_report_io *zone_info,
 		     uint64_t size, uint8_t option, uint64_t lba, int do_ata)
 {
 	int rc;
@@ -276,7 +276,7 @@ int do_report_zones_ioctl(const char * pathname, uint64_t lba, int do_ata)
 	int rc = -4;
         int fd = open(pathname, O_RDWR);
         if (fd != -1) {
-		struct bdev_zone_report_ioctl_t * zone_info;
+		struct bdev_zone_report_io *zone_info;
                 uint64_t size;
 
 		/* NOTE: 128 seems to be about the RELIABLE limit ...     */

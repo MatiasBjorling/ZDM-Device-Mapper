@@ -53,160 +53,241 @@
 #include <libcrc.h>
 
 
+typedef struct zdm_ioc_status zdm_ioc_status_t;
+typedef struct zdm_ioc_request zdm_ioc_request_t;
+
+typedef union zdm_ioc
+{
+    zdm_ioc_request_t request;
+    zdm_ioc_status_t  status;
+} zdm_ioc_t;
+
+struct zone_value_entry
+{
+    u32 zone;
+    u32 value;
+};
+
 static volatile int clean_exit = 0;
 
 /* Ctrl-\ handler */
-void sigint_handler(int sig) {
-	clean_exit = 1;
-	signal(sig, sigint_handler); /* re-install handler */
+void sigint_handler(int sig)
+{
+    clean_exit = 1;
+    signal(sig, sigint_handler); /* re-install handler */
 }
 
-int query_everything(int m_fd, int m_count, FILE *wfp)
+int query_everything(int fd_stats, int fd_wps, int fd_use, FILE *wfp)
 {
-	int rcode = 0;
-	int entry;
-	size_t sz = sizeof(struct zdm_record) + (m_count * sizeof(struct megazone_info));
-	struct zdm_record * m_data = calloc(1, sz);
+    int rcode = 0;
+    int32_t mz_count = 0;
+    u32 iter = 0;
+    u32 mz;
+    ssize_t in;
+    ssize_t sz;
+    struct zone_value_entry entry;
+    struct zdm_ioc_status status;
+    struct zdm_record * m_rec;
+    off_t pos = 0ul;
 
-	printf("how_big: header: %lu, data: %lu, total: %lu [m_count: %d]\n",
-		sizeof(struct zdm_record),
-		m_count * sizeof(struct megazone_info),
-		sz,
-		m_count );
+    in = read(fd_stats, &status, sizeof(status));
+    if (in == sizeof(status))
+    {
+        mz_count = (status.m_zones + 1023) / 1024;
+    }
+    else
+    {
+        fprintf(stderr, "Read -> %ld\n", in );
+        return -1;
+    }
 
-	m_data->size = sz;
-	m_data->mz_count = m_count;
-	time(&m_data->at.tval);
-        for (entry = 0; entry < m_count; entry++)
+    sz = sizeof(struct zdm_record) + (mz_count * sizeof(struct megazone_info));
+    m_rec = malloc(sz);
+    m_rec->size = sz;
+    m_rec->mz_count = mz_count;
+    m_rec->crc32 = 0u;
+    time(&m_rec->at.tval);
+
+    memset(m_rec->data, 0xff, mz_count * sizeof(struct megazone_info));
+    for (iter = 0; iter < status.m_zones && in > 0; iter++)
+    {
+        mz = iter / 1024;
+        in = read(fd_wps, &entry, sizeof(entry));
+        if (in == sizeof(entry))
         {
-            struct zdm_ioc_request * req_wps  = (struct zdm_ioc_request *)m_data->data[entry].wps;
-            struct zdm_ioc_request * req_free = (struct zdm_ioc_request *)m_data->data[entry].free;
-            union zdm_ioc_state * req_status  = (union zdm_ioc_state *)&m_data->data[entry].state;
-
-            req_wps->result_size = sizeof(m_data->data[entry].wps);
-            req_wps->megazone_nr = entry;
-            req_free->result_size = sizeof(m_data->data[entry].free);
-            req_free->megazone_nr = entry;
-            req_status->request.result_size = sizeof(m_data->data[entry].state);
-            req_status->request.megazone_nr = entry;
-
-            rcode = ioctl(m_fd, ZDM_IOC_WPS, req_wps);
-            if (rcode < 0)
-            {
-                fprintf(stderr, "ERROR: ZDM_IOC_WPS -> %d", rcode);
-                break;
-            }
-            rcode = ioctl(m_fd, ZDM_IOC_FREE, req_free);
-            if (rcode < 0)
-            {
-                fprintf(stderr, "ERROR: %d\n", rcode);
-                break;
-            }
-            rcode = ioctl(m_fd, ZDM_IOC_STATUS, req_status);
-            if (rcode < 0)
-            {
-                fprintf(stderr, "ERROR: ZDM_IOC_STATUS -> %d", rcode);
-                break;
-            }
+            m_rec->data[mz].wps[iter % 1024] = entry.value;
         }
-	m_data->crc32 = crc32c(~(u32) 0u, m_data, sz);
+    }
 
-	fwrite(m_data, sz, 1, wfp);
+    for (iter = 0; iter < status.m_zones && in > 0; iter++)
+    {
+        mz = iter / 1024;
+        in = read(fd_use, &entry, sizeof(entry));
+        if (in == sizeof(entry))
+        {
+            m_rec->data[mz].free[iter % 1024] = entry.value;
+        }
+    }
 
-	return rcode;
+    lseek(fd_stats, pos, SEEK_SET);
+    lseek(fd_wps,   pos, SEEK_SET);
+    lseek(fd_use,   pos, SEEK_SET);
+
+    for (iter = 0; iter < mz_count; iter++)
+    {
+        memcpy(&m_rec->data[iter].state, &status, sizeof(status));
+    }
+
+    m_rec->crc32 = crc32c(~(u32) 0u, m_rec, m_rec->size);
+
+    in = fwrite(m_rec, 1, m_rec->size, wfp);
+    fprintf(stderr, "Wrote: %ld\n", in );
+
+    return rcode;
 }
 
 
-int do_query_wps(int fd, int period, FILE *wfp, int verbose)
+int do_query_wps(const char *ppath, int period, FILE *wfp)
 {
-	int rcode = ioctl(fd, ZDM_IOC_MZCOUNT, 0);
-	if (rcode < 0) {
-		fprintf(stderr, "ERROR: %d\n", rcode);
-	} else {
-		int mz_count = rcode;
-                while (!clean_exit) {
-			rcode = query_everything(fd, mz_count, wfp);
-			if (rcode) {
-				break;
-			}
-			sleep(period);
-		}
-	}
-	return rcode;
+    int rcode = -1;
+    char stats[128];
+    char wps[128];
+    char use[128];
+    int fd_stats = -1;
+    int fd_wps = -1;
+    int fd_use = -1;
+
+    snprintf(stats, sizeof(stats), "%s/" PROC_DATA, ppath);
+    snprintf(wps,   sizeof(wps  ), "%s/" PROC_WP, ppath);
+    snprintf(use,   sizeof(use  ), "%s/" PROC_FREE, ppath);
+
+    fd_stats = open(stats, O_RDONLY);
+    if (fd_stats == -1)
+    {
+        goto out;
+    }
+
+    fd_wps = open(wps, O_RDONLY);
+    if (fd_wps == -1)
+    {
+        goto out;
+    }
+
+    fd_use = open(use, O_RDONLY);
+    if (fd_use == -1)
+    {
+        goto out;
+    }
+
+    while (!clean_exit)
+    {
+        rcode = query_everything(fd_stats, fd_wps, fd_use, wfp);
+        if (rcode)
+        {
+            break;
+        }
+        sleep(period);
+    }
+
+out:
+
+    if (fd_stats != -1)
+    {
+        close(fd_stats);
+    }
+
+    if (fd_wps != -1)
+    {
+        close(fd_wps);
+    }
+
+    if (fd_use != -1)
+    {
+        close(fd_use);
+    }
+
+    if (rcode < 0)
+    {
+        fprintf(stderr, "ERROR: %d\n", rcode);
+    }
+    return rcode;
 }
 
 void usage(void)
 {
-	printf("USAGE:\n"
-	       "    zdm-mlog [-l <level>] [-p <seconds>] -o <outfile> zdm_device\n"
-	       "Defaults are: -v 0\n"
-	       "              -p 1\n"
-	       "              -o ./zdm_device.log\n");
+    printf("USAGE:\n"
+           "    zdm-mlog [-l <level>] [-p <seconds>] -o <outfile> zdm_device\n"
+           "Defaults are: -v 0\n"
+           "              -p 1\n"
+           "              -o ./zdm_device.log\n");
 }
 
 int main(int argc, char *argv[])
 {
-	int opt;
-	int index;
-	int period = 1;
-	int loglevel;
-	int exCode = 0;
-	char *fname = NULL;
+    int opt;
+    int index;
+    int period = 1;
+    int exCode = 0;
+    char *fname = NULL;
 
-	/* Parse command line */
-	errno = EINVAL; // Assume invalid Argument if we die
-	while ((opt = getopt(argc, argv, "o:v:p:")) != -1) {
-		switch (opt) {
-		case 'o':
-			fname = optarg;
-			break;
-                case 'p':
-			period = atoi(optarg);
-			break;
-		case 'v':
-			loglevel = atoi(optarg);
-			break;
-		default:
-			usage();
-			break;
-		} /* switch */
-	} /* while */
+    /* Parse command line */
+    errno = EINVAL; // Assume invalid Argument if we die
+    while ((opt = getopt(argc, argv, "o:v:p:")) != -1)
+    {
+        switch (opt)
+        {
+        case 'o':
+            fname = optarg;
+            break;
+        case 'p':
+            period = atoi(optarg);
+            break;
+        default:
+            usage();
+            break;
+        } /* switch */
+    } /* while */
 
-	if (!fname) {
-		usage();
-		printf(" ** -o <outfile> required to log data\n");
-		exCode = 1;
-		goto done;
-	}
+    if (!fname)
+    {
+        usage();
+        printf(" ** -o <outfile> required to log data\n");
+        exCode = 1;
+        goto done;
+    }
 
-	for (index = optind; index < argc; index++) {
-		int fd;
+    for (index = optind; index < argc; index++)
+    {
+        struct stat st_buf;
 
-		fd = open(argv[index], O_RDWR);
-		if (fd) {
-			FILE *ofp = fopen(fname, "w");
-			if (ofp) {
+        if (0 == stat(argv[index], &st_buf) &&
+                S_ISDIR(st_buf.st_mode))
+        {
+            FILE *ofp = fopen(fname, "w");
+            if (ofp)
+            {
+                /* Set up QUIT, INT, HUP and ABRT handlers */
+                signal(SIGQUIT, sigint_handler);
+                signal(SIGINT, sigint_handler);
+                signal(SIGABRT, sigint_handler);
+                signal(SIGHUP, sigint_handler);
 
-				/* Set up QUIT, INT, HUP and ABRT handlers */
-				signal(SIGQUIT, sigint_handler);
-				signal(SIGINT, sigint_handler);
-				signal(SIGABRT, sigint_handler);
-				signal(SIGHUP, sigint_handler);
+                do_query_wps(argv[index], period, ofp);
+                fclose(ofp);
+            }
+        }
+        else
+        {
+            perror("Failed to open file");
+            fprintf(stderr, "No a directory: %s", argv[index]);
+        }
+    }
 
-				do_query_wps(fd, period, ofp, loglevel);
-				fclose(ofp);
-			}
-			close(fd);
-		} else {
-			perror("Failed to open file");
-			fprintf(stderr, "file: %s", argv[index]);
-		}
-	}
-
-	(void) loglevel;
+    if (argc == 1 || optind == 0)
+    {
+        usage();
+    }
 
 done:
-	return exCode;
+    return exCode;
 }
-
-

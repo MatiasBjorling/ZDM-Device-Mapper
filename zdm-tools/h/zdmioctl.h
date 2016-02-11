@@ -21,11 +21,40 @@
 #define ZDM_IOC_FREE             0x5a4e0003
 #define ZDM_IOC_STATUS           0x5a4e0004
 
-#define Z_WP_GC_FULL            (1u << 31)
-#define Z_WP_GC_ACTIVE          (1u << 30)
-#define Z_WP_GC_TARGET          (1u << 29)
-#define Z_WP_GC_READY           (1u << 28)
-#define Z_WP_NON_SEQ            (1u << 27)
+#define PROC_WP			"wp.bin"
+#define PROC_FREE		"free.bin"
+#define PROC_DATA		"data.bin"
+#define PROC_STATUS		"status"
+
+#define Z_WP_GC_FULL		(1u << 31)
+#define Z_WP_GC_ACTIVE		(1u << 30)
+#define Z_WP_GC_TARGET		(1u << 29)
+#define Z_WP_GC_READY		(1u << 28)
+#define Z_WP_GC_BITS		(0xFu << 28)
+
+#define Z_WP_RRECALC		(1u << 31)
+// #define Z_WP_RA_ACTIVE		(1u << 30)
+// #define Z_WP_RA_TARGET		(1u << 29)
+// #define Z_WP_RA_READY		(1u << 28)
+// #define Z_WP_RA_BITS		(0xFu << 28)
+
+
+#define Z_WP_GC_PENDING		(Z_WP_GC_FULL|Z_WP_GC_ACTIVE)
+#define Z_WP_NON_SEQ		(1u << 27)
+#define Z_WP_RESV_01		(1u << 26)
+#define Z_WP_RESV_02		(1u << 25)
+#define Z_WP_RESV_03		(1u << 24)
+
+#define Z_WP_VALUE_MASK		(~0u >> 8)
+#define Z_WP_FLAGS_MASK		(~0u << 24)
+#define Z_WP_STREAM_MASK        Z_WP_FLAGS_MASK
+
+#define Z_AQ_GC			(1u << 31)
+#define Z_AQ_META		(1u << 30)
+#define Z_AQ_NORMAL		(1u << 29)
+#define Z_AQ_STREAM_ID		(1u << 28)
+#define Z_AQ_STREAM_MASK	(0xFF)
+#define Z_AQ_META_STREAM	(Z_AQ_META | Z_AQ_STREAM_ID | 0xFE)
 
 #ifdef __cplusplus
 extern "C" {
@@ -37,7 +66,7 @@ struct zdm_ioc_status {
 	uint64_t b_used;
 	uint64_t b_available;
 	uint64_t b_discard;
-	uint64_t m_used;
+	uint64_t m_zones;
 	uint64_t mc_entries;
 	uint64_t mlut_blocks;
 	uint64_t crc_blocks;

@@ -48,157 +48,202 @@
 #include <sys/mman.h>
 #include <sys/time.h>
 
-
-
 #include "utypes.h"
+#include <zdmioctl.h>
+#include <libcrc.h>
 
-struct zdm_ioc_request {
-	u32 result_size;
-	u32 megazone_nr;
+static volatile int clean_exit = 0;
+
+/* Ctrl-\ handler */
+void sigint_handler(int sig)
+{
+    clean_exit = 1;
+    signal(sig, sigint_handler); /* re-install handler */
+}
+
+struct zone_value_entry
+{
+    u32 zone;
+    u32 value;
 };
 
-// request an info dump from ZDM:
-#define ZDM_IOC_MZCOUNT 0x5a4e0001
-#define ZDM_IOC_WPS     0x5a4e0002
-#define ZDM_IOC_FREE    0x5a4e0003
-#define ZDM_IOC_STATUS  0x5a4e0004
-
-int do_show_megaz(int fd, int megaz)
+int query_everything(int fd_wps, int fd_use, int skip)
 {
-	int ncolumns = 5;
-	int cc;
-	int rcode = 0;
-	struct zdm_ioc_request * req_wps;
-	struct zdm_ioc_request * req_free;
+    int ncolumns = 5;
+    int cc;
+    int rcode = 0;
+    int zone_nr = 0;
+    ssize_t in_wp, in_use;
+    struct zone_value_entry wp;
+    struct zone_value_entry use;
+    off_t pos = 0ul;
 
-	req_wps  = malloc(4096);
-	req_free = malloc(4096);
-	if (req_wps && req_free) {
 
-		req_wps->result_size = 4096;
-		req_wps->megazone_nr = megaz;
+    for (cc = 0; cc < ncolumns; cc++)
+    {
+        printf("entry fl.  wps .free -");
+    }
+    printf("\n");
 
-		rcode = ioctl(fd, ZDM_IOC_WPS, req_wps);
-		if (rcode < 0) {
-			printf("ERROR: %d\n", rcode);
-			goto out;
-		}
-		req_free->result_size = 4096;
-		req_free->megazone_nr = megaz;
+    do
+    {
+        in_wp  = read(fd_wps, &wp, sizeof(wp));
+        in_use = read(fd_use, &use, sizeof(use));
 
-		rcode = ioctl(fd, ZDM_IOC_FREE, req_free);
-		if (rcode < 0) {
-			printf("ERROR: %d\n", rcode);
-			return rcode;
-		}
+        if (in_wp == sizeof(wp) && in_use == sizeof(use))
+        {
+            zone_nr++;
+            if (zone_nr < skip)
+            {
+                continue;
+            }
 
-		if (rcode == 0) {
-			int nn;
-			u32 * wps = (u32 *)req_wps;
-			u32 * fct = (u32 *)req_free;
+            cc = zone_nr % ncolumns;
+            printf("%4d: %2x %6x %5u ",
+                   zone_nr,
+                   wp.value >> 24,
+                   wp.value & 0xFFFFFF,
+                   use.value & 0xFFFFFF );
 
-			for (cc = 0; cc < ncolumns; cc++) {
-				printf("entry fl.  wps .free -");
-			}
-			printf("\n");
+            if ((zone_nr % ncolumns) == 0)
+            {
+                printf("\n");
+            }
+        }
+    }
+    while (in_wp > 0 && in_use > 0);
 
-			for (nn = 0; nn < 1024;) {
-				for (cc = 0; cc < ncolumns; cc++) {
-					u32 flags = wps[nn] >> 24;
-					if (wps[nn] == 0xFFFFFFFF) {
-						break; // end of data
-					}
-					printf("%4d: %2x %6x %5u ",
-						nn,
-						flags,
-						wps[nn] & 0xFFFFFF,
-						fct[nn] );
-					nn++;
-				}
-				printf("\n");
+    lseek(fd_wps,   pos, SEEK_SET);
+    lseek(fd_use,   pos, SEEK_SET);
+    printf("\n");
 
-				if (wps[nn] == 0xFFFFFFFF) {
-					break; // end of data
-				}
-			}
-		}
-	}
+    return rcode;
+}
+
+int do_query_wps(const char *ppath, int skip, int period)
+{
+    int rcode = -1;
+    char wps[128];
+    char use[128];
+    int fd_wps = -1;
+    int fd_use = -1;
+
+    snprintf(wps,   sizeof(wps  ), "%s/" PROC_WP, ppath);
+    snprintf(use,   sizeof(use  ), "%s/" PROC_FREE, ppath);
+
+    fd_wps = open(wps, O_RDONLY);
+    if (fd_wps == -1)
+    {
+        goto out;
+    }
+
+    fd_use = open(use, O_RDONLY);
+    if (fd_use == -1)
+    {
+        goto out;
+    }
+
+    while (!clean_exit)
+    {
+        rcode = query_everything(fd_wps, fd_use, skip);
+        if (rcode)
+        {
+            break;
+        }
+        if (period == 0)
+        {
+            break;
+        }
+        sleep(period);
+        printf("\n");
+
+    }
+
 out:
-	if (req_wps) {
-		free(req_wps);
-	}
-	if (req_free) {
-		free(req_free);
-	}
-	return rcode;
+
+    if (fd_wps != -1)
+    {
+        close(fd_wps);
+    }
+
+    if (fd_use != -1)
+    {
+        close(fd_use);
+    }
+
+    if (rcode < 0)
+    {
+        fprintf(stderr, "ERROR: %d\n", rcode);
+    }
+    return rcode;
 }
 
-int do_query_wps(int fd, int megaz)
+void usage(void)
 {
-	int rcode = ioctl(fd, ZDM_IOC_MZCOUNT, 0);
-	if (rcode < 0) {
-		printf("ERROR: %d\n", rcode);
-	} else {
-		u32 count = rcode;
-
-		printf("Got %u megazones\n", rcode);
-
-		if (-1 == megaz) {
-			u32 entry;
-			for (entry = 0; entry < count; entry++) {
-				rcode = do_show_megaz(fd, entry);
-			}
-		} else if (megaz < rcode) {
-			rcode = do_show_megaz(fd, megaz);
-		}
-	}
-	return rcode;
+    printf("USAGE:\n"
+           "    zdm-zones -p <repeat seconds> -m <skip_zones> proc_path ...\n"
+           "Defaults are: -p 0 -m 0\n"
+           "\n"
+           "  Ex: zdm-zones /proc/zdm_sdf1\n" );
 }
-
 
 
 int main(int argc, char *argv[])
 {
-	int opt;
-	int index;
-	int loglevel;
-	int megaz  = -1;
-	int exCode = 0;
+    int opt;
+    int index;
+    int megaz  = -1;
+    int exCode = 0;
+    int period = 0;
 
-	/* Parse command line */
-	errno = EINVAL; // Assume invalid Argument if we die
-	while ((opt = getopt(argc, argv, "m:l:")) != -1) {
-		switch (opt) {
-		case 'm':
-			megaz = atoi(optarg);
-			break;
-		case 'l':
-			loglevel = atoi(optarg);
-			break;
-		default:
-			printf("USAGE:\n"
-			       "    verify -l loglevel files...\n"
-			       "Defaults are: -l 0\n");
-			break;
-		} /* switch */
-	} /* while */
+    /* Parse command line */
+    errno = EINVAL; // Assume invalid Argument if we die
+    while ((opt = getopt(argc, argv, "m:l:p:")) != -1)
+    {
+        switch (opt)
+        {
+        case 'm':
+            megaz = atoi(optarg);
+            break;
+        case 'p':
+            period = atoi(optarg);
+            break;
+        default:
+            usage();
+            break;
+        } /* switch */
+    } /* while */
 
-	for (index = optind; index < argc; index++) {
-		int fd;
+    for (index = optind; index < argc; index++)
+    {
+        struct stat st_buf;
 
-		printf("Do something with %s\n", argv[index] );
-		fd = open(argv[index], O_RDWR);
-		if (fd) {
-			do_query_wps(fd, megaz);
-		} else {
-			perror("Failed to open file");
-			fprintf(stderr, "file: %s", argv[index]);
-		}
-	}
+        if (0 == stat(argv[index], &st_buf) &&
+                S_ISDIR(st_buf.st_mode))
+        {
 
-	(void) loglevel;
+            /* Set up QUIT, INT, HUP and ABRT handlers */
+            signal(SIGQUIT, sigint_handler);
+            signal(SIGINT, sigint_handler);
+            signal(SIGABRT, sigint_handler);
+            signal(SIGHUP, sigint_handler);
 
-	return exCode;
+            do_query_wps(argv[index], megaz, period);
+
+        }
+        else
+        {
+            perror("Failed to open file");
+            fprintf(stderr, "No a directory: %s", argv[index]);
+        }
+    }
+
+    if (argc == 1 || optind == 0)
+    {
+        usage();
+    }
+
+    return exCode;
 }
 
 

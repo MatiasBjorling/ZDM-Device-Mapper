@@ -1,0 +1,30 @@
+From da1c54d0329796d42bdf3f5b93c775658037500a Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Thu, 4 Feb 2016 13:35:08 -0600
+Subject: [PATCH 6/7] RAID 4/5/6: Indicate parity blocks as 'META'
+
+    It is useful for ZDM to know that a block is part of a parity stripe
+    as parity stripes are deemed to be hotter and more prone to becoming
+    stale. ZDM will co-locate META bios to alternate streams.
+
+Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
+---
+ drivers/md/raid5.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index b6793d2..d52711c 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -926,6 +926,8 @@ again:
+ 			rrdev = NULL;
+ 		}
+ 		if (rw & WRITE) {
++			if (i == sh->pd_idx || i == sh->qd_idx)
++				rw |= REQ_META;
+ 			if (replace_only)
+ 				rdev = NULL;
+ 			if (rdev == rrdev)
+-- 
+2.7.0
+
