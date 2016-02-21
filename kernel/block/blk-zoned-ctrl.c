@@ -114,13 +114,13 @@ int blk_cmd_execute(struct request_queue *queue,
 	int write = (data_direction == DMA_TO_DEVICE);
 	int ret = DRIVER_ERROR << 24;
 
-	req = blk_get_request(queue, write, __GFP_WAIT);
+	req = blk_get_request(queue, write, GFP_KERNEL);
 	if (IS_ERR(req))
 		return ret;
 	blk_rq_set_block_pc(req);
 
 	if (bufflen &&  blk_rq_map_kern(queue, req,
-					buffer, bufflen, __GFP_WAIT))
+					buffer, bufflen, GFP_KERNEL))
 		goto out;
 
 	req->cmd_len = COMMAND_SIZE(cmd[0]);

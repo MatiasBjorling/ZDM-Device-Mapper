@@ -357,6 +357,7 @@ void ext4_io_submit(struct ext4_io_submit *io)
 		int io_op = io->io_wbc->sync_mode == WB_SYNC_ALL ?
 			    WRITE_SYNC : WRITE;
 		bio_get(io->io_bio);
+		io->io_bio->pid = io->pid;
 		submit_bio(io_op, io->io_bio);
 		bio_put(io->io_bio);
 	}
@@ -385,6 +386,7 @@ static int io_submit_init_bio(struct ext4_io_submit *io,
 	bio->bi_end_io = ext4_end_bio;
 	bio->bi_private = ext4_get_io_end(io->io_end);
 	io->io_bio = bio;
+	io->io_bio->pid = io->pid;
 	io->io_next_block = bh->b_blocknr;
 	return 0;
 }
@@ -425,6 +427,7 @@ int ext4_bio_write_page(struct ext4_io_submit *io,
 	struct buffer_head *bh, *head;
 	int ret = 0;
 	int nr_submitted = 0;
+	int nr_to_submit = 0;
 
 	blocksize = 1 << inode->i_blkbits;
 
@@ -468,8 +471,10 @@ int ext4_bio_write_page(struct ext4_io_submit *io,
 			/* A hole? We can safely clear the dirty bit */
 			if (!buffer_mapped(bh))
 				clear_buffer_dirty(bh);
-			if (io->io_bio)
+			if (io->io_bio) {
+				io->io_bio->pid = inode->pid;
 				ext4_io_submit(io);
+			}
 			continue;
 		}
 		if (buffer_new(bh)) {
@@ -477,11 +482,13 @@ int ext4_bio_write_page(struct ext4_io_submit *io,
 			unmap_underlying_metadata(bh->b_bdev, bh->b_blocknr);
 		}
 		set_buffer_async_write(bh);
+		nr_to_submit++;
 	} while ((bh = bh->b_this_page) != head);
 
 	bh = head = page_buffers(page);
 
-	if (ext4_encrypted_inode(inode) && S_ISREG(inode->i_mode)) {
+	if (ext4_encrypted_inode(inode) && S_ISREG(inode->i_mode) &&
+	    nr_to_submit) {
 		data_page = ext4_encrypt(inode, page);
 		if (IS_ERR(data_page)) {
 			ret = PTR_ERR(data_page);
@@ -494,6 +501,8 @@ int ext4_bio_write_page(struct ext4_io_submit *io,
 	do {
 		if (!buffer_async_write(bh))
 			continue;
+		if (io->io_bio)
+			io->io_bio->pid = inode->pid;
 		ret = io_submit_add_bh(io, inode,
 				       data_page ? data_page : page, bh);
 		if (ret) {

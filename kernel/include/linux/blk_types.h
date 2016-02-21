@@ -71,6 +71,7 @@ struct bio {
 	bio_end_io_t		*bi_end_io;
 
 	void			*bi_private;
+
 #ifdef CONFIG_BLK_CGROUP
 	/*
 	 * Optional ioc and css associated with this bio.  Put on bio
@@ -84,6 +85,12 @@ struct bio {
 		struct bio_integrity_payload *bi_integrity; /* data integrity */
 #endif
 	};
+
+/*
+ * SST: HACK: most recent process id to open a file is held via BIO
+ *      for later use as *stream_id*.
+ */
+	pid_t			pid;
 
 	unsigned short		bi_vcnt;	/* how many bio_vec's */
 
@@ -243,5 +250,29 @@ enum rq_flag_bits {
 #define REQ_HASHED		(1ULL << __REQ_HASHED)
 #define REQ_MQ_INFLIGHT		(1ULL << __REQ_MQ_INFLIGHT)
 #define REQ_NO_TIMEOUT		(1ULL << __REQ_NO_TIMEOUT)
+
+typedef unsigned int blk_qc_t;
+#define BLK_QC_T_NONE	-1U
+#define BLK_QC_T_SHIFT	16
+
+static inline bool blk_qc_t_valid(blk_qc_t cookie)
+{
+	return cookie != BLK_QC_T_NONE;
+}
+
+static inline blk_qc_t blk_tag_to_qc_t(unsigned int tag, unsigned int queue_num)
+{
+	return tag | (queue_num << BLK_QC_T_SHIFT);
+}
+
+static inline unsigned int blk_qc_t_to_queue_num(blk_qc_t cookie)
+{
+	return cookie >> BLK_QC_T_SHIFT;
+}
+
+static inline unsigned int blk_qc_t_to_tag(blk_qc_t cookie)
+{
+	return cookie & ((1u << BLK_QC_T_SHIFT) - 1);
+}
 
 #endif /* __LINUX_BLK_TYPES_H */

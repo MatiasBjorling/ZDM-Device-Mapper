@@ -37,9 +37,9 @@ config MD_AUTODETECT
 	default y
 	---help---
 	  If you say Y here, then the kernel will try to autodetect raid
-	  arrays as part of its boot process.
+	  arrays as part of its boot process. 
 
-	  If you don't use raid and say Y, this autodetection can cause
+	  If you don't use raid and say Y, this autodetection can cause 
 	  a several-second delay in the boot time due to various
 	  synchronisation steps that are part of this step.
 
@@ -123,6 +123,7 @@ config MD_RAID456
 	tristate "RAID-4/RAID-5/RAID-6 mode"
 	depends on BLK_DEV_MD
 	select RAID6_PQ
+	select LIBCRC32C
 	select ASYNC_MEMCPY
 	select ASYNC_XOR
 	select ASYNC_PQ

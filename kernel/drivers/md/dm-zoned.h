@@ -15,15 +15,12 @@
 #ifndef _DM_ZONED_H
 #define _DM_ZONED_H
 
+#define ALLOC_DEBUG		0
 #define USE_KTHREAD		0
+#define KFIFO_SIZE		(1 << 14)
 
-#define CRIT			GFP_ATOMIC
 #define NORMAL			0
-
-#define ZDM_IOC_MZCOUNT		0x5a4e0001
-#define ZDM_IOC_WPS		0x5a4e0002
-#define ZDM_IOC_FREE		0x5a4e0003
-#define ZDM_IOC_STATUS		0x5a4e0004
+#define CRIT			GFP_NOIO
 
 #define DM_MSG_PREFIX		"zoned"
 
@@ -44,17 +41,15 @@
 #define Z_WP_GC_READY		(1u << 28)
 #define Z_WP_GC_BITS		(0xFu << 28)
 
-#define Z_WP_RRECALC		(1u << 31)
-
 #define Z_WP_GC_PENDING		(Z_WP_GC_FULL|Z_WP_GC_ACTIVE)
 #define Z_WP_NON_SEQ		(1u << 27)
-#define Z_WP_RESV_01		(1u << 26)
+#define Z_WP_RRECALC		(1u << 26)
 #define Z_WP_RESV_02		(1u << 25)
 #define Z_WP_RESV_03		(1u << 24)
 
 #define Z_WP_VALUE_MASK		(~0u >> 8)
 #define Z_WP_FLAGS_MASK		(~0u << 24)
-#define Z_WP_STREAM_MASK        Z_WP_FLAGS_MASK
+#define Z_WP_STREAM_MASK	Z_WP_FLAGS_MASK
 
 #define Z_AQ_GC			(1u << 31)
 #define Z_AQ_META		(1u << 30)
@@ -91,10 +86,13 @@
 #define MAX_MZ_SUPP		64
 #define FWD_TM_KEY_BASE		4096ul
 
-#define Z_HASH_SZ		1
-
 #define IO_VCACHE_ORDER		8
 #define IO_VCACHE_PAGES		(1 << IO_VCACHE_ORDER)  /* 256 pages => 1MiB */
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 
 enum superblock_flags_t {
 	SB_DIRTY = 1,
@@ -117,10 +115,27 @@ struct z_io_req_t {
 
 /**
  * enum pg_flag_enum - Map Pg flags
+ * @IS_DIRTY: Block is modified from on-disk copy.
+ * @IS_STALE: ??
+ *
+ * @IS_FWD: Is part of Forward ZLT or CRC table.
+ * @IS_REV: Is part of Reverse ZLT or CRC table.
+ * @IS_CRC: Is part of CRC table.
+ * @IS_LUT: Is part of ZTL table.
+ *
+ * @R_IN_FLIGHT: Async read in progress.
+ * @W_IN_FLIGHT: ASync write in progress.
+ * @DELAY_ADD: Spinlock was busy for zltlst, added to lazy for transit.
+ * @STICKY: ???
+ * @IS_READA: Block will pulled for Read Ahead. Cleared when used.
+ * @IS_DROPPED: Has clean/expired from zlt_lst and is waiting free().
+ *
+ * @IS_LAZY:   Had been added to 'lazy' lzy_lst.
+ * @IN_ZLT: Had been added to 'inpool' zlt_lst.
+ *
  */
 enum pg_flag_enum {
 	IS_DIRTY,
-	IS_GC,
 	IS_STALE,
 
 	IS_FWD,
@@ -128,11 +143,18 @@ enum pg_flag_enum {
 	IS_CRC,
 	IS_LUT,
 
-	IS_MEMPOOL,
+	R_IN_FLIGHT,
+	W_IN_FLIGHT,
+	DELAY_ADD,
+	STICKY,
+	IS_READA,
+	IS_DROPPED,
+	IS_LAZY,
+	IN_ZLT,
 };
 
 /**
- * enum gc_flags_enum - GC/Compaction states
+ * enum gc_flags_enum - Garbage Collection [GC] states.
  */
 enum gc_flags_enum {
 	DO_GC_NEW,
@@ -160,7 +182,6 @@ enum znd_flags_enum {
 	DO_MEMPOOL,
 	DO_SYNC,
 	DO_JOURNAL_LOAD,
-
 	DO_GC_NO_PURGE,
 	DO_METAWORK_QD,
 };
@@ -194,7 +215,6 @@ struct gc_state {
 	u32 z_gc;
 
 	int result;
-	u16 tag;
 };
 
 /**
@@ -224,8 +244,8 @@ struct map_addr {
  * Longer description of this structure.
  */
 struct map_sect_to_lba {
-	__le64 logical;		/* record type [16 bits] + logical sector # */
-	__le64 physical;	/* csum 16 [16 bits] + 'physical' block lba */
+	__le64 tlba;		/* record type [16 bits] + logical sector # */
+	__le64 bval;	/* csum 16 [16 bits] + 'physical' block lba */
 } __packed;
 
 /**
@@ -247,6 +267,7 @@ enum map_type_enum {
  * @jcount:
  * @jsorted:
  * @jsize:
+ * @map_content: See map_type_enum
  *
  * Longer description of this structure.
  */
@@ -259,6 +280,7 @@ struct map_cache {
 	u32 jcount;
 	u32 jsorted;
 	u32 jsize;
+	u32 map_content; /* IS_MAP or IS_DISC */
 };
 
 
@@ -290,11 +312,14 @@ struct map_pg {
 	u64 last_write;
 	struct mutex md_lock;
 	unsigned long flags;
-	struct list_head inpool;
+	struct list_head zltlst;
 
 	/* in flight tracking */
+	struct list_head lazy;
 	struct zoned *znd;
 	struct map_pg *crc_pg;
+	int hotness;
+	int index;
 	__le16 md_crc;
 };
 
@@ -351,7 +376,7 @@ struct meta_pg {
 	__le32 *zf_est;
 	__le32 *wp_used;
 	u64 lba;
-	struct mutex wplck;
+	spinlock_t wplck;
 	unsigned long flags;
 };
 
@@ -457,14 +482,15 @@ struct stale_tracking {
 
 /**
  * struct zoned - A page of map table
- * @ti:
- * @callbacks:
- * @dev:
+ * @ti:		dm_target entry
+ * @dev:	dm_dev entry
  * @mclist:	list of pages of in-memory LBA mappings.
  * @mclck:	in memory map-cache lock (spinlock)
 
- * @smtpool:		pages of lookup table entries
- * @map_pool_lock:	smtpool: memory pool lock
+ * @zltpool:		pages of lookup table entries
+ * @zlt_lck:	zltpool: memory pool lock
+ * @lzy_pool:
+ * @lzy_lock:
  * @fwd_tm:
  * @rev_tm:
 
@@ -501,7 +527,6 @@ struct stale_tracking {
  * @suspended:
  * @gc_mz_pref:
  * @mz_provision:	Number of zones per 1024 of over-provisioning.
- * @zinqtype:
  * @ata_passthrough:
  * @is_empty:		For fast discards on initial format
  *
@@ -509,34 +534,33 @@ struct stale_tracking {
  */
 struct zoned {
 	struct dm_target *ti;
-	struct dm_target_callbacks callbacks;
 	struct dm_dev *dev;
 
-	struct list_head mclist[Z_HASH_SZ];
-	spinlock_t       mclck[Z_HASH_SZ];
-	struct mutex     mcmutex[Z_HASH_SZ];
-
-	struct list_head smtpool;
-	struct mutex map_pool_lock;
+	struct list_head zltpool;
+	struct list_head lzy_pool;
+	struct list_head mclist[MAP_COUNT];
+	spinlock_t       mclck[MAP_COUNT];
 
 	struct work_struct bg_work;
 	struct workqueue_struct *bg_wq;
-	spinlock_t stats_lock;
 
-	struct mutex mapkey_lock; /* access LUT and CRC array of pointers */
-	struct mutex ct_lock; /* access LUT and CRC array of pointers */
+	spinlock_t zlt_lck;
+	spinlock_t lzy_lck;
+	spinlock_t stats_lock;
+	spinlock_t mapkey_lock; /* access LUT and CRC array of pointers */
+	spinlock_t ct_lock; /* access LUT and CRC array of pointers */
+
+	struct mutex pool_mtx;
 	struct mutex mz_io_mutex;
 	struct mutex vcio_lock;
-	struct mutex io_lock;
 
-#if USE_KTHREAD
-	struct bio *bio_queue[512];
-	u32 bio_in;
-	u32 bio_out;
+#if USE_KTHREAD /* experimental++ */
 	struct task_struct *bio_kthread;
-	wait_queue_head_t bio_wait;
-	spinlock_t bio_qlck;
+	DECLARE_KFIFO_PTR(bio_fifo, struct bio *);
+	wait_queue_head_t wait_bio;
+	wait_queue_head_t wait_fifo;
 #endif
+	struct bio_set *bio_set;
 
 	struct gc_state *gc_active;
 	spinlock_t gc_lock;
@@ -588,7 +612,9 @@ struct zoned {
 	u32 z_current;
 	u32 z_meta_resv;
 	u32 z_gc_resv;
+	u32 gc_events;
 	int mc_entries;
+	int dc_entries;
 	int meta_result;
 	struct stale_tracking stale;
 
@@ -615,10 +641,20 @@ struct zoned {
 	atomic_t suspended;
 	atomic_t gc_throttle;
 
+#if ALLOC_DEBUG
+	atomic_t allocs;
+	int hw_allocs;
+	void **alloc_trace;
+#endif
+	u32 filled_zone;
 	u16 mz_provision;
-	u8 zinqtype;
-	u8 ata_passthrough;
-	u8 is_empty;
+	unsigned bdev_is_zoned:1;
+	unsigned ata_passthrough:1;
+	unsigned issue_open_zone:1;
+	unsigned issue_close_zone:1;
+	unsigned is_empty:1;
+	unsigned trim:1;
+
 };
 
 /**
@@ -662,4 +698,9 @@ struct zdm_ioc_status {
 	u32 bins[40];
 };
 
+#ifdef __cplusplus
+}
+#endif
+
 #endif /* _DM_ZONED_H */
+
