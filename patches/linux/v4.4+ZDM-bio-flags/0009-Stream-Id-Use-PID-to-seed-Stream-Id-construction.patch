@@ -1,0 +1,222 @@
+From 8df813a6ec8ff2a45f10cc6dc4209adb28400496 Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Wed, 2 Mar 2016 23:42:56 -0600
+Subject: [PATCH 09/10] Stream Id: Use PID to seed Stream Id construction.
+
+Experimental:
+
+Use PID to differentiate between streams of incoming
+data to simulate the effect that stream id may have
+on certain predictable workloads.
+
+Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
+---
+ block/bio.c               | 2 ++
+ drivers/md/dm-zoned.c     | 9 +++++++++
+ fs/ext4/ext4.h            | 1 +
+ fs/ext4/file.c            | 1 +
+ fs/ext4/inode.c           | 4 ++++
+ fs/ext4/page-io.c         | 8 +++++++-
+ fs/xfs/xfs_aops.c         | 2 ++
+ fs/xfs/xfs_file.c         | 2 ++
+ include/linux/blk_types.h | 6 ++++++
+ include/linux/fs.h        | 6 ++++++
+ 10 files changed, 40 insertions(+), 1 deletion(-)
+
+diff --git a/block/bio.c b/block/bio.c
+index 4f184d9..705ed7e 100644
+--- a/block/bio.c
++++ b/block/bio.c
+@@ -584,6 +584,7 @@ void __bio_clone_fast(struct bio *bio, struct bio *bio_src)
+ 	bio->bi_rw = bio_src->bi_rw;
+ 	bio->bi_iter = bio_src->bi_iter;
+ 	bio->bi_io_vec = bio_src->bi_io_vec;
++	bio->pid = bio_src->pid;
+ }
+ EXPORT_SYMBOL(__bio_clone_fast);
+ 
+@@ -666,6 +667,7 @@ struct bio *bio_clone_bioset(struct bio *bio_src, gfp_t gfp_mask,
+ 	bio->bi_rw		= bio_src->bi_rw;
+ 	bio->bi_iter.bi_sector	= bio_src->bi_iter.bi_sector;
+ 	bio->bi_iter.bi_size	= bio_src->bi_iter.bi_size;
++	bio->pid		= bio_src->pid;
+ 
+ 	if (bio->bi_rw & REQ_DISCARD)
+ 		goto integrity_clone;
+diff --git a/drivers/md/dm-zoned.c b/drivers/md/dm-zoned.c
+index 3e7c1b0..970e441 100644
+--- a/drivers/md/dm-zoned.c
++++ b/drivers/md/dm-zoned.c
+@@ -110,6 +110,15 @@ static inline u32 bio_stream(struct bio *bio)
+ 
+ 	if (bio->bi_rw & REQ_META)
+ 		stream_id = 0xff;
++	else {
++		u32 upid = bio->pid;
++
++		stream_id = ((upid/97) + (upid/1031) + (upid)) & 0xff;
++		if (stream_id == 0)
++			stream_id++;
++		if (stream_id == 0xff)
++			stream_id--;
++	}
+ 
+ 	return stream_id;
+ }
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index cc7ca4e..82d012e 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -192,6 +192,7 @@ struct ext4_io_submit {
+ 	struct bio		*io_bio;
+ 	ext4_io_end_t		*io_end;
+ 	sector_t		io_next_block;
++	pid_t			pid;
+ };
+ 
+ /*
+diff --git a/fs/ext4/file.c b/fs/ext4/file.c
+index 113837e..c7864fb 100644
+--- a/fs/ext4/file.c
++++ b/fs/ext4/file.c
+@@ -318,6 +318,7 @@ static int ext4_file_open(struct inode * inode, struct file * filp)
+ 	char buf[64], *cp;
+ 	int ret;
+ 
++	inode->pid = get_current()->pid;
+ 	if (unlikely(!(sbi->s_mount_flags & EXT4_MF_MNTDIR_SAMPLED) &&
+ 		     !(sb->s_flags & MS_RDONLY))) {
+ 		sbi->s_mount_flags |= EXT4_MF_MNTDIR_SAMPLED;
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index ea433a7..2e48ee3 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -1884,6 +1884,7 @@ static int ext4_writepage(struct page *page,
+ 		return __ext4_journalled_writepage(page, len);
+ 
+ 	ext4_io_submit_init(&io_submit, wbc);
++	io_submit.pid = inode->pid;
+ 	io_submit.io_end = ext4_init_io_end(inode, GFP_NOFS);
+ 	if (!io_submit.io_end) {
+ 		redirty_page_for_writepage(wbc, page);
+@@ -2509,6 +2510,7 @@ static int ext4_writepages(struct address_space *mapping,
+ 	mpd.inode = inode;
+ 	mpd.wbc = wbc;
+ 	ext4_io_submit_init(&mpd.io_submit, wbc);
++	mpd.io_submit.pid = inode->pid;
+ retry:
+ 	if (wbc->sync_mode == WB_SYNC_ALL || wbc->tagged_writepages)
+ 		tag_pages_for_writeback(mapping, mpd.first_page, mpd.last_page);
+@@ -2562,6 +2564,8 @@ retry:
+ 			}
+ 		}
+ 		ext4_journal_stop(handle);
++		if (mpd.io_submit.io_bio)
++			mpd.io_submit.io_bio->pid = inode->pid;
+ 		/* Submit prepared bio */
+ 		ext4_io_submit(&mpd.io_submit);
+ 		/* Unlock pages we didn't use */
+diff --git a/fs/ext4/page-io.c b/fs/ext4/page-io.c
+index 17fbe38..f97c1df 100644
+--- a/fs/ext4/page-io.c
++++ b/fs/ext4/page-io.c
+@@ -357,6 +357,7 @@ void ext4_io_submit(struct ext4_io_submit *io)
+ 		int io_op = io->io_wbc->sync_mode == WB_SYNC_ALL ?
+ 			    WRITE_SYNC : WRITE;
+ 		bio_get(io->io_bio);
++		io->io_bio->pid = io->pid;
+ 		submit_bio(io_op, io->io_bio);
+ 		bio_put(io->io_bio);
+ 	}
+@@ -385,6 +386,7 @@ static int io_submit_init_bio(struct ext4_io_submit *io,
+ 	bio->bi_end_io = ext4_end_bio;
+ 	bio->bi_private = ext4_get_io_end(io->io_end);
+ 	io->io_bio = bio;
++	io->io_bio->pid = io->pid;
+ 	io->io_next_block = bh->b_blocknr;
+ 	return 0;
+ }
+@@ -469,8 +471,10 @@ int ext4_bio_write_page(struct ext4_io_submit *io,
+ 			/* A hole? We can safely clear the dirty bit */
+ 			if (!buffer_mapped(bh))
+ 				clear_buffer_dirty(bh);
+-			if (io->io_bio)
++			if (io->io_bio) {
++				io->io_bio->pid = inode->pid;
+ 				ext4_io_submit(io);
++			}
+ 			continue;
+ 		}
+ 		if (buffer_new(bh)) {
+@@ -497,6 +501,8 @@ int ext4_bio_write_page(struct ext4_io_submit *io,
+ 	do {
+ 		if (!buffer_async_write(bh))
+ 			continue;
++		if (io->io_bio)
++			io->io_bio->pid = inode->pid;
+ 		ret = io_submit_add_bh(io, inode,
+ 				       data_page ? data_page : page, bh);
+ 		if (ret) {
+diff --git a/fs/xfs/xfs_aops.c b/fs/xfs/xfs_aops.c
+index 29e7e5d..44c9b39 100644
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@ -382,6 +382,8 @@ xfs_submit_ioend_bio(
+ 	atomic_inc(&ioend->io_remaining);
+ 	bio->bi_private = ioend;
+ 	bio->bi_end_io = xfs_end_bio;
++	bio->pid = ioend->io_inode->pid;
++
+ 	submit_bio(wbc->sync_mode == WB_SYNC_ALL ? WRITE_SYNC : WRITE, bio);
+ }
+ 
+diff --git a/fs/xfs/xfs_file.c b/fs/xfs/xfs_file.c
+index f5392ab..365e40a 100644
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@ -1051,6 +1051,8 @@ xfs_file_open(
+ 		return -EFBIG;
+ 	if (XFS_FORCED_SHUTDOWN(XFS_M(inode->i_sb)))
+ 		return -EIO;
++
++	inode->pid = get_current()->pid;
+ 	return 0;
+ }
+ 
+diff --git a/include/linux/blk_types.h b/include/linux/blk_types.h
+index ffdc0bf..156837a 100644
+--- a/include/linux/blk_types.h
++++ b/include/linux/blk_types.h
+@@ -85,6 +85,12 @@ struct bio {
+ #endif
+ 	};
+ 
++/*
++ *  SST: HACK most recent process id to *WRITE* to file
++ * for passing to BIO struct as *stream_id*
++ */
++	pid_t			pid;
++
+ 	unsigned short		bi_vcnt;	/* how many bio_vec's */
+ 
+ 	/*
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 3aa5142..9b5c876 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -676,6 +676,12 @@ struct inode {
+ 	struct hlist_head	i_fsnotify_marks;
+ #endif
+ 
++/*
++ *  SST: HACK most recent process id to *WRITE* to file
++ * for passing to BIO struct as *stream_id*
++ */
++	pid_t			pid;
++
+ 	void			*i_private; /* fs or device private pointer */
+ };
+ 
+-- 
+2.7.0
+
