@@ -14,7 +14,7 @@ else (EXISTS /usr/include/linux/blk-zoned-ctrl.h)
 endif (EXISTS /usr/include/linux/blk-zoned-ctrl.h)
 
 set (sdtools_VERSION_MAJOR 1)
-set (sdtools_VERSION_MINOR 0)
+set (sdtools_VERSION_MINOR 1)
 
 # configure a header file to pass some of the CMake settings
 # to the source code
@@ -33,6 +33,7 @@ add_executable(sd_zone_close   sd_reset_wp/sd_zone_close.c  sd_reset_wp/is_mount
 add_executable(sd_zone_open    sd_reset_wp/sd_zone_open.c   sd_reset_wp/is_mounted.c)
 add_executable(sd_identify     sd_identify/sd_identify.c)
 add_executable(sd_report_zones sd_report_zones/sd_report_zones.c)
+add_executable(blkreport       sd_report_zones/blkreport.c)
 
 install(TARGETS
             sd_reset_wp
@@ -41,6 +42,7 @@ install(TARGETS
             sd_zone_open
             sd_identify
             sd_report_zones
+            blkreport
         RUNTIME DESTINATION bin
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib)

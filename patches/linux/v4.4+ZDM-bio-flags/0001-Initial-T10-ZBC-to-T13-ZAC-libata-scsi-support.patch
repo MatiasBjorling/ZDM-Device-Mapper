@@ -1,22 +1,36 @@
-From aa3418e99d7994c87c464c8d3e48b77edf9fab07 Mon Sep 17 00:00:00 2001
+From f39a918c6ec41026fdceccbc3d664fa629607127 Mon Sep 17 00:00:00 2001
 From: Shaun Tancheff <shaun@tancheff.com>
-Date: Wed, 2 Mar 2016 17:54:26 -0600
-Subject: [PATCH 01/10] Add ZBC <-> ZAC xlat support for report, open, close, 
- reset, finish
+Date: Thu, 3 Mar 2016 01:18:51 -0600
+Subject: [PATCH 1/5] Initial T10 ZBC to T13 ZAC libata-scsi support.
 
-Provide SCSI <-> ATA translation layer for ZBC commands:
+Provide SCSI -> ATA translation layer for ZBC commands:
   - Report Zones
-  - Open, Close, Reset and Finish zones
+  - Zone Action: Open, Close, Reset and Finish zones
 
 Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
 ---
- drivers/ata/libata-scsi.c | 167 ++++++++++++++++++++++++++++++++++++++++++++++
- include/linux/ata.h       |  18 +++++
- include/scsi/scsi_proto.h |  14 ++++
- 3 files changed, 199 insertions(+)
+ drivers/ata/libata-eh.c       |   2 +
+ drivers/ata/libata-scsi.c     | 168 +++++++++++++++++++++++++++++++++++++++++-
+ include/linux/ata.h           |  18 +++++
+ include/scsi/scsi_proto.h     |  14 ++++
+ include/trace/events/libata.h |   2 +
+ 5 files changed, 203 insertions(+), 1 deletion(-)
 
+diff --git a/drivers/ata/libata-eh.c b/drivers/ata/libata-eh.c
+index 961acc7..c217471 100644
+--- a/drivers/ata/libata-eh.c
++++ b/drivers/ata/libata-eh.c
+@@ -2398,6 +2398,8 @@ const char *ata_get_cmd_descript(u8 command)
+ 		{ ATA_CMD_CFA_WRITE_MULT_NE,	"CFA WRITE MULTIPLE WITHOUT ERASE" },
+ 		{ ATA_CMD_REQ_SENSE_DATA,	"REQUEST SENSE DATA EXT" },
+ 		{ ATA_CMD_SANITIZE_DEVICE,	"SANITIZE DEVICE" },
++		{ ATA_CMD_ZONE_MAN_IN,		"ZAC MANAGEMENT IN" },
++		{ ATA_CMD_ZONE_MAN_OUT,		"ZAC MANAGEMENT OUT" },
+ 		{ ATA_CMD_READ_LONG,		"READ LONG (with retries)" },
+ 		{ ATA_CMD_READ_LONG_ONCE,	"READ LONG (without retries)" },
+ 		{ ATA_CMD_WRITE_LONG,		"WRITE LONG (with retries)" },
 diff --git a/drivers/ata/libata-scsi.c b/drivers/ata/libata-scsi.c
-index 7e959f9..5d2d757 100644
+index 7e959f9..b6f20fe 100644
 --- a/drivers/ata/libata-scsi.c
 +++ b/drivers/ata/libata-scsi.c
 @@ -65,6 +65,7 @@ static struct ata_device *__ata_scsi_find_dev(struct ata_port *ap,
@@ -27,7 +41,16 @@ index 7e959f9..5d2d757 100644
  
  #define RW_RECOVERY_MPAGE 0x1
  #define RW_RECOVERY_MPAGE_LEN 12
-@@ -1443,6 +1444,160 @@ static unsigned int ata_scsi_flush_xlat(struct ata_queued_cmd *qc)
+@@ -969,7 +970,7 @@ static void ata_to_sense_error(unsigned id, u8 drv_stat, u8 drv_err, u8 *sk,
+  *	passthrough command, so we use the following sense data:
+  *	sk = RECOVERED ERROR
+  *	asc,ascq = ATA PASS-THROUGH INFORMATION AVAILABLE
+- *      
++ *
+  *
+  *	LOCKING:
+  *	None.
+@@ -1443,6 +1444,81 @@ static unsigned int ata_scsi_flush_xlat(struct ata_queued_cmd *qc)
  }
  
  /**
@@ -106,6 +129,13 @@ index 7e959f9..5d2d757 100644
 +}
 +
 +/**
+  *	scsi_6_lba_len - Get LBA and transfer length
+  *	@cdb: SCSI command to translate
+  *
+@@ -1797,6 +1873,84 @@ static void ata_scsi_qc_complete(struct ata_queued_cmd *qc)
+ }
+ 
+ /**
 + *	ata_scsi_report_zones_xlat - Translate SCSI Report Zones command
 + *	@qc: Storage for translated ATA taskfile
 + *
@@ -183,12 +213,11 @@ index 7e959f9..5d2d757 100644
 +	return 1;
 +}
 +
-+
 +/**
-  *	scsi_6_lba_len - Get LBA and transfer length
-  *	@cdb: SCSI command to translate
-  *
-@@ -2233,12 +2388,17 @@ static unsigned int ata_scsiop_inq_b1(struct ata_scsi_args *args, u8 *rbuf)
+  *	ata_scsi_translate - Translate then issue SCSI command to ATA device
+  *	@dev: ATA device to which the command is addressed
+  *	@cmd: SCSI command to execute
+@@ -2233,12 +2387,17 @@ static unsigned int ata_scsiop_inq_b1(struct ata_scsi_args *args, u8 *rbuf)
  {
  	int form_factor = ata_id_form_factor(args->id);
  	int media_rotation_rate = ata_id_rotation_rate(args->id);
@@ -206,7 +235,7 @@ index 7e959f9..5d2d757 100644
  
  	return 0;
  }
-@@ -3422,6 +3582,13 @@ static inline ata_xlat_func_t ata_get_xlat_func(struct ata_device *dev, u8 cmd)
+@@ -3422,6 +3581,13 @@ static inline ata_xlat_func_t ata_get_xlat_func(struct ata_device *dev, u8 cmd)
  
  	case START_STOP:
  		return ata_scsi_start_stop_xlat;
@@ -288,6 +317,19 @@ index a9fbf1b..dd0e089 100644
  /* Vendor specific CDBs start here */
  #define VENDOR_SPECIFIC_CDB 0xc0
  
+diff --git a/include/trace/events/libata.h b/include/trace/events/libata.h
+index 8b0fbd9..157ca7b 100644
+--- a/include/trace/events/libata.h
++++ b/include/trace/events/libata.h
+@@ -97,6 +97,8 @@
+ 		 ata_opcode_name(ATA_CMD_CFA_WRITE_MULT_NE),	\
+ 		 ata_opcode_name(ATA_CMD_REQ_SENSE_DATA),	\
+ 		 ata_opcode_name(ATA_CMD_SANITIZE_DEVICE),	\
++		 ata_opcode_name(ATA_CMD_ZONE_MAN_IN),		\
++		 ata_opcode_name(ATA_CMD_ZONE_MAN_OUT),		\
+ 		 ata_opcode_name(ATA_CMD_RESTORE),		\
+ 		 ata_opcode_name(ATA_CMD_READ_LONG),		\
+ 		 ata_opcode_name(ATA_CMD_READ_LONG_ONCE),	\
 -- 
 2.7.0
 

@@ -36,7 +36,7 @@ provided the required amount of conventional space is available.
 
 ## Software Requirements
 
-  - Current Linux Kernel v4.1 to v.4.3 with ZDM patches
+  - Current Linux Kernel v4.1 to v.4.4 with ZDM patches
   - Recommended: sg3utils (1.41 or later) or sd-tools.
 
 ## Caveat Emptor - Warning
@@ -143,18 +143,26 @@ If not, please see http://www.gnu.org/licenses/.
     * v4.1 [ZDM r101 patches for linux v4.1](/patches/linux/v4.1+ZDM-r101)
     * v4.2 [ZDM r101 patches for linux v4.2](/patches/linux/v4.2+ZDM-r101)
     * v4.3 [ZDM r101 patches for linux v4.3](/patches/linux/v4.3+ZDM-r101)
+    * v4.4 [ZDM r103 patches for linux v4.4](/patches/linux/v4.4+ZDM-r103)
   - Linux kernel with ZDM patches applied.
     * v4.1 https://seagit.okla.seagate.com/ZDM-Release/zdm-kernel/tree/v4.1+ZDM-r101
     * v4.2 https://seagit.okla.seagate.com/ZDM-Release/zdm-kernel/tree/v4.2+ZDM-r101
-    * v4.3 https://seagit.okla.seagate.com/ZDM-Release/zdm-kernel/tree/v4.2+ZDM-r101
+    * v4.3 https://seagit.okla.seagate.com/ZDM-Release/zdm-kernel/tree/v4.3+ZDM-r101
+    * v4.4 https://seagit.okla.seagate.com/ZDM-Release/zdm-kernel/tree/v4.4+ZDM-r103
 
-## Observations and Known Issues in this release (#101)
+## Observations and Known Issues in this release (#103)
 
-  - XFS Hang on v4.3 and v4.4 kernels
-    * ZDM is known to cause XFS to hang during I/O.
-    * Hangs appear to happen quickly following discard handling in ZDM.
+  - Discard cache support is incomplete and unbounded, theoretically it could use up a lot of memory.
+     * In practice this is not happening.
+     * Fix is planned for #105.
+  - Bug: Discard on-disk format is not handled during for restore.
+     * Fix is planned for #104.
   - Bug: Write back of metadata could cause inconsitency in case of sudden power loss between SYNC's
+     * Fix is planned for #105.
   - Bug: A race condition exists causing corrupt metadata and -ENOSPC will be reported and halting writes.
+     * Fixed for next release.
+  - Bug: A race condition exists allowing ingress to overwhelm GC rate -ENOSPC will be reported and ingress halted.
+     * Fixed in next release.
 
 ## Changes from Initial Release
 
@@ -186,3 +194,11 @@ If not, please see http://www.gnu.org/licenses/.
     * Added Stream Id to manage co-location of data with similar expected lifetimes.
     * Remove the fixed address segmentation (Megazone) scheme.
     * Added support for large conventional space in low LBAs and utilize the space for translation tables.
+
+  - ZDM #103
+    * Added read-ahead for LT entries.
+    * Removed big io_mutex
+    * Added discard extent cache
+    * Enabled discard support for md-raid to be enabled by ZDM block devices.
+    * Added an experimental prototype hack to use PID as stream id.
+    * Changed userspace ioctl to use procfs as ioctl are disabled in v4.4 and later kernels.

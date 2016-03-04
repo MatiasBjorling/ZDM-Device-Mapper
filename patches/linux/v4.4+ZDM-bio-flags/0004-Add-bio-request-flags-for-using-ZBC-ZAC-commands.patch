@@ -1,7 +1,7 @@
-From f884074a91ea710d7c993d38eb24768c70b8fe5c Mon Sep 17 00:00:00 2001
+From f7437fe193111dbfadf5143ccda97d1fca033577 Mon Sep 17 00:00:00 2001
 From: Shaun Tancheff <shaun@tancheff.com>
 Date: Wed, 2 Mar 2016 21:41:47 -0600
-Subject: [PATCH 03/10] Add bio/request flags for using ZBC/ZAC commands
+Subject: [PATCH 4/5] Add bio/request flags for using ZBC/ZAC commands
 
 T10 ZBC and T13 ZAC specify operations for Zoned devices.
 
