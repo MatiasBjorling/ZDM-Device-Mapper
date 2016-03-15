@@ -4,9 +4,11 @@
 #include <linux/gfp.h>
 #include <linux/blkpg.h>
 #include <linux/hdreg.h>
+#include <linux/badblocks.h>
 #include <linux/backing-dev.h>
 #include <linux/fs.h>
 #include <linux/blktrace_api.h>
+#include <linux/blkzoned_api.h>
 #include <linux/pr.h>
 #include <asm/uaccess.h>
 
@@ -194,6 +196,110 @@ int blkdev_reread_part(struct block_device *bdev)
 }
 EXPORT_SYMBOL(blkdev_reread_part);
 
+static int blk_zoned_report_ioctl(struct block_device *bdev, fmode_t mode,
+		void __user *parg)
+{
+	int error = -EFAULT;
+	int gfp = GFP_KERNEL|GFP_DMA;
+	struct bdev_zone_report_io *zone_iodata = NULL;
+	u32 alloc_size = max(PAGE_SIZE, sizeof(*zone_iodata));
+	unsigned long bi_rw = 0;
+	u8 opt = 0;
+
+	if (!(mode & FMODE_READ))
+		return -EBADF;
+
+	zone_iodata = kmalloc(alloc_size, gfp);
+	if (!zone_iodata) {
+		error = -ENOMEM;
+		goto report_zones_out;
+	}
+	if (copy_from_user(zone_iodata, parg, sizeof(*zone_iodata))) {
+		error = -EFAULT;
+		goto report_zones_out;
+	}
+	if (zone_iodata->data.in.return_page_count > alloc_size) {
+		void *tmp;
+
+		alloc_size = zone_iodata->data.in.return_page_count;
+		if (alloc_size < KMALLOC_MAX_SIZE) {
+			tmp = krealloc(zone_iodata, alloc_size, gfp);
+			if (!tmp) {
+				error = -ENOMEM;
+				goto report_zones_out;
+			}
+			zone_iodata = tmp;
+		} else {
+			/* Result requires DMA capable memory */
+			pr_err("Not enough memory available for request.\n");
+			error = -ENOMEM;
+			goto report_zones_out;
+		}
+	}
+	opt = zone_iodata->data.in.report_option & 0x7F;
+	if (zone_iodata->data.in.report_option & ZOPT_USE_ATA_PASS)
+		bi_rw = REQ_PRIO;
+
+	error = blkdev_issue_zone_report(bdev, bi_rw,
+			zone_iodata->data.in.zone_locator_lba, opt,
+			zone_iodata, alloc_size, GFP_KERNEL);
+
+	if (error)
+		goto report_zones_out;
+
+	if (copy_to_user(parg, zone_iodata, alloc_size))
+		error = -EFAULT;
+
+report_zones_out:
+	kfree(zone_iodata);
+	return error;
+}
+
+static int blk_zoned_action_ioctl(struct block_device *bdev, fmode_t mode,
+				  unsigned cmd, unsigned long arg)
+{
+	unsigned long bi_rw = 0;
+
+	if (!(mode & FMODE_WRITE))
+		return -EBADF;
+
+	/*
+	 * When the low bit is set force ATA passthrough try to work around
+	 * older SAS HBA controllers that don't support ZBC to ZAC translation.
+	 *
+	 * When the low bit is clear follow the normal path but also correct
+	 * for ~0ul LBA means 'for all lbas'.
+	 *
+	 * NB: We should do extra checking here to see if the user specified
+	 *     the entire block device as opposed to a partition of the
+	 *     device....
+	 */
+	if (arg & 1) {
+		bi_rw = REQ_PRIO;
+		if (arg != ~0ul)
+			arg &= ~1ul; /* ~1 :: 0xFF...FE */
+	} else {
+		if (arg == ~1ul)
+			arg = ~0ul;
+	}
+
+	switch (cmd) {
+	case BLKOPENZONE:
+		bi_rw = REQ_OPEN_ZONE;
+		break;
+	case BLKCLOSEZONE:
+		bi_rw = REQ_CLOSE_ZONE;
+		break;
+	case BLKDISCARD:
+		bi_rw = REQ_DISCARD;
+		break;
+	default:
+		pr_err("%s: Unknown action: %u", __func__, cmd);
+		WARN_ON(1);
+	}
+	return blkdev_issue_zone_action(bdev, bi_rw, arg, GFP_KERNEL);
+}
+
 static int blk_ioctl_discard(struct block_device *bdev, fmode_t mode,
 		unsigned long arg, unsigned long flags)
 {
@@ -208,6 +314,9 @@ static int blk_ioctl_discard(struct block_device *bdev, fmode_t mode,
 
 	start = range[0];
 	len = range[1];
+
+	if (start & 3 && len == (1 << 29))
+		return blk_zoned_action_ioctl(bdev, mode, BLKDISCARD, start);
 
 	if (start & 511)
 		return -EINVAL;
@@ -406,6 +515,35 @@ static inline int is_unrecognized_ioctl(int ret)
 		ret == -ENOIOCTLCMD;
 }
 
+#ifdef CONFIG_FS_DAX
+bool blkdev_dax_capable(struct block_device *bdev)
+{
+	struct gendisk *disk = bdev->bd_disk;
+
+	if (!disk->fops->direct_access)
+		return false;
+
+	/*
+	 * If the partition is not aligned on a page boundary, we can't
+	 * do dax I/O to it.
+	 */
+	if ((bdev->bd_part->start_sect % (PAGE_SIZE / 512))
+			|| (bdev->bd_part->nr_sects % (PAGE_SIZE / 512)))
+		return false;
+
+	/*
+	 * If the device has known bad blocks, force all I/O through the
+	 * driver / page cache.
+	 *
+	 * TODO: support finer grained dax error handling
+	 */
+	if (disk->bb && disk->bb->count)
+		return false;
+
+	return true;
+}
+#endif
+
 static int blkdev_flushbuf(struct block_device *bdev, fmode_t mode,
 		unsigned cmd, unsigned long arg)
 {
@@ -568,6 +706,14 @@ int blkdev_ioctl(struct block_device *bdev, fmode_t mode, unsigned cmd,
 	case BLKTRACESETUP:
 	case BLKTRACETEARDOWN:
 		return blk_trace_ioctl(bdev, cmd, argp);
+	case BLKREPORT:
+		return blk_zoned_report_ioctl(bdev, mode, argp);
+	case BLKOPENZONE:
+	case BLKCLOSEZONE:
+		return blk_zoned_action_ioctl(bdev, mode, cmd, arg);
+	case BLKDAXGET:
+		return put_int(arg, !!(bdev->bd_inode->i_flags & S_DAX));
+		break;
 	case IOC_PR_REGISTER:
 		return blkdev_pr_register(bdev, argp);
 	case IOC_PR_RESERVE:

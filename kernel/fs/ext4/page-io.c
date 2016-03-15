@@ -52,9 +52,8 @@ void ext4_exit_pageio(void)
  */
 static void buffer_io_error(struct buffer_head *bh)
 {
-	char b[BDEVNAME_SIZE];
-	printk_ratelimited(KERN_ERR "Buffer I/O error on device %s, logical block %llu\n",
-			bdevname(bh->b_bdev, b),
+	printk_ratelimited(KERN_ERR "Buffer I/O error on device %pg, logical block %llu\n",
+		       bh->b_bdev,
 			(unsigned long long)bh->b_blocknr);
 }
 
@@ -357,7 +356,6 @@ void ext4_io_submit(struct ext4_io_submit *io)
 		int io_op = io->io_wbc->sync_mode == WB_SYNC_ALL ?
 			    WRITE_SYNC : WRITE;
 		bio_get(io->io_bio);
-		io->io_bio->pid = io->pid;
 		submit_bio(io_op, io->io_bio);
 		bio_put(io->io_bio);
 	}
@@ -386,7 +384,6 @@ static int io_submit_init_bio(struct ext4_io_submit *io,
 	bio->bi_end_io = ext4_end_bio;
 	bio->bi_private = ext4_get_io_end(io->io_end);
 	io->io_bio = bio;
-	io->io_bio->pid = io->pid;
 	io->io_next_block = bh->b_blocknr;
 	return 0;
 }
@@ -406,6 +403,7 @@ submit_and_retry:
 		ret = io_submit_init_bio(io, bh);
 		if (ret)
 			return ret;
+		bio_set_streamid(io->io_bio, inode_streamid(inode));
 	}
 	ret = bio_add_page(io->io_bio, page, bh->b_size, bh_offset(bh));
 	if (ret != bh->b_size)
@@ -471,10 +469,8 @@ int ext4_bio_write_page(struct ext4_io_submit *io,
 			/* A hole? We can safely clear the dirty bit */
 			if (!buffer_mapped(bh))
 				clear_buffer_dirty(bh);
-			if (io->io_bio) {
-				io->io_bio->pid = inode->pid;
+			if (io->io_bio)
 				ext4_io_submit(io);
-			}
 			continue;
 		}
 		if (buffer_new(bh)) {
@@ -501,8 +497,6 @@ int ext4_bio_write_page(struct ext4_io_submit *io,
 	do {
 		if (!buffer_async_write(bh))
 			continue;
-		if (io->io_bio)
-			io->io_bio->pid = inode->pid;
 		ret = io_submit_add_bh(io, inode,
 				       data_page ? data_page : page, bh);
 		if (ret) {

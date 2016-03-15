@@ -76,6 +76,7 @@ struct dio_submit {
 	int reap_counter;		/* rate limit reaping */
 	sector_t final_block_in_request;/* doesn't change */
 	int boundary;			/* prev block is at a boundary */
+	int streamid;			/* Write stream ID */
 	get_block_t *get_block;		/* block mapping function */
 	dio_submit_t *submit_io;	/* IO submition function */
 
@@ -376,6 +377,8 @@ dio_bio_alloc(struct dio *dio, struct dio_submit *sdio,
 
 	sdio->bio = bio;
 	sdio->logical_offset_in_bio = sdio->cur_page_fs_offset;
+
+	bio_set_streamid(bio, sdio->streamid);
 }
 
 /*
@@ -472,8 +475,8 @@ static int dio_bio_complete(struct dio *dio, struct bio *bio)
 		dio->io_error = -EIO;
 
 	if (dio->is_async && dio->rw == READ && dio->should_dirty) {
-		bio_check_pages_dirty(bio);	/* transfers ownership */
 		err = bio->bi_error;
+		bio_check_pages_dirty(bio);	/* transfers ownership */
 	} else {
 		bio_for_each_segment_all(bvec, bio, i) {
 			struct page *page = bvec->bv_page;
@@ -1157,12 +1160,12 @@ do_blockdev_direct_IO(struct kiocb *iocb, struct inode *inode,
 					iocb->ki_filp->f_mapping;
 
 			/* will be released by direct_io_worker */
-			mutex_lock(&inode->i_mutex);
+			inode_lock(inode);
 
 			retval = filemap_write_and_wait_range(mapping, offset,
 							      end - 1);
 			if (retval) {
-				mutex_unlock(&inode->i_mutex);
+				inode_unlock(inode);
 				kmem_cache_free(dio_cache, dio);
 				goto out;
 			}
@@ -1173,7 +1176,7 @@ do_blockdev_direct_IO(struct kiocb *iocb, struct inode *inode,
 	dio->i_size = i_size_read(inode);
 	if (iov_iter_rw(iter) == READ && offset >= dio->i_size) {
 		if (dio->flags & DIO_LOCKING)
-			mutex_unlock(&inode->i_mutex);
+			inode_unlock(inode);
 		kmem_cache_free(dio_cache, dio);
 		retval = 0;
 		goto out;
@@ -1224,6 +1227,7 @@ do_blockdev_direct_IO(struct kiocb *iocb, struct inode *inode,
 	sdio.blkbits = blkbits;
 	sdio.blkfactor = i_blkbits - blkbits;
 	sdio.block_in_file = offset >> blkbits;
+	sdio.streamid = file_streamid(iocb->ki_filp);
 
 	sdio.get_block = get_block;
 	dio->end_io = end_io;
@@ -1295,7 +1299,7 @@ do_blockdev_direct_IO(struct kiocb *iocb, struct inode *inode,
 	 * of protecting us from looking up uninitialized blocks.
 	 */
 	if (iov_iter_rw(iter) == READ && (dio->flags & DIO_LOCKING))
-		mutex_unlock(&dio->inode->i_mutex);
+		inode_unlock(dio->inode);
 
 	/*
 	 * The only time we want to leave bios in flight is when a successful

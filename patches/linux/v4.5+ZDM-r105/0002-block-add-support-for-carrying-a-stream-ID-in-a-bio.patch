@@ -1,0 +1,147 @@
+From cc44efeeeb734fded7ed226ffc8da114ae938300 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@fb.com>
+Date: Wed, 2 Mar 2016 09:32:10 -0700
+Subject: [PATCH 02/23] block: add support for carrying a stream ID in a bio
+
+The top bits of bio->bi_flags are reserved for keeping the
+allocation pool, set aside the next 16 bits for carrying
+a stream ID. That leaves us with support for 64k - 1 streams,
+0 is reserved as a "stream not set" value.
+
+Add helpers for setting/getting stream ID of a bio.
+
+Signed-off-by: Jens Axboe <axboe@fb.com>
+---
+ block/bio.c               |  5 ++++
+ block/blk-core.c          |  4 ++++
+ include/linux/blk_types.h | 60 ++++++++++++++++++++++++++++++++++-------------
+ 3 files changed, 53 insertions(+), 16 deletions(-)
+
+diff --git a/block/bio.c b/block/bio.c
+index cf75915..d42e69c 100644
+--- a/block/bio.c
++++ b/block/bio.c
+@@ -584,6 +584,7 @@ void __bio_clone_fast(struct bio *bio, struct bio *bio_src)
+ 	bio->bi_rw = bio_src->bi_rw;
+ 	bio->bi_iter = bio_src->bi_iter;
+ 	bio->bi_io_vec = bio_src->bi_io_vec;
++	bio_set_streamid(bio, bio_get_streamid(bio_src));
+ }
+ EXPORT_SYMBOL(__bio_clone_fast);
+ 
+@@ -689,6 +690,7 @@ integrity_clone:
+ 		}
+ 	}
+ 
++	bio_set_streamid(bio, bio_get_streamid(bio_src));
+ 	return bio;
+ }
+ EXPORT_SYMBOL(bio_clone_bioset);
+@@ -2037,6 +2039,9 @@ static void __init biovec_init_slabs(void)
+ 
+ static int __init init_bio(void)
+ {
++	BUILD_BUG_ON(BIO_FLAG_LAST > ((8 * sizeof(unsigned int)) -
++			BIO_POOL_BITS - BIO_STREAM_BITS));
++
+ 	bio_slab_max = 2;
+ 	bio_slab_nr = 0;
+ 	bio_slabs = kzalloc(bio_slab_max * sizeof(struct bio_slab), GFP_KERNEL);
+diff --git a/block/blk-core.c b/block/blk-core.c
+index b83d297..e4b1269 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -2071,6 +2071,10 @@ blk_qc_t generic_make_request(struct bio *bio)
+ 		struct request_queue *q = bdev_get_queue(bio->bi_bdev);
+ 
+ 		if (likely(blk_queue_enter(q, false) == 0)) {
++			if (bio_streamid_valid(bio))
++				blk_add_trace_msg(q, "StreamID=%u",
++							bio_get_streamid(bio));
++
+ 			ret = q->make_request_fn(q, bio);
+ 
+ 			blk_queue_exit(q);
+diff --git a/include/linux/blk_types.h b/include/linux/blk_types.h
+index 86a38ea..fc63a82 100644
+--- a/include/linux/blk_types.h
++++ b/include/linux/blk_types.h
+@@ -112,21 +112,23 @@ struct bio {
+ /*
+  * bio flags
+  */
+-#define BIO_SEG_VALID	1	/* bi_phys_segments valid */
+-#define BIO_CLONED	2	/* doesn't own data */
+-#define BIO_BOUNCED	3	/* bio is a bounce bio */
+-#define BIO_USER_MAPPED 4	/* contains user pages */
+-#define BIO_NULL_MAPPED 5	/* contains invalid user pages */
+-#define BIO_QUIET	6	/* Make BIO Quiet */
+-#define BIO_CHAIN	7	/* chained bio, ->bi_remaining in effect */
+-#define BIO_REFFED	8	/* bio has elevated ->bi_cnt */
+-
+-/*
+- * Flags starting here get preserved by bio_reset() - this includes
+- * BIO_POOL_IDX()
+- */
+-#define BIO_RESET_BITS	13
+-#define BIO_OWNS_VEC	13	/* bio_free() should free bvec */
++enum {
++	BIO_SEG_VALID	= 0,	/* bi_phys_segments valid */
++	BIO_CLONED,		/* doesn't own data */
++	BIO_BOUNCED,		/* bio is a bounce bio */
++	BIO_USER_MAPPED,	/* contains user pages */
++	BIO_NULL_MAPPED,	/* contains invalid user pages */
++	BIO_QUIET,		/* Mnake BIO Quiet */
++	BIO_CHAIN,		/* chained bio, ->bi_remaining in effect */
++	BIO_REFFED,		/* bio has elevated ->bi_cnt */
++	BIO_OWNS_VEC,		/* bio_free() should free bvec */
++	BIO_FLAG_LAST,		/* end of bits */
++	/*
++	 * Flags starting here get preserved by bio_reset() - this includes
++	 * BIO_POOL_IDX()
++	 */
++	BIO_RESET_BITS = BIO_FLAG_LAST,
++};
+ 
+ /*
+  * top 4 bits of bio flags indicate the pool this bio came from
+@@ -134,9 +136,35 @@ struct bio {
+ #define BIO_POOL_BITS		(4)
+ #define BIO_POOL_NONE		((1UL << BIO_POOL_BITS) - 1)
+ #define BIO_POOL_OFFSET		(32 - BIO_POOL_BITS)
+-#define BIO_POOL_MASK		(1UL << BIO_POOL_OFFSET)
+ #define BIO_POOL_IDX(bio)	((bio)->bi_flags >> BIO_POOL_OFFSET)
+ 
++/*
++ * after the pool bits, next 16 bits are for the stream id
++ */
++#define BIO_STREAM_BITS		(16)
++#define BIO_STREAM_OFFSET	(BIO_POOL_OFFSET - BIO_STREAM_BITS)
++#define BIO_STREAM_MASK		((1 << BIO_STREAM_BITS) - 1)
++
++static inline unsigned long streamid_to_flags(unsigned int id)
++{
++	return (unsigned long) (id & BIO_STREAM_MASK) << BIO_STREAM_OFFSET;
++}
++
++static inline void bio_set_streamid(struct bio *bio, unsigned int id)
++{
++	bio->bi_flags |= streamid_to_flags(id);
++}
++
++static inline unsigned int bio_get_streamid(struct bio *bio)
++{
++	return (bio->bi_flags >> BIO_STREAM_OFFSET) & BIO_STREAM_MASK;
++}
++
++static inline bool bio_streamid_valid(struct bio *bio)
++{
++	return bio_get_streamid(bio) != 0;
++}
++
+ #endif /* CONFIG_BLOCK */
+ 
+ /*
+-- 
+2.7.0
+

@@ -135,6 +135,20 @@ static inline void *idr_find(struct idr *idr, int id)
 #define idr_for_each_entry(idp, entry, id)			\
 	for (id = 0; ((entry) = idr_get_next(idp, &(id))) != NULL; ++id)
 
+/**
+ * idr_for_each_entry - continue iteration over an idr's elements of a given type
+ * @idp:     idr handle
+ * @entry:   the type * to use as cursor
+ * @id:      id entry's key
+ *
+ * Continue to iterate over list of given type, continuing after
+ * the current position.
+ */
+#define idr_for_each_entry_continue(idp, entry, id)			\
+	for ((entry) = idr_get_next((idp), &(id));			\
+	     entry;							\
+	     ++id, (entry) = idr_get_next((idp), &(id)))
+
 /*
  * IDA - IDR based id allocator, use when translation from id to
  * pointer isn't necessary.
@@ -161,13 +175,14 @@ struct ida {
 
 int ida_pre_get(struct ida *ida, gfp_t gfp_mask);
 int ida_get_new_above(struct ida *ida, int starting_id, int *p_id);
+int __ida_remove(struct ida *ida, int id);
 void ida_remove(struct ida *ida, int id);
 void ida_destroy(struct ida *ida);
 void ida_init(struct ida *ida);
 
 int ida_simple_get(struct ida *ida, unsigned int start, unsigned int end,
 		   gfp_t gfp_mask);
-void ida_simple_remove(struct ida *ida, unsigned int id);
+int ida_simple_remove(struct ida *ida, unsigned int id);
 
 /**
  * ida_get_new - allocate new ID

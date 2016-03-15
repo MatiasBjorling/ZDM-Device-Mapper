@@ -6,6 +6,7 @@
 #include <linux/bio.h>
 #include <linux/blkdev.h>
 #include <linux/scatterlist.h>
+#include <linux/blkzoned_api.h>
 
 #include "blk.h"
 
@@ -299,3 +300,166 @@ int blkdev_issue_zeroout(struct block_device *bdev, sector_t sector,
 	return __blkdev_issue_zeroout(bdev, sector, nr_sects, gfp_mask);
 }
 EXPORT_SYMBOL(blkdev_issue_zeroout);
+
+/**
+ * bio_add_kmem_pages - Add a kmalloc()'d array to a bio.
+ * @bio: Bio to add pages to
+ * @buf: kmalloc()'d buffer.
+ * @bufsz: size of buffer to add.
+ *
+ * Return: 0 on success. Negative on error.
+ *
+ * Description:
+ *    Add kmalloc()'d memory as a series of pages to a BIO. This may fail
+ *    if the initial bio does not have enough space to add another bi_io_vec
+ *    entry. See also: bio_add_page().
+ */
+static int bio_add_kmem_pages(struct bio *bio, void *buf, size_t bufsz)
+{
+	unsigned offset;
+	void *pg;
+	unsigned long len;
+
+	do {
+		pg = virt_to_page(buf);
+		offset = ((unsigned long) buf) & (PAGE_SIZE - 1);
+		len = PAGE_SIZE - offset;
+		if (!bio_add_page(bio, pg, len, offset))
+			return -ENOMEM;
+		buf += len;
+	} while (bio->bi_iter.bi_size < bufsz);
+
+	return 0;
+}
+
+/**
+ * blkdev_issue_zone_report - queue a report zones operation
+ * @bdev:	target blockdev
+ * @bi_rw:	extra bio rw flags. If unsure, use 0.
+ * @sector:	start sector
+ * @buf:	kmalloc()'d buffer for read.
+ * @bufsz:	size of buffer in bytes.
+ * @gfp_mask:	memory allocation flags (for bio_alloc)
+ *
+ * Description:
+ *    Issue a zone report request for the sectors in question.
+ */
+int blkdev_issue_zone_report(struct block_device *bdev, unsigned long bi_rw,
+			     sector_t sector, u8 opt, void *buf, size_t bufsz,
+			     gfp_t gfp_mask)
+{
+	DECLARE_COMPLETION_ONSTACK(wait);
+	struct request_queue *q = bdev_get_queue(bdev);
+	struct bdev_zone_report *conv = buf;
+	struct bio_batch bb;
+	struct bio *bio;
+	unsigned int nr_iovecs = (bufsz / PAGE_SIZE) + 1;
+	int ret = 0;
+
+	if (!q)
+		return -ENXIO;
+
+	if (bufsz < (sizeof(struct bdev_zone_report) +
+		     sizeof(struct bdev_zone_descriptor)))
+		return -EINVAL;
+
+	conv->descriptor_count = 0;
+
+	atomic_set(&bb.done, 1);
+	bb.error = 0;
+	bb.wait = &wait;
+
+	bio = bio_alloc(gfp_mask, nr_iovecs);
+	if (!bio)
+		return -ENOMEM;
+
+	bio->bi_iter.bi_sector = sector;
+	bio->bi_end_io = bio_batch_end_io;
+	bio->bi_bdev = bdev;
+	bio->bi_private = &bb;
+	bio->bi_vcnt = 0;
+	bio->bi_iter.bi_size = 0;
+	bio_set_streamid(bio, opt);
+
+	ret = bio_add_kmem_pages(bio, buf, bufsz);
+	if (ret)
+		return ret;
+
+	atomic_inc(&bb.done);
+	submit_bio(bi_rw | REQ_REPORT_ZONES, bio);
+
+	/* Wait for bios in-flight */
+	if (!atomic_dec_and_test(&bb.done))
+		wait_for_completion_io(&wait);
+
+	/*
+	 * When our request it nak'd the underlying device maybe conventional
+	 * so ... report a single conventional zone the size of the device.
+	 */
+	if (bb.error == -EIO && conv->descriptor_count) {
+		/* Adjust the conventional to the size of the partition ... */
+		__be64 blksz = cpu_to_be64(bdev->bd_part->nr_sects);
+
+		conv->maximum_lba = blksz;
+		conv->descriptors[0].type = ZTYP_CONVENTIONAL;
+		conv->descriptors[0].flags = ZCOND_CONVENTIONAL << 4;
+		conv->descriptors[0].length = blksz;
+		conv->descriptors[0].lba_start = 0;
+		conv->descriptors[0].lba_wptr = blksz;
+		return 0;
+	}
+	if (bb.error)
+		return bb.error;
+	return ret;
+}
+EXPORT_SYMBOL(blkdev_issue_zone_report);
+
+/**
+ * blkdev_issue_zone_action - queue a report zones operation
+ * @bdev:	target blockdev
+ * @bi_rw:	REQ_OPEN_ZONE or REQ_CLOSE_ZONE.
+ * @sector:	start sector
+ * @gfp_mask:	memory allocation flags (for bio_alloc)
+ *
+ * Description:
+ *    Issue a zone report request for the sectors in question.
+ */
+int blkdev_issue_zone_action(struct block_device *bdev, unsigned long bi_rw,
+			     sector_t sector, gfp_t gfp_mask)
+{
+	DECLARE_COMPLETION_ONSTACK(wait);
+	struct request_queue *q = bdev_get_queue(bdev);
+	struct bio_batch bb;
+	struct bio *bio;
+	int ret = 0;
+
+	if (!q)
+		return -ENXIO;
+
+	atomic_set(&bb.done, 1);
+	bb.error = 0;
+	bb.wait = &wait;
+
+	bio = bio_alloc(gfp_mask, 1);
+	if (!bio)
+		return -ENOMEM;
+
+	bio->bi_iter.bi_sector = sector;
+	bio->bi_end_io = bio_batch_end_io;
+	bio->bi_bdev = bdev;
+	bio->bi_private = &bb;
+	bio->bi_vcnt = 0;
+	bio->bi_iter.bi_size = 0;
+
+	atomic_inc(&bb.done);
+	submit_bio(REQ_WRITE | bi_rw, bio);
+
+	/* Wait for bios in-flight */
+	if (!atomic_dec_and_test(&bb.done))
+		wait_for_completion_io(&wait);
+
+	if (bb.error)
+		return bb.error;
+	return ret;
+}
+EXPORT_SYMBOL(blkdev_issue_zone_action);

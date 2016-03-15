@@ -1,0 +1,113 @@
+From 60c7737c05a395bbfbc2eceda2768b18bbf91c72 Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Tue, 15 Mar 2016 04:05:02 -0500
+Subject: [PATCH 2/2] ATA passthrough fixes ZAC block devices.
+
+SATA devices connected through SAS/HBA's which do not support
+the ZBC command set cannot properly work with ZAC devices.
+However such HBA's support ATA 16 passthrough which in generally
+works correctly.
+
+This support sending ATA 16 commands via the SCSI ATA passthrough
+to SATA devices allowing such devices to work until the firmware
+for such SAS HBA's are updated or replaced.
+
+Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
+---
+ sys-utils/blkreport.c  |  2 +-
+ sys-utils/blkzonecmd.c | 34 ++++++++++++++++++++++++----------
+ 2 files changed, 25 insertions(+), 11 deletions(-)
+
+diff --git a/sys-utils/blkreport.c b/sys-utils/blkreport.c
+index ec82c24..55d641f 100644
+--- a/sys-utils/blkreport.c
++++ b/sys-utils/blkreport.c
+@@ -247,7 +247,7 @@ struct bdev_zone_report_io {
+ #endif
+ 
+ #ifndef BLKREPORT
+-#define BLKREPORT _IOWR(0x12,128, struct bdev_zone_report_io)
++# define BLKREPORT	_IOWR(0x12, 130, struct bdev_zone_report_io)
+ #endif
+ 
+ static const char * same_text[] = {
+diff --git a/sys-utils/blkzonecmd.c b/sys-utils/blkzonecmd.c
+index b2ebc7c..1e35454 100644
+--- a/sys-utils/blkzonecmd.c
++++ b/sys-utils/blkzonecmd.c
+@@ -52,11 +52,11 @@
+ #endif
+ 
+ #ifndef BLKOPENZONE
+-# define BLKOPENZONE	_IO(0x12,129)
++# define BLKOPENZONE	_IO(0x12, 131)
+ #endif
+ 
+ #ifndef BLKCLOSEZONE
+-# define BLKCLOSEZONE	_IO(0x12,130)
++# define BLKCLOSEZONE	_IO(0x12, 132)
+ #endif
+ 
+ enum {
+@@ -83,6 +83,15 @@ static void print_stats(int act, char *path, uint64_t lba)
+ 	}
+ }
+ 
++#define DEFAULT_ZONE_ORDER (19 + 9);
++
++static inline int issue_discard(int fd, uint64_t zone_lba, uint64_t ata)
++{
++	uint64_t range[2] = { zone_lba, 1 << DEFAULT_ZONE_ORDER };
++
++	return ioctl(fd, BLKDISCARD, &range);
++}
++
+ static void __attribute__((__noreturn__)) usage(FILE *out)
+ {
+ 	fputs(USAGE_HEADER, out);
+@@ -115,7 +124,7 @@ int main(int argc, char **argv)
+ 	uint64_t blksize;
+ 	struct stat sb;
+ 	uint64_t zone_lba = 0ul;
+-	uint64_t ata = 0;
++	int ata = 0;
+ 	int act = ACT_OPEN_ZONE;
+ 
+ 	static const struct option longopts[] = {
+@@ -203,21 +212,26 @@ int main(int argc, char **argv)
+ 	if (zone_lba > blksize)
+ 		errx(EXIT_FAILURE, _("%s: offset is greater than device size"), path);
+ 
++	if (ata) {
++		zone_lba |= 1ul; /* ensure low bit is set */
++	} else {
++		zone_lba &= ~1ul; /* ensure low bit is clear */
++	}
++
+ 	switch (act) {
+ 	case ACT_OPEN_ZONE:
+-		if (ioctl(fd, BLKOPENZONE, zone_lba | ata))
++		if (ioctl(fd, BLKOPENZONE, zone_lba))
+ 			 err(EXIT_FAILURE, _("%s: BLKOPENZONE ioctl failed"), path);
+ 		break;
+ 	case ACT_CLOSE_ZONE:
+-		if (ioctl(fd, BLKSECDISCARD, zone_lba | ata))
++		if (ioctl(fd, ACT_CLOSE_ZONE, zone_lba))
+ 			err(EXIT_FAILURE, _("%s: BLKSECDISCARD ioctl failed"), path);
+ 		break;
+ 
+-// TODO:
+-//	case ACT_RESET_ZONE:
+-//		if (ioctl(fd, BLKDISCARD, &range))
+-//			err(EXIT_FAILURE, _("%s: BLKDISCARD ioctl failed"), path);
+-//		break;
++	case ACT_RESET_ZONE:
++		if (issue_discard(fd, zone_lba))
++			err(EXIT_FAILURE, _("%s: BLKDISCARD ioctl failed"), path);
++		break;
+ 	}
+ 
+ 	if (verbose && zone_lba)
+-- 
+2.7.0
+

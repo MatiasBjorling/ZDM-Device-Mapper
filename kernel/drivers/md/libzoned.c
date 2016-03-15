@@ -12,10 +12,10 @@
  * warranty of any kind, whether express or implied.
  */
 
-#define BUILD_NO		103
+#define BUILD_NO		105
 
 #define EXTRA_DEBUG		0
-#define ENABLE_PG_FREE_VIA_LAZY	0
+#define ENABLE_PG_FREE_VIA_LAZY	1
 
 #define MZ_MEMPOOL_SZ		512
 #define READ_AHEAD		16   /* number of LUT entries to read-ahead */
@@ -83,27 +83,29 @@ static void meta_work_task(struct work_struct *work);
 static u64 mcache_greatest_gen(struct zoned *, int, u64 *, u64 *);
 static u64 mcache_find_gen(struct zoned *, u64 base, int, u64 *out);
 static int find_superblock(struct zoned *znd, int use_wq, int do_init);
-static int sync_mapped_pages(struct zoned *znd, int sync, int drop);
-static int unused_phy(struct zoned *znd, u64 lba, u64 orig_s, int gfp);
-static struct io_4k_block *get_io_vcache(struct zoned *znd, int gfp);
+static int sync_mapped_pages(struct zoned *znd, int sync, int *drop);
+static int unused_phy(struct zoned *znd, u64 lba, u64 orig_s, gfp_t gfp);
+static struct io_4k_block *get_io_vcache(struct zoned *znd, gfp_t gfp);
 static int put_io_vcache(struct zoned *znd, struct io_4k_block *cache);
-static struct map_pg *get_map_entry(struct zoned *, u64 lba, int gfp);
+static struct map_pg *get_map_entry(struct zoned *, u64 lba, gfp_t gfp);
 static void put_map_entry(struct map_pg *);
-static int cache_pg(struct zoned *znd, struct map_pg *pg, int, struct mpinfo *);
+static int cache_pg(struct zoned *znd, struct map_pg *pg, gfp_t gfp,
+		    struct mpinfo *mpi);
 static int move_to_map_tables(struct zoned *znd, struct map_cache *mcache);
 static void update_stale_ratio(struct zoned *znd, u32 zone);
 static int zoned_create_disk(struct dm_target *ti, struct zoned *znd);
 static int do_init_zoned(struct dm_target *ti, struct zoned *znd);
-static int z_discard_partial(struct zoned *znd, u32 blks, int gfp);
-static u64 z_discard_range(struct zoned *znd, u64 addr, int gfp);
+static int z_discard_partial(struct zoned *znd, u32 blks, gfp_t gfp);
+static u64 z_discard_range(struct zoned *znd, u64 addr, gfp_t gfp);
 static u64 z_lookup_cache(struct zoned *znd, u64 addr, int type);
-static u64 z_lookup_table(struct zoned *znd, u64 addr, int gfp);
-static u64 current_mapping(struct zoned *znd, u64 addr, int gfp);
-static int z_mapped_add_one(struct zoned *znd, u64 dm_s, u64 lba, int gfp);
-static int z_mapped_discard(struct zoned *znd, u64 tlba, u64 count, int gfp);
-static int z_mapped_addmany(struct zoned *znd, u64 dm_s, u64 lba, u64, int gfp);
-static int z_to_map_list(struct zoned *znd, u64 dm_s, u64 lba, int gfp);
-static int z_to_discard_list(struct zoned *znd, u64 dm_s, u64 blks, int gfp);
+static u64 z_lookup_table(struct zoned *znd, u64 addr, gfp_t gfp);
+static u64 current_mapping(struct zoned *znd, u64 addr, gfp_t gfp);
+static int z_mapped_add_one(struct zoned *znd, u64 dm_s, u64 lba, gfp_t gfp);
+static int z_mapped_discard(struct zoned *znd, u64 tlba, u64 count, gfp_t gfp);
+static int z_mapped_addmany(struct zoned *znd, u64 dm_s, u64 lba, u64,
+			    gfp_t gfp);
+static int z_to_map_list(struct zoned *znd, u64 dm_s, u64 lba, gfp_t gfp);
+static int z_to_discard_list(struct zoned *znd, u64 dm_s, u64 blks, gfp_t gfp);
 static int discard_merge(struct zoned *znd, u64 tlba, u64 blks);
 static int z_mapped_sync(struct zoned *znd);
 static int z_mapped_init(struct zoned *znd);
@@ -115,6 +117,8 @@ static int read_block(struct dm_target *, enum dm_io_mem_type,
 		      void *, u64, unsigned int, int);
 static int write_block(struct dm_target *, enum dm_io_mem_type,
 		       void *, u64, unsigned int, int);
+static int writef_block(struct dm_target *ti, int rw, enum dm_io_mem_type dtype,
+			void *data, u64 lba, unsigned int count, int queue);
 static int zoned_init_disk(struct dm_target *ti, struct zoned *znd,
 			   int create, int force);
 
@@ -398,8 +402,26 @@ void lazy_pool_add(struct zoned *znd, struct map_pg *expg, int bit)
 	if (!test_bit(IS_LAZY, &expg->flags)) {
 		set_bit(IS_LAZY, &expg->flags);
 		list_add(&expg->lazy, &znd->lzy_pool);
+		znd->in_lzy++;
 	}
 	set_bit(bit, &expg->flags);
+	spin_unlock_irqrestore(&znd->lzy_lck, flags);
+}
+
+/**
+ * lazy_pool_splice - Add a list of pages to the lazy pool
+ * @znd: ZDM Instance
+ * @list: List of map table page to add.
+ *
+ * Lazy pool is used for deferred adding and delayed removal.
+ */
+static __always_inline
+void lazy_pool_splice(struct zoned *znd, struct list_head *list)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&znd->lzy_lck, flags);
+	list_splice_tail(list, &znd->lzy_pool);
 	spin_unlock_irqrestore(&znd->lzy_lck, flags);
 }
 
@@ -422,6 +444,7 @@ static inline int pool_add(struct zoned *znd, struct map_pg *expg)
 			} else {
 				set_bit(IN_ZLT, &expg->flags);
 				list_add(&expg->zltlst, &znd->zltpool);
+				znd->in_zlt++;
 			}
 			spin_unlock_irqrestore(&znd->zlt_lck, flags);
 			rcode = 0;
@@ -714,36 +737,36 @@ void zdm_alloc_debug(struct zoned *znd, void *p, size_t sz, int id)
  * This (ugly) unified scheme helps to find leaks and monitor usage
  *   via ioctl tools.
  */
-static void *zdm_alloc(struct zoned *znd, size_t sz, int code, int gfp)
+static void *zdm_alloc(struct zoned *znd, size_t sz, int code, gfp_t gfp)
 {
 	void *pmem = NULL;
 	int id    = code & 0x00FFFF;
 	int flag  = code & 0xFF0000;
-	int gfp_flags;
+	gfp_t gfp_mask;
 
 #if USE_KTHREAD
-	gfp_flags = GFP_KERNEL;
+	gfp_mask = GFP_KERNEL;
 #else
-	gfp_flags = gfp ? GFP_ATOMIC : GFP_KERNEL;
+	gfp_mask = gfp ? GFP_ATOMIC : GFP_KERNEL;
 #endif
 
 	if (flag == GET_VM)
 		might_sleep();
 
-	if (gfp_flags != GFP_ATOMIC)
+	if (gfp_mask != GFP_ATOMIC)
 		might_sleep();
 
 	switch (flag) {
 	case GET_ZPG:
-		pmem = (void *)get_zeroed_page(gfp_flags);
-		if (!pmem && gfp_flags == GFP_ATOMIC) {
+		pmem = (void *)get_zeroed_page(gfp_mask);
+		if (!pmem && gfp_mask == GFP_ATOMIC) {
 			Z_ERR(znd, "No atomic for %d, try noio.", id);
 			pmem = (void *)get_zeroed_page(GFP_NOIO);
 		}
 		break;
 	case GET_KM:
-		pmem = kzalloc(sz, gfp_flags);
-		if (!pmem && gfp_flags == GFP_ATOMIC) {
+		pmem = kzalloc(sz, gfp_mask);
+		if (!pmem && gfp_mask == GFP_ATOMIC) {
 			Z_ERR(znd, "No atomic for %d, try noio.", id);
 			pmem = kzalloc(sz, GFP_NOIO);
 		}
@@ -773,15 +796,15 @@ static void *zdm_alloc(struct zoned *znd, size_t sz, int code, int gfp)
  * @znd: ZDM instance
  * @n: number of elements in array.
  * @sz: allocation size of each element.
- * @code: allocation strategy (VM, KM, PAGE, N-PAGES).
- * @gfp: kernel allocation flags.
+ * @c: allocation strategy (VM, KM, PAGE, N-PAGES).
+ * @q: kernel allocation flags.
  *
  * calloc is just an zeroed memory array alloc.
  * all zdm_alloc schemes are for zeroed memory so no extra memset needed.
  */
-static void *zdm_calloc(struct zoned *znd, size_t n, size_t sz, int code, int q)
+static void *zdm_calloc(struct zoned *znd, size_t n, size_t sz, int c, gfp_t q)
 {
-	return zdm_alloc(znd, sz * n, code, q);
+	return zdm_alloc(znd, sz * n, c, q);
 }
 
 /**
@@ -791,7 +814,7 @@ static void *zdm_calloc(struct zoned *znd, size_t n, size_t sz, int code, int q)
  *
  * Return: Pointer to pool memory or NULL.
  */
-static struct io_4k_block *get_io_vcache(struct zoned *znd, int gfp)
+static struct io_4k_block *get_io_vcache(struct zoned *znd, gfp_t gfp)
 {
 	struct io_4k_block *cache = NULL;
 	int avail;
@@ -815,7 +838,7 @@ static struct io_4k_block *get_io_vcache(struct zoned *znd, int gfp)
 /**
  * put_io_vcache() - Get a pre-allocated pool of memory for IO.
  * @znd: ZDM instance
- * @gfp: Allocation flags if no pre-allocated pool can be found.
+ * @cache: Allocated cache entry.
  *
  * Return: Pointer to pool memory or NULL.
  */
@@ -891,14 +914,13 @@ static int release_memcache(struct zoned *znd)
 		if (list_empty(head))
 			return 0;
 
+		SpinLock(&znd->mclck[no]);
 		list_for_each_entry_safe(mcache, _mc, head, mclist) {
-			/** move all the journal entries into the SLT */
-			SpinLock(&znd->mclck[no]);
 			list_del(&mcache->mclist);
 			ZDM_FREE(znd, mcache->jdata, Z_C4K, PG_08);
 			ZDM_FREE(znd, mcache, sizeof(*mcache), KM_07);
-			spin_unlock(&znd->mclck[no]);
 		}
+		spin_unlock(&znd->mclck[no]);
 
 	}
 	return 0;
@@ -953,7 +975,7 @@ static void mapped_free(struct zoned *znd, struct map_pg *mapped)
 		WARN_ON(test_bit(IS_DIRTY, &mapped->flags));
 		if (mapped->data.addr) {
 			ZDM_FREE(znd, mapped->data.addr, Z_C4K, PG_27);
-			znd->incore_count--;
+			atomic_dec(&znd->incore);
 		}
 		mutex_unlock(&mapped->md_lock);
 		ZDM_FREE(znd, mapped, sizeof(*mapped), KM_20);
@@ -970,7 +992,7 @@ static void mapped_free(struct zoned *znd, struct map_pg *mapped)
 static int flush_map(struct zoned *znd, struct map_pg **map, u32 count)
 {
 	const int use_wq = 1;
-	const int sync = 0;
+	const int sync = 1;
 	u32 ii;
 	int err = 0;
 
@@ -1005,15 +1027,22 @@ static int zoned_io_flush(struct zoned *znd)
 	set_bit(DO_JOURNAL_MOVE, &znd->flags);
 	set_bit(DO_MEMPOOL, &znd->flags);
 	set_bit(DO_SYNC, &znd->flags);
+	set_bit(DO_FLUSH, &znd->flags);
 	queue_work(znd->meta_wq, &znd->meta_work);
 	flush_workqueue(znd->meta_wq);
+	flush_workqueue(znd->bg_wq);
 
 	mod_delayed_work(znd->gc_wq, &znd->gc_work, 0);
 	flush_delayed_work(&znd->gc_work);
 	atomic_dec(&znd->gc_throttle);
 
-	INIT_LIST_HEAD(&znd->zltpool);
+	spin_lock(&znd->lzy_lck);
 	INIT_LIST_HEAD(&znd->lzy_pool);
+	spin_unlock(&znd->lzy_lck);
+
+	spin_lock(&znd->zlt_lck);
+	INIT_LIST_HEAD(&znd->zltpool);
+	spin_unlock(&znd->zlt_lck);
 
 	err = flush_map(znd, znd->fwd_tm, znd->map_count);
 	if (err)
@@ -1032,6 +1061,7 @@ static int zoned_io_flush(struct zoned *znd)
 		goto out;
 
 	set_bit(DO_SYNC, &znd->flags);
+	set_bit(DO_FLUSH, &znd->flags);
 	queue_work(znd->meta_wq, &znd->meta_work);
 	flush_workqueue(znd->meta_wq);
 
@@ -1114,6 +1144,7 @@ static void zoned_destroy(struct zoned *znd)
 
 	release_table_pages(znd);
 	release_memcache(znd);
+
 	if (znd->dev) {
 		dm_put_device(znd->ti, znd->dev);
 		znd->dev = NULL;
@@ -1121,6 +1152,10 @@ static void zoned_destroy(struct zoned *znd)
 	if (znd->io_wq) {
 		destroy_workqueue(znd->io_wq);
 		znd->io_wq = NULL;
+	}
+	if (znd->zone_action_wq) {
+		destroy_workqueue(znd->zone_action_wq);
+		znd->zone_action_wq = NULL;
 	}
 	if (znd->bg_wq) {
 		destroy_workqueue(znd->bg_wq);
@@ -1252,6 +1287,7 @@ struct meta_pg *_alloc_wp(struct zoned *znd)
 		}
 		_init_wp(znd, gzno, wpg);
 		set_bit(IS_DIRTY, &wpg->flags);
+		clear_bit(IS_FLUSH, &wpg->flags);
 	}
 
 out:
@@ -1325,14 +1361,13 @@ static int do_init_zoned(struct dm_target *ti, struct zoned *znd)
 	}
 	spin_lock_init(&znd->zlt_lck);
 	spin_lock_init(&znd->lzy_lck);
-
-	mutex_init(&znd->pool_mtx);
-
 	spin_lock_init(&znd->gc_lock);
 	spin_lock_init(&znd->stats_lock);
 	spin_lock_init(&znd->mapkey_lock);
 	spin_lock_init(&znd->ct_lock);
 
+	mutex_init(&znd->pool_mtx);
+	mutex_init(&znd->gc_wait);
 	mutex_init(&znd->gc_postmap.cached_lock);
 	mutex_init(&znd->gc_vcio_lock);
 	mutex_init(&znd->vcio_lock);
@@ -1448,7 +1483,7 @@ static int do_init_zoned(struct dm_target *ti, struct zoned *znd)
 
 	znd->meta_wq = create_singlethread_workqueue("znd_meta_wq");
 	if (!znd->meta_wq) {
-		ti->error = "couldn't start header metadata update thread";
+		ti->error = "couldn't start metadata worker thread";
 		rcode = -ENOMEM;
 		goto out;
 	}
@@ -1469,7 +1504,14 @@ static int do_init_zoned(struct dm_target *ti, struct zoned *znd)
 
 	znd->io_wq = create_singlethread_workqueue("kzoned_dm_io_wq");
 	if (!znd->io_wq) {
-		ti->error = "couldn't start header metadata update thread";
+		ti->error = "couldn't start DM I/O thread";
+		rcode = -ENOMEM;
+		goto out;
+	}
+
+	znd->zone_action_wq = create_singlethread_workqueue("zone_act_wq");
+	if (!znd->zone_action_wq) {
+		ti->error = "couldn't start zone action worker";
 		rcode = -ENOMEM;
 		goto out;
 	}
@@ -1483,10 +1525,7 @@ static int do_init_zoned(struct dm_target *ti, struct zoned *znd)
 	INIT_WORK(&znd->bg_work, bg_work_task);
 	INIT_DELAYED_WORK(&znd->gc_work, gc_work_task);
 	setup_timer(&znd->timer, activity_timeout, (unsigned long)znd);
-
-	znd->incore_count = 0;
 	znd->last_w = BAD_ADDR;
-
 	set_bit(DO_SYNC, &znd->flags);
 
 out:
@@ -1990,7 +2029,7 @@ static void increment_used_blks(struct zoned *znd, u64 lba, u32 blks)
  *
  * Return: Disk LBA or 0 if not found.
  */
-static u64 _current_mapping(struct zoned *znd, int nodisc, u64 addr, int gfp)
+static u64 _current_mapping(struct zoned *znd, int nodisc, u64 addr, gfp_t gfp)
 {
 	u64 found = 0ul;
 
@@ -2024,7 +2063,7 @@ out:
  *
  * Return: Disk LBA or 0 if not found.
  */
-static u64 current_mapping(struct zoned *znd, u64 addr, int gfp)
+static u64 current_mapping(struct zoned *znd, u64 addr, gfp_t gfp)
 {
 	const int nodisc = 0;
 
@@ -2040,7 +2079,7 @@ static u64 current_mapping(struct zoned *znd, u64 addr, int gfp)
  *
  * Add a new extent entry.
  */
-static int z_mapped_add_one(struct zoned *znd, u64 dm_s, u64 lba, int gfp)
+static int z_mapped_add_one(struct zoned *znd, u64 dm_s, u64 lba, gfp_t gfp)
 {
 	int err = 0;
 
@@ -2093,7 +2132,7 @@ static int z_mapped_add_one(struct zoned *znd, u64 dm_s, u64 lba, int gfp)
  *
  * Add a new extent entry.
  */
-static int z_discard_small(struct zoned *znd, u64 tlba, u64 count, int gfp)
+static int z_discard_small(struct zoned *znd, u64 tlba, u64 count, gfp_t gfp)
 {
 	const int nodisc = 1;
 	int err = 0;
@@ -2121,7 +2160,7 @@ static int z_discard_small(struct zoned *znd, u64 tlba, u64 count, int gfp)
  *
  * Add a new extent entry.
  */
-static int z_discard_large(struct zoned *znd, u64 tlba, u64 blks, int gfp)
+static int z_discard_large(struct zoned *znd, u64 tlba, u64 blks, gfp_t gfp)
 {
 	int rcode = 0;
 
@@ -2146,14 +2185,14 @@ static int z_discard_large(struct zoned *znd, u64 tlba, u64 blks, int gfp)
  * Otherwise add a new extent entry.
  */
 static
-int mapped_discard(struct zoned *znd, u64 tlba, u64 blks, int merge, int gfp)
+int mapped_discard(struct zoned *znd, u64 tlba, u64 blks, int merge, gfp_t gfp)
 {
 	int err = 0;
 
 	if (merge && discard_merge(znd, tlba, blks))
 		goto done;
 
-	if (blks < DISCARD_MAX_INGRESS) {
+	if (blks < DISCARD_MAX_INGRESS || znd->dc_entries > 39) {
 		/* io_mutex is avoid adding map cache entries during SYNC */
 		MutexLock(&znd->mz_io_mutex);
 		err = z_discard_small(znd, tlba, blks, gfp);
@@ -2174,7 +2213,7 @@ done:
  * @blks: number of blocks being discard.
  * @gfp: Current memory allocation scheme.
  */
-static int z_mapped_discard(struct zoned *znd, u64 tlba, u64 blks, int gfp)
+static int z_mapped_discard(struct zoned *znd, u64 tlba, u64 blks, gfp_t gfp)
 {
 	const int merge = 1;
 
@@ -2186,7 +2225,7 @@ static int z_mapped_discard(struct zoned *znd, u64 tlba, u64 blks, int gfp)
  * @znd: ZDM Instance
  * @gfp: Current memory allocation scheme.
  */
-static struct map_cache *mcache_alloc(struct zoned *znd, int gfp)
+static struct map_cache *mcache_alloc(struct zoned *znd, gfp_t gfp)
 {
 	struct map_cache *mcache;
 
@@ -2438,6 +2477,7 @@ static void mcache_insert(struct zoned *znd, struct map_cache *mcache,
 	}
 }
 
+
 /**
  * mc_delete_entry - Overwrite a map_cache entry (for mostly sorted data)
  * @mcache: Map Cache block
@@ -2480,7 +2520,7 @@ void mc_delete_entry(struct map_cache *mcache, int entry)
  * for writing. Ideally the punch only requires the extent to be shrunk.
  */
 static int _discard_split_entry(struct zoned *znd, struct map_cache *mcache,
-				int at, u64 addr, int gfp)
+				int at, u64 addr, gfp_t gfp)
 {
 	const int merge = 0;
 	int err = 0;
@@ -2544,6 +2584,7 @@ static int _discard_split_entry(struct zoned *znd, struct map_cache *mcache,
 	 * entry or we ran to the end of the extent and we can just
 	 * truncate the extent.
 	 */
+
 	if (tlba == addr) {
 		blocks -= dblks;
 		tlba += dblks;
@@ -2588,7 +2629,7 @@ out:
  * The overall purpose of the discard pool is to reduce the amount of intake
  * on the memcache to avoid starving the I/O requests.
  */
-static u64 z_discard_range(struct zoned *znd, u64 addr, int gfp)
+static u64 z_discard_range(struct zoned *znd, u64 addr, gfp_t gfp)
 {
 	struct map_cache *mcache;
 	u64 found = 0ul;
@@ -2640,7 +2681,7 @@ out:
  * The overall purpose of the discard pool is to reduce the amount of intake
  * on the memcache to avoid starving the I/O requests.
  */
-static int z_discard_partial(struct zoned *znd, u32 minblks, int gfp)
+static int z_discard_partial(struct zoned *znd, u32 minblks, gfp_t gfp)
 {
 	struct map_cache *mcache;
 	int completions = 0;
@@ -2890,12 +2931,12 @@ static int _cached_to_tables(struct zoned *znd, u32 zone)
  *
  * Return: 0 on success or -errno value
  */
-static int z_flush_bdev(struct zoned *znd)
+static int z_flush_bdev(struct zoned *znd, gfp_t gfp)
 {
 	int err;
 	sector_t bi_done;
 
-	err = blkdev_issue_flush(znd->dev->bdev, GFP_KERNEL, &bi_done);
+	err = blkdev_issue_flush(znd->dev->bdev, gfp, &bi_done);
 	if (err)
 		Z_ERR(znd, "%s: flush failing sector %lu!", __func__, bi_done);
 
@@ -2910,10 +2951,12 @@ static int z_flush_bdev(struct zoned *znd)
  * Forced inline as it is 'optional' and because it is called with
  * spin locks enabled and only from a single caller.
  */
-static __always_inline void pg_delete(struct zoned *znd, struct map_pg *expg)
+static __always_inline int pg_delete(struct zoned *znd, struct map_pg *expg)
 {
 	struct map_pg **zlt;
 	spinlock_t *lock;
+	int req_flush = 0;
+	int dropped = 0;
 	int index = expg->index;
 	int is_lut = test_bit(IS_LUT, &expg->flags);
 	int is_fwd = test_bit(IS_FWD, &expg->flags);
@@ -2926,30 +2969,39 @@ static __always_inline void pg_delete(struct zoned *znd, struct map_pg *expg)
 		zlt = is_fwd ? znd->fwd_crc : znd->rev_crc;
 		lock = &znd->ct_lock;
 	}
-	spin_lock(lock);
-	if (index > -1 && index < count && expg == zlt[index] &&
-	    test_and_clear_bit(IS_DROPPED, &expg->flags)) {
-		zlt[index] = NULL;
 
+	if (!spin_trylock(lock))
+		return req_flush;
+
+	if (index > -1 && index < count && expg == zlt[index] &&
+	    test_bit(IS_DROPPED, &expg->flags)) {
+		zlt[index] = NULL;
 		MutexLock(&expg->md_lock);
 		if (test_and_clear_bit(IS_LAZY, &expg->flags)) {
-			list_del(&expg->lazy);
+			clear_bit(IS_DROPPED, &expg->flags);
 			clear_bit(DELAY_ADD, &expg->flags);
-
 			if (expg->data.addr) {
 				void *pg = expg->data.addr;
 
 				expg->data.addr = NULL;
 				ZDM_FREE(znd, pg, Z_C4K, PG_27);
-				znd->incore_count--;
+				atomic_dec(&znd->incore);
+			} else {
+				Z_ERR(znd, "** No data pg? %llx", expg->lba);
 			}
-			ZDM_FREE(znd, expg, sizeof(*expg), KM_20);
+			list_del(&expg->lazy);
+			znd->in_lzy--;
+			req_flush = !test_bit(IS_FLUSH, &expg->flags);
+			dropped = 1;
 		} else {
 			Z_ERR(znd, "Detected double list del.");
 		}
 		mutex_unlock(&expg->md_lock);
+		if (dropped)
+			ZDM_FREE(znd, expg, sizeof(*expg), KM_20);
 	}
 	spin_unlock(lock);
+	return req_flush;
 }
 
 /**
@@ -2963,13 +3015,14 @@ static __always_inline void pg_delete(struct zoned *znd, struct map_pg *expg)
  *     the default we can catch it and make it 'hotter' before the
  *     hotness indicator is lost.
  */
-void manage_lazy_activity(struct zoned *znd)
+static int manage_lazy_activity(struct zoned *znd)
 {
 	struct map_pg *expg;
 	struct map_pg *_tpg;
+	int want_flush = 0;
+	const u32 msecs = MEM_HOT_BOOST_INC;
 
 	spin_lock(&znd->lzy_lck);
-
 	expg = list_first_entry_or_null(&znd->lzy_pool, typeof(*expg), lazy);
 	if (!expg || (&expg->lazy == &znd->lzy_pool))
 		goto out;
@@ -2977,30 +3030,39 @@ void manage_lazy_activity(struct zoned *znd)
 	_tpg = list_next_entry(expg, lazy);
 	while (&expg->lazy != &znd->lzy_pool) {
 		/*
+		 * this should never happen:
+		 */
+		if (test_bit(IS_DIRTY, &expg->flags))
+			set_bit(DELAY_ADD, &expg->flags);
+		/*
 		 * Migrage pg to zltlst list
 		 */
-		if (test_and_clear_bit(DELAY_ADD, &expg->flags)) {
-			spin_lock(&znd->zlt_lck);
-			list_del(&expg->lazy);
-			clear_bit(IS_LAZY, &expg->flags);
-			clear_bit(IS_DROPPED, &expg->flags);
-
-			if (!test_bit(IN_ZLT, &expg->flags)) {
-				set_bit(IN_ZLT, &expg->flags);
-				list_add(&expg->zltlst, &znd->zltpool);
+		if (test_bit(DELAY_ADD, &expg->flags)) {
+			if (spin_trylock(&znd->zlt_lck)) {
+				if (!test_bit(IN_ZLT, &expg->flags)) {
+					list_del(&expg->lazy);
+					znd->in_lzy--;
+					clear_bit(IS_LAZY, &expg->flags);
+					clear_bit(IS_DROPPED, &expg->flags);
+					clear_bit(DELAY_ADD, &expg->flags);
+					set_bit(IN_ZLT, &expg->flags);
+					list_add(&expg->zltlst, &znd->zltpool);
+					znd->in_zlt++;
+				} else {
+					Z_ERR(znd, "** ZLT double add? %llx",
+						expg->lba);
+				}
+				spin_unlock(&znd->zlt_lck);
 			}
-			spin_unlock(&znd->zlt_lck);
 #if ENABLE_PG_FREE_VIA_LAZY
 		} else {
-			u64 expired = expg->age + msecs_to_jiffies(5000);
-
 			/*
 			 * Delete page
 			 */
 			if (!test_bit(IN_ZLT, &expg->flags) &&
-			    test_bit(IS_DROPPED, &expg->flags) &&
-			    time_after64(jiffies_64, expired)) {
-				pg_delete(znd, expg);
+			     test_bit(IS_DROPPED, &expg->flags)) {
+				if (is_expired_msecs(expg->age, msecs))
+					want_flush |= pg_delete(znd, expg);
 			}
 #endif
 		}
@@ -3010,6 +3072,87 @@ void manage_lazy_activity(struct zoned *znd)
 
 out:
 	spin_unlock(&znd->lzy_lck);
+	return want_flush;
+}
+
+
+
+/**
+ * mark_clean_flush_zlt() - Mark all non-dirty ZLT blocks as 'FLUSH'
+ * @znd: ZDM instance
+ *
+ * After a FLUSH/FUA these blocks are on disk and redundant FLUSH
+ * can be skipped if the block is later ejected.
+ */
+static void mark_clean_flush_zlt(struct zoned *znd)
+{
+	struct map_pg *expg = NULL;
+	struct map_pg *_tpg;
+
+	spin_lock(&znd->zlt_lck);
+	if (list_empty(&znd->zltpool))
+		goto out;
+
+	expg = list_last_entry(&znd->zltpool, typeof(*expg), zltlst);
+	if (!expg || &expg->zltlst == (&znd->zltpool))
+		goto out;
+
+	_tpg = list_prev_entry(expg, zltlst);
+	while (&expg->zltlst != &znd->zltpool) {
+		ref_pg(expg);
+		if (!test_bit(IS_DIRTY, &expg->flags))
+			set_bit(IS_FLUSH, &expg->flags);
+		deref_pg(expg);
+		expg = _tpg;
+		_tpg = list_prev_entry(expg, zltlst);
+	}
+
+out:
+	spin_unlock(&znd->zlt_lck);
+}
+
+/**
+ * mark_clean_flush_lzy() - Mark all non-dirty ZLT blocks as 'FLUSH'
+ * @znd: ZDM instance
+ *
+ * After a FLUSH/FUA these blocks are on disk and redundant FLUSH
+ * can be skipped if the block is later ejected.
+ */
+static void mark_clean_flush_lzy(struct zoned *znd)
+{
+	struct map_pg *expg = NULL;
+	struct map_pg *_tpg;
+
+	spin_lock(&znd->lzy_lck);
+	expg = list_first_entry_or_null(&znd->lzy_pool, typeof(*expg), lazy);
+	if (!expg || (&expg->lazy == &znd->lzy_pool))
+		goto out;
+
+	_tpg = list_next_entry(expg, lazy);
+	while (&expg->lazy != &znd->lzy_pool) {
+		ref_pg(expg);
+		if (!test_bit(IS_DIRTY, &expg->flags))
+			set_bit(IS_FLUSH, &expg->flags);
+		deref_pg(expg);
+		expg = _tpg;
+		_tpg = list_next_entry(expg, lazy);
+	}
+
+out:
+	spin_unlock(&znd->lzy_lck);
+}
+
+/**
+ * mark_clean_flush() - Mark all non-dirty ZLT/LZY blocks as 'FLUSH'
+ * @znd: ZDM instance
+ *
+ * After a FLUSH/FUA these blocks are on disk and redundant FLUSH
+ * can be skipped if the block is later ejected.
+ */
+static void mark_clean_flush(struct zoned *znd)
+{
+	mark_clean_flush_zlt(znd);
+	mark_clean_flush_lzy(znd);
 }
 
 /**
@@ -3021,20 +3164,49 @@ out:
 static int do_sync_metadata(struct zoned *znd, int sync, int drop)
 {
 	int err = 0;
+	int want_flush;
 
-	manage_lazy_activity(znd);
+	want_flush = manage_lazy_activity(znd);
+	if (want_flush)
+		set_bit(DO_FLUSH, &znd->flags);
 
-	err = sync_mapped_pages(znd, sync, drop);
+	err = sync_mapped_pages(znd, sync, &drop);
 	if (err) {
 		Z_ERR(znd, "Uh oh: sync_mapped_pages -> %d", err);
 		goto out;
 	}
 
+	if (drop)
+		set_bit(DO_FLUSH, &znd->flags);
+
+	/*
+	 * If we are lucky then this sync will get us to a 'clean'
+	 * state and the follow on bdev flush is redunant and skipped
+	 *
+	 * If not we will suffer a performance stall because we were
+	 * ejected blocks.
+	 *
+	 * TODO: On Sync/Flush/FUA we can mark all of our clean ZLT
+	 *       as flushed and we can bypass elevating the drop count
+	 *       to trigger a flush for such already flushed blocks.
+	 */
+	want_flush = test_bit(DO_FLUSH, &znd->flags);
 	err = z_mapped_sync(znd);
 	if (err) {
 		Z_ERR(znd, "Uh oh. z_mapped_sync -> %d", err);
 		goto out;
 	}
+
+	if (test_and_clear_bit(DO_FLUSH, &znd->flags)) {
+		err = z_flush_bdev(znd, GFP_KERNEL);
+		if (err) {
+			Z_ERR(znd, "Uh oh. flush_bdev failed. -> %d", err);
+			goto out;
+		}
+		want_flush = 1;
+	}
+	if (want_flush)
+		mark_clean_flush(znd);
 
 out:
 	return err;
@@ -3082,19 +3254,30 @@ static int do_journal_to_table(struct zoned *znd)
 static int do_sync_to_disk(struct zoned *znd)
 {
 	int err = 0;
-	int sync = test_and_clear_bit(DO_SYNC, &znd->flags);
 	int drop = 0;
+	int sync = 0;
+
+	if (test_and_clear_bit(DO_SYNC, &znd->flags) ||
+	    test_bit(DO_FLUSH, &znd->flags))
+		sync = 1;
 
 	if (test_and_clear_bit(DO_MEMPOOL, &znd->flags)) {
 		int pool_size = MZ_MEMPOOL_SZ * 4;
+
+#if ENABLE_PG_FREE_VIA_LAZY
+		/**
+		 * Trust our cache miss algo
+		 */
+		pool_size = MZ_MEMPOOL_SZ * 3;
+#endif
 
 		if (is_expired_msecs(znd->age, MEM_PURGE_MSECS * 2))
 			pool_size = 3;
 		else if (is_expired_msecs(znd->age, MEM_PURGE_MSECS))
 			pool_size = MZ_MEMPOOL_SZ;
 
-		if (znd->incore_count > pool_size)
-			drop = znd->incore_count - pool_size;
+		if (atomic_read(&znd->incore) > pool_size)
+			drop = atomic_read(&znd->incore) - pool_size;
 	}
 	if (sync || drop)
 		err = do_sync_metadata(znd, sync, drop);
@@ -3121,7 +3304,8 @@ static void meta_work_task(struct work_struct *work)
 
 	err = do_init_from_journal(znd);
 
-	if (test_bit(DO_JOURNAL_MOVE, &znd->flags) &&
+	if (test_bit(DO_JOURNAL_MOVE, &znd->flags) ||
+	    test_bit(DO_FLUSH, &znd->flags) ||
 	    test_bit(DO_SYNC, &znd->flags)) {
 		MutexLock(&znd->mz_io_mutex);
 		locked = 1;
@@ -3161,7 +3345,7 @@ static void meta_work_task(struct work_struct *work)
  * the old block being stale.
  */
 static int _update_entry(struct zoned *znd, struct map_cache *mcache, int at,
-			 u64 dm_s, u64 lba, int gfp)
+			 u64 dm_s, u64 lba, gfp_t gfp)
 {
 	struct map_sect_to_lba *data;
 	u64 lba_was;
@@ -3217,7 +3401,7 @@ static int _update_disc(struct zoned *znd, struct map_cache *mcache, int at,
  * @gfp: Allocation (kmalloc) flags
  */
 static int mc_update(struct zoned *znd, struct map_cache *mcache, int at,
-		     u64 dm_s, u64 lba, int type, int gfp)
+		     u64 dm_s, u64 lba, int type, gfp_t gfp)
 {
 	int rcode;
 
@@ -3237,7 +3421,8 @@ static int mc_update(struct zoned *znd, struct map_cache *mcache, int at,
  * @type: List (type) to be adding to (MAP or DISCARD)
  * @gfp: Allocation (kmalloc) flags
  */
-static int _mapped_list(struct zoned *znd, u64 dm_s, u64 lba, int type, int gfp)
+static
+int _mapped_list(struct zoned *znd, u64 dm_s, u64 lba, int type, gfp_t gfp)
 {
 	struct map_cache *mcache = NULL;
 	struct map_cache *mc_add = NULL;
@@ -3335,7 +3520,7 @@ out:
  * @blks: Number of blocks in the extent.
  * @gfp: Allocation (kmalloc) flags
  */
-static int z_to_discard_list(struct zoned *znd, u64 dm_s, u64 blks, int gfp)
+static int z_to_discard_list(struct zoned *znd, u64 dm_s, u64 blks, gfp_t gfp)
 {
 	return _mapped_list(znd, dm_s, blks, IS_DISCARD, gfp);
 }
@@ -3347,7 +3532,7 @@ static int z_to_discard_list(struct zoned *znd, u64 dm_s, u64 blks, int gfp)
  * @lba: bLBA mapping to
  * @gfp: Allocation (kmalloc) flags
  */
-static int z_to_map_list(struct zoned *znd, u64 dm_s, u64 lba, int gfp)
+static int z_to_map_list(struct zoned *znd, u64 dm_s, u64 lba, gfp_t gfp)
 {
 	return _mapped_list(znd, dm_s, lba, IS_MAP, gfp);
 }
@@ -3484,6 +3669,8 @@ static int z_mapped_sync(struct zoned *znd)
 	int nblks = 1;
 	int use_wq = 0;
 	int rc = 1;
+	int discards = 0;
+	int maps = 0;
 	int jwrote = 0;
 	int cached = 0;
 	int idx = 0;
@@ -3503,36 +3690,34 @@ static int z_mapped_sync(struct zoned *znd)
 		goto out;
 	}
 
-
-/* TIME TO DO SOME WORK!! */
-
-/* dirty wp blocks (zone pointers) [allow for 64*4 blocks] */
-/* md_crcs-> 0x2148/9 */
-
-	lba = 0x2048;
+	lba = 0x2048ul;
 	for (idx = 0; idx < znd->gz_count; idx++) {
 		struct meta_pg *wpg = &znd->wp[idx];
 
 		if (test_bit(IS_DIRTY, &wpg->flags)) {
-			znd->bmkeys->wp_crc[idx] = crc_md_le16(wpg->wp_alloc,
-				Z_CRC_4K);
-			znd->bmkeys->zf_crc[idx] = crc_md_le16(wpg->zf_est,
-				Z_CRC_4K);
-			if (test_bit(IS_DIRTY, &wpg->flags)) {
-				memcpy(io_vcache[0].data, wpg->wp_alloc, Z_C4K);
-				memcpy(io_vcache[1].data, wpg->zf_est, Z_C4K);
-
-				rc = write_block(ti, DM_IO_VMA, io_vcache, lba,
-					cached, use_wq);
-				if (rc)
-					goto out;
-			}
+			cached = 0;
+			memcpy(io_vcache[cached].data, wpg->wp_alloc, Z_C4K);
+			znd->bmkeys->wp_crc[idx] =
+				crc_md_le16(io_vcache[cached].data, Z_CRC_4K);
+			cached++;
+			memcpy(io_vcache[cached].data, wpg->zf_est, Z_C4K);
+			znd->bmkeys->zf_crc[idx] =
+				crc_md_le16(io_vcache[cached].data, Z_CRC_4K);
+			cached++;
+			rc = write_block(ti, DM_IO_VMA, io_vcache, lba,
+				cached, use_wq);
+			if (rc)
+				goto out;
 			clear_bit(IS_DIRTY, &wpg->flags);
+
+			Z_DBG(znd, "%d# -- WP: %04x | ZF: %04x",
+			      idx, znd->bmkeys->wp_crc[idx],
+				   znd->bmkeys->zf_crc[idx]);
 		}
 		lba += 2;
 	}
 
-	lba += (generation % modulo) * incr;
+	lba = (generation % modulo) * incr;
 	if (lba == 0)
 		lba++;
 
@@ -3542,8 +3727,6 @@ static int z_mapped_sync(struct zoned *znd)
 
 	idx = 0;
 	for (no = 0; no < MAP_COUNT; no++) {
-		int incr_w = 0;
-
 		mcache = mcache_first_get(znd, no);
 		while (mcache) {
 			u64 phy = le64_to_lba48(mcache->jdata[0].bval, NULL);
@@ -3558,7 +3741,11 @@ static int z_mapped_sync(struct zoned *znd)
 				memcpy(io_vcache[cached].data,
 					mcache->jdata, Z_C4K);
 				cached++;
-				incr_w++;
+
+				if (no == IS_DISCARD)
+					discards++;
+				else
+					maps++;
 			}
 
 			if (cached == IO_VCACHE_PAGES) {
@@ -3578,28 +3765,36 @@ static int z_mapped_sync(struct zoned *znd)
 			}
 			mcache = mcache_put_get_next(znd, mcache, no);
 		}
-		if (incr_w > 40)
-			Z_ERR(znd, "**WARNING** large map cache %d [%d]",
-				incr_w, no);
 	}
 	jwrote += cached;
+	if (discards > 40)
+		Z_ERR(znd, "**WARNING** large discard cache %d", discards);
+	if (maps > 40)
+		Z_ERR(znd, "**WARNING** large map cache %d", maps);
 
 	znd->bmkeys->md_crc = crc_md_le16(znd->md_crcs, 2 * Z_CRC_4K);
 	znd->bmkeys->n_crcs = cpu_to_le16(jwrote);
+	znd->bmkeys->discards = cpu_to_le16(discards);
+	znd->bmkeys->maps = cpu_to_le16(maps);
 	znd->bmkeys->crc32 = 0;
 	znd->bmkeys->crc32 = cpu_to_le32(crc32c(~0u, znd->bmkeys, Z_CRC_4K));
 	if (cached < (IO_VCACHE_PAGES - 3)) {
 		memcpy(io_vcache[cached].data, znd->bmkeys, Z_C4K);
 		cached++;
 		memcpy(io_vcache[cached].data, znd->md_crcs, Z_C4K * 2);
-		cached++;
+		cached += 2;
 		need_sync_io = 0;
 	}
 
 	do {
 		if (cached > 0) {
-			rc = write_block(ti, DM_IO_VMA, io_vcache, lba, cached,
-					 use_wq);
+			int rw = WRITE;
+
+			if (!need_sync_io &&
+			    test_and_clear_bit(DO_FLUSH, &znd->flags))
+				rw |= (REQ_FLUSH | REQ_FUA);
+			rc = writef_block(ti, rw, DM_IO_VMA, io_vcache, lba,
+					  cached, use_wq);
 			if (rc) {
 				Z_ERR(znd, "%s: mcache-> %" PRIu64
 				      " [%d blks] %p -> %d",
@@ -3613,6 +3808,8 @@ static int z_mapped_sync(struct zoned *znd)
 		if (need_sync_io) {
 			memcpy(io_vcache[cached].data, znd->bmkeys, Z_C4K);
 			cached++;
+			memcpy(io_vcache[cached].data, znd->md_crcs, Z_C4K * 2);
+			cached += 2;
 			need_sync_io = 0;
 		}
 	} while (cached > 0);
@@ -3660,7 +3857,7 @@ void zoned_personality(struct zoned *znd, struct zdm_superblock *sblock)
 }
 
 /**
- * find_superblock() - Find superblock following lba
+ * find_superblock_at() - Find superblock following lba
  * @znd: ZDM instance
  * @lba: Lba to start scanning for superblock.
  * @use_wq: If a work queue is needed to scanning.
@@ -3728,13 +3925,18 @@ out:
 static int find_superblock(struct zoned *znd, int use_wq, int do_init)
 {
 	int found = 0;
-	u64 lba;
+	int iter = 0;
+	u64 lba = LBA_SB_START;
+	u64 last = MAX_CACHE_INCR * CACHE_COPIES;
 
-	for (lba = LBA_SB_START; lba < 0x800; lba += MAX_CACHE_INCR) {
+	do {
 		found = find_superblock_at(znd, lba, use_wq, do_init);
 		if (found)
 			break;
-	}
+		iter++;
+		lba = MAX_CACHE_INCR * iter;
+	} while (lba < last);
+
 	return found;
 }
 
@@ -3776,11 +3978,6 @@ static u64 mcache_find_gen(struct zoned *znd, u64 lba, int use_wq, u64 *sb_lba)
 				*sb_lba = lba;
 			goto out;
 		}
-		if (data[0] == 0 && data[1] == 0) {
-			/* No SB here... */
-			Z_DBG(znd, "FGen: Invalid block %" PRIx64 "?", lba);
-			goto out;
-		}
 		lba++;
 		count++;
 		if (count > MAX_CACHE_SYNC) {
@@ -3807,8 +4004,8 @@ static inline int cmp_gen(u64 left, u64 right)
 	if (left != right) {
 		u64 delta = (left > right) ? left - right : right - left;
 
-		result = -1;
-		if (delta > 1) {
+		result = (left > right) ? -1 : 1;
+		if (delta > 0xFFFFFFFF) {
 			if (left == BAD_ADDR)
 				result = 1;
 		} else {
@@ -3846,7 +4043,7 @@ u64 mcache_greatest_gen(struct zoned *znd, int use_wq, u64 *sb, u64 *at_lba)
 		gen_no[idx] = mcache_find_gen(znd, lba, use_wq, pAt);
 		if (gen_no[idx])
 			pick = idx;
-		lba += incr;
+		lba = idx * incr;
 	}
 
 	for (idx = 0; idx < locations; idx++) {
@@ -3891,6 +4088,55 @@ static u64 count_stale_blocks(struct zoned *znd, u32 gzno, struct meta_pg *wpg)
 	return stale;
 }
 
+static int do_load_cache(struct zoned *znd, int type, u64 lba, int idx, int wq)
+{
+	u16 count;
+	__le16 crc;
+	int rc = 0;
+	int blks = 1;
+	struct map_cache *mcache = mcache_alloc(znd, NORMAL);
+
+	if (!mcache) {
+		rc = -ENOMEM;
+		goto out;
+	}
+
+	rc = read_block(znd->ti, DM_IO_KMEM, mcache->jdata, lba, blks, wq);
+	if (rc) {
+		Z_ERR(znd, "%s: mcache-> %" PRIu64
+			   " [%d blks] %p -> %d",
+		      __func__, lba, blks, mcache->jdata, rc);
+
+		ZDM_FREE(znd, mcache->jdata, Z_C4K, PG_08);
+		ZDM_FREE(znd, mcache, sizeof(*mcache), KM_07);
+		goto out;
+	}
+	crc = crc_md_le16(mcache->jdata, Z_CRC_4K);
+	if (crc != znd->bmkeys->crcs[idx]) {
+		rc = -EIO;
+		Z_ERR(znd, "%s: bad crc %" PRIu64,  __func__, lba);
+		goto out;
+	}
+	(void)le64_to_lba48(mcache->jdata[0].bval, &count);
+	mcache->jcount = count;
+	mclist_add(znd, mcache, type);
+
+out:
+	return rc;
+}
+
+static int do_load_map_cache(struct zoned *znd, u64 lba, int idx, int wq)
+{
+	return do_load_cache(znd, IS_MAP, lba, idx, wq);
+}
+
+static int do_load_discard_cache(struct zoned *znd, u64 lba, int idx, int wq)
+{
+	return do_load_cache(znd, IS_DISCARD, lba, idx, wq);
+}
+
+
+
 /**
  * z_mapped_init() - Re-Load an existing ZDM instance from the block device.
  * @znd: ZDM instance
@@ -3903,10 +4149,9 @@ static int z_mapped_init(struct zoned *znd)
 	int nblks = 1;
 	int wq = 0;
 	int rc = 1;
-	int done = 0;
-	int jfound = 0;
 	int idx = 0;
-	struct list_head hjload;
+	int jcount = 0;
+	u64 sblba = 0;
 	u64 lba = 0;
 	u64 generation;
 	__le32 crc_chk;
@@ -3921,25 +4166,7 @@ static int z_mapped_init(struct zoned *znd)
 		goto out;
 	}
 
-	/*
-	 * Read write printers
-	 */
-	lba = 0x2048;
-	for (idx = 0; idx < znd->gz_count; idx++) {
-		struct meta_pg *wpg = &znd->wp[idx];
-
-		rc = read_block(ti, DM_IO_KMEM, wpg->wp_alloc, lba, 1, wq);
-		if (rc)
-			goto out;
-		rc = read_block(ti, DM_IO_KMEM, wpg->zf_est,   lba + 1, 1, wq);
-		if (rc)
-			goto out;
-		lba += 2;
-	}
-
-	INIT_LIST_HEAD(&hjload);
-
-	generation = mcache_greatest_gen(znd, wq, NULL, &lba);
+	generation = mcache_greatest_gen(znd, wq, &sblba, &lba);
 	if (generation == 0) {
 		rc = -ENODATA;
 		goto out;
@@ -3948,47 +4175,32 @@ static int z_mapped_init(struct zoned *znd)
 	if (lba == 0)
 		lba++;
 
-	do {
-		struct map_cache *mcache = mcache_alloc(znd, NORMAL);
+	/* read superblock */
+	rc = read_block(ti, DM_IO_VMA, io_vcache, sblba, nblks, wq);
+	if (rc)
+		goto out;
 
-		if (!mcache) {
-			rc = -ENOMEM;
-			goto out;
-		}
+	memcpy(znd->bmkeys, io_vcache, sizeof(*znd->bmkeys));
 
-		rc = read_block(ti, DM_IO_KMEM,
-				mcache->jdata, lba, nblks, wq);
-		if (rc) {
-			Z_ERR(znd, "%s: mcache-> %" PRIu64
-				   " [%d blks] %p -> %d",
-			      __func__, lba, nblks, mcache->jdata, rc);
+	/* read in map cache */
+	for (idx = 0; idx < le16_to_cpu(znd->bmkeys->maps); idx++) {
+		rc = do_load_map_cache(znd, lba++, jcount++, wq);
+		if (rc)
 			goto out;
-		}
+	}
+
+	/* read in discard cache */
+	for (idx = 0; idx < le16_to_cpu(znd->bmkeys->discards); idx++) {
+		rc = do_load_discard_cache(znd, lba++, jcount++, wq);
+		if (rc)
+			goto out;
+	}
+
+	/* skip re-read of superblock */
+	if (lba == sblba)
 		lba++;
 
-		if (is_key_page(mcache->jdata)) {
-			memcpy(znd->bmkeys, mcache->jdata, Z_C4K);
-			mcache->jcount = 0;
-			done = 1;
-			ZDM_FREE(znd, mcache->jdata, Z_C4K, PG_08);
-			ZDM_FREE(znd, mcache, sizeof(*mcache), KM_07);
-			mcache = NULL;
-		} else {
-			u16 jcount;
-
-			(void)le64_to_lba48(mcache->jdata[0].bval, &jcount);
-			mcache->jcount = jcount;
-
-			list_add(&(mcache->mclist), &hjload);
-			jfound++;
-		}
-
-		if (jfound > MAX_CACHE_SYNC) {
-			rc = -EIO;
-			goto out;
-		}
-	} while (!done);
-
+	/* read in CRC pgs */
 	rc = read_block(ti, DM_IO_VMA, znd->md_crcs, lba, 2, wq);
 	if (rc)
 		goto out;
@@ -4003,66 +4215,60 @@ static int z_mapped_init(struct zoned *znd)
 		      le32_to_cpu(crc_chk),
 		      le32_to_cpu(znd->bmkeys->crc32));
 		rc = -EIO;
+		goto out;
 	}
 
-	if (jfound != le16_to_cpu(znd->bmkeys->n_crcs)) {
+	if (jcount != le16_to_cpu(znd->bmkeys->n_crcs)) {
 		Z_ERR(znd, " ... mcache entries: found = %u, expected = %u",
-		      jfound, le16_to_cpu(znd->bmkeys->n_crcs));
+		      jcount, le16_to_cpu(znd->bmkeys->n_crcs));
 		rc = -EIO;
+		goto out;
 	}
-	if ((crc_chk == znd->bmkeys->crc32) && !list_empty(&hjload)) {
-		struct map_cache *mcache;
-		struct map_cache *jsafe;
 
-/*
- *  FIXME: mcache is MAP_COUNT lists stashed at sync.
- *	 we need to retrieve both lists.
- */
-
-		idx = 0;
-		list_for_each_entry_safe(mcache, jsafe, &hjload, mclist) {
-			__le16 crc = crc_md_le16(mcache->jdata, Z_CRC_4K);
-
-			Z_DBG(znd, "mcache CRC: %u: %04x [vs %04x] (c:%d)",
-			      idx, le16_to_cpu(crc),
-			      le16_to_cpu(znd->bmkeys->crcs[idx]),
-			      mcache->jcount);
-
-			if (crc == znd->bmkeys->crcs[idx]) {
-/* WRONG ... -------> */
-				int no = le64_to_lba48(mcache->jdata[1].tlba,
-							NULL) % MAP_COUNT;
-
-				mclist_add(znd, mcache, no);
-			} else {
-				Z_ERR(znd, ".. %04x [vs %04x] (c:%d)",
-				      le16_to_cpu(crc),
-				      le16_to_cpu(znd->bmkeys->crcs[idx]),
-				      mcache->jcount);
-				rc = -EIO;
-			}
-			idx++;
-		}
-	}
 	crc_chk = crc_md_le16(znd->md_crcs, Z_CRC_4K * 2);
 	if (crc_chk != znd->bmkeys->md_crc) {
 		Z_ERR(znd, "CRC of CRC PGs: Ex %04x vs %04x  <- calculated",
 		      le16_to_cpu(znd->bmkeys->md_crc),
 		      le16_to_cpu(crc_chk));
+		rc = -EIO;
+		goto out;
 	}
 
+	/*
+	 * Read write pointers / free counters.
+	 */
+	lba = 0x2048ul;
 	znd->discard_count = 0;
 	for (idx = 0; idx < znd->gz_count; idx++) {
 		struct meta_pg *wpg = &znd->wp[idx];
-		__le16 crc_wp = crc_md_le16(wpg->wp_alloc, Z_CRC_4K);
-		__le16 crc_zf = crc_md_le16(wpg->zf_est, Z_CRC_4K);
+		__le16 crc_wp;
+		__le16 crc_zf;
+
+		rc = read_block(ti, DM_IO_KMEM, wpg->wp_alloc, lba, 1, wq);
+		if (rc)
+			goto out;
+		crc_wp = crc_md_le16(wpg->wp_alloc, Z_CRC_4K);
+		if (znd->bmkeys->wp_crc[idx] != crc_wp)
+			Z_ERR(znd, "WP @ %d does not match written.", idx);
+
+		rc = read_block(ti, DM_IO_KMEM, wpg->zf_est, lba + 1, 1, wq);
+		if (rc)
+			goto out;
+		crc_zf = crc_md_le16(wpg->zf_est, Z_CRC_4K);
+		if (znd->bmkeys->zf_crc[idx] != crc_zf)
+			Z_ERR(znd, "ZF @ %d does not match written.", idx);
+
+		Z_DBG(znd, "%d# -- WP: %04x [%04x] | ZF: %04x [%04x]",
+		      idx, znd->bmkeys->wp_crc[idx], crc_wp,
+			   znd->bmkeys->zf_crc[idx], crc_zf);
+
 
 		if (znd->bmkeys->wp_crc[idx] == crc_wp &&
-		    znd->bmkeys->zf_crc[idx] == crc_zf) {
+		    znd->bmkeys->zf_crc[idx] == crc_zf)
 			znd->discard_count += count_stale_blocks(znd, idx, wpg);
-		}
-	}
 
+		lba += 2;
+	}
 	znd->z_gc_resv   = le32_to_cpu(znd->bmkeys->gc_resv);
 	znd->z_meta_resv = le32_to_cpu(znd->bmkeys->meta_resv);
 
@@ -4080,13 +4286,14 @@ out:
  * @c: Number of (contiguous) map entries to add.
  * @fp: Allocation flags (for _ALLOC)
  */
-static int z_mapped_addmany(struct zoned *znd, u64 dm_s, u64 lba, u64 c, int fp)
+static int z_mapped_addmany(struct zoned *znd, u64 dm_s, u64 lba,
+			    u64 count, gfp_t gfp)
 {
 	int rc = 0;
 	sector_t blk;
 
-	for (blk = 0; blk < c; blk++) {
-		rc = z_mapped_add_one(znd, dm_s + blk, lba + blk, fp);
+	for (blk = 0; blk < count; blk++) {
+		rc = z_mapped_add_one(znd, dm_s + blk, lba + blk, gfp);
 		if (rc)
 			goto out;
 	}
@@ -4105,7 +4312,7 @@ out:
  * @gfp: Allocation flags (for _ALLOC)
  */
 static struct map_pg *alloc_pg(struct zoned *znd, int entry, u64 lba,
-			       struct mpinfo *mpi, int ahead, int gfp)
+			       struct mpinfo *mpi, int ahead, gfp_t gfp)
 {
 	spinlock_t *lock = &znd->ct_lock;
 	struct map_pg *found = ZDM_ALLOC(znd, sizeof(*found), KM_20, gfp);
@@ -4160,24 +4367,18 @@ static __always_inline int _maybe_undrop(struct zoned *znd, struct map_pg *pg)
 
 	if (test_bit(IS_DROPPED, &pg->flags)) {
 		spin_lock(&znd->lzy_lck);
-		if (test_and_clear_bit(IS_DROPPED, &pg->flags) &&
-		    test_and_clear_bit(IS_LAZY, &pg->flags))
-			list_del(&pg->lazy);
+		if (test_bit(IS_DROPPED, &pg->flags) &&
+		    test_bit(IS_LAZY, &pg->flags)) {
+			clear_bit(IS_DROPPED, &pg->flags);
+			set_bit(DELAY_ADD, &pg->flags);
+		}
 		spin_unlock(&znd->lzy_lck);
-
-		pg->hotness += MEM_HOT_BOOST_INC;
+		if (pg->hotness < MEM_PURGE_MSECS)
+			pg->hotness += MEM_HOT_BOOST_INC;
 		pg->age = jiffies_64 + msecs_to_jiffies(pg->hotness);
-
-		if (getref_pg(pg) != 1)
-			Z_ERR(znd, "Undelete with elevated ref: %u",
-			      getref_pg(pg));
-		if (pg->data.addr)
-			Z_ERR(znd, "Undelete with hot page?");
-
 		undrop = 1;
-	} else {
-		ref_pg(pg);
 	}
+	ref_pg(pg);
 	return undrop;
 }
 
@@ -4192,7 +4393,7 @@ static __always_inline int _maybe_undrop(struct zoned *znd, struct map_pg *pg)
  * itself on disk). The recursion is never deep but it can
  * be avoided or mitigated by keep such 'key' pages in cache.
  */
-static int _load_backing_pages(struct zoned *znd, u64 lba, int gfp)
+static int _load_backing_pages(struct zoned *znd, u64 lba, gfp_t gfp)
 {
 	const int raflg = 1;
 	int rc = 0;
@@ -4247,7 +4448,7 @@ out:
  * into cache. Rather than defer it to cache_pg() it's brought into the
  * cache here.
  */
-static int _load_crc_page(struct zoned *znd, struct mpinfo *mpi, int gfp)
+static int _load_crc_page(struct zoned *znd, struct mpinfo *mpi, gfp_t gfp)
 {
 	const int raflg = 0;
 	int rc = 0;
@@ -4283,7 +4484,6 @@ static int _load_crc_page(struct zoned *znd, struct mpinfo *mpi, int gfp)
 	return rc;
 }
 
-
 /**
  * put_map_entry() - Decrement refcount of mapped page.
  * @pg: mapped page
@@ -4304,7 +4504,7 @@ static inline void put_map_entry(struct map_pg *pg)
  *
  * Page will be loaded from disk it if is not already in core memory.
  */
-static struct map_pg *get_map_entry(struct zoned *znd, u64 lba, int gfp)
+static struct map_pg *get_map_entry(struct zoned *znd, u64 lba, gfp_t gfp)
 {
 	struct mpinfo mpi;
 	struct map_pg *ahead[READ_AHEAD];
@@ -4450,6 +4650,7 @@ static int metadata_dirty_fling(struct zoned *znd, u64 dm_s)
 		pg->age = jiffies_64 + msecs_to_jiffies(pg->hotness);
 		clear_bit(IS_READA, &pg->flags);
 		set_bit(IS_DIRTY, &pg->flags);
+		clear_bit(IS_FLUSH, &pg->flags);
 		is_flung = 1;
 		mutex_unlock(&pg->md_lock);
 
@@ -4896,6 +5097,7 @@ static void clear_gc_target_flag(struct zoned *znd)
 			wpg->wp_alloc[gzoff] = cpu_to_le32(wp);
 		}
 		set_bit(IS_DIRTY, &wpg->flags);
+		clear_bit(IS_FLUSH, &wpg->flags);
 		spin_unlock(&wpg->wplck);
 	}
 }
@@ -5070,6 +5272,7 @@ static sector_t _blkalloc(struct zoned *znd, u32 z_at, u32 flags,
 		wpg->wp_alloc[gzoff] = cpu_to_le32(wptr);
 		wpg->zf_est[gzoff] = cpu_to_le32(zf_est);
 		set_bit(IS_DIRTY, &wpg->flags);
+		clear_bit(IS_FLUSH, &wpg->flags);
 	}
 	spin_unlock(&wpg->wplck);
 
@@ -5127,8 +5330,11 @@ static void update_stale_ratio(struct zoned *znd, u32 zone)
  * @z_gc: Zone to queue.
  * @delay: Delay queue metric
  * @gfp: Allocation scheme.
+ *
+ * Return: 1 on success, 0 if not queued/busy, negative on error.
  */
-static int z_zone_compact_queue(struct zoned *znd, u32 z_gc, int delay, int gfp)
+static
+int z_zone_compact_queue(struct zoned *znd, u32 z_gc, int delay, gfp_t gfp)
 {
 	unsigned long flags;
 	int do_queue = 0;
@@ -5149,16 +5355,20 @@ static int z_zone_compact_queue(struct zoned *znd, u32 z_gc, int delay, int gfp)
 	if (!znd->gc_active) {
 		znd->gc_active = gc_entry;
 		do_queue = 1;
+	} else {
+		Z_ERR(znd, "GC: Tried to queue but already active");
 	}
 	spin_unlock_irqrestore(&znd->gc_lock, flags);
 
 	if (do_queue) {
 		unsigned long tval = msecs_to_jiffies(delay);
 
-		queue_delayed_work(znd->gc_wq, &znd->gc_work, tval);
+		if (queue_delayed_work(znd->gc_wq, &znd->gc_work, tval))
+			err = 1;
 	} else {
 		ZDM_FREE(znd, gc_entry, sizeof(*gc_entry), KM_16);
 		znd->gc_backlog--;
+		Z_ERR(znd, "GC: FAILED to queue work");
 	}
 
 	return err;
@@ -5179,7 +5389,7 @@ static u32 zone_zfest(struct zoned *znd, u32 z_id)
 }
 
 /**
- * gc_compact_check() - Called periodically to initiate GC
+ * gc_request_queued() - Called periodically to initiate GC
  *
  * @znd: ZDM instance
  * @bin: Bin with stale zones to scan for GC
@@ -5187,7 +5397,7 @@ static u32 zone_zfest(struct zoned *znd, u32 z_id)
  * @gfp: Default memory allocation scheme.
  *
  */
-static int gc_compact_check(struct zoned *znd, int bin, int delay, int gfp)
+static int gc_request_queued(struct zoned *znd, int bin, int delay, gfp_t gfp)
 {
 	unsigned long flags;
 	int queued = 0;
@@ -5240,11 +5450,13 @@ static int gc_compact_check(struct zoned *znd, int bin, int delay, int gfp)
 		}
 	}
 
+	if (!delay && top_roi == NOZONE)
+		Z_ERR(znd, "No GC candidate in bin: %u -> %u", z_gc, s_end);
+
 	/* determine the cut-off for GC based on MZ overall staleness */
 	if (top_roi != NOZONE) {
 		u32 state_metric = GC_PRIO_DEFAULT;
-		u32 n_filled = znd->data_zones - znd->z_gc_free;
-		u32 n_empty = znd->data_zones - n_filled;
+		u32 n_empty = znd->z_gc_free;
 		int pctfree = n_empty * 100 / znd->data_zones;
 
 		/*
@@ -5260,9 +5472,20 @@ static int gc_compact_check(struct zoned *znd, int bin, int delay, int gfp)
 		else if (pctfree < 25)
 			state_metric = GC_PRIO_LOW;
 
-		if (zone_zfest(znd, top_roi) > state_metric)
-			if (z_zone_compact_queue(znd, top_roi, delay * 5, gfp))
+		if (zone_zfest(znd, top_roi) > state_metric) {
+			int rc;
+
+			rc = z_zone_compact_queue(znd, top_roi, delay * 5, gfp);
+			if (rc == 1)
 				queued = 1;
+			else if (rc < 0)
+				Z_ERR(znd, "GC: Z#%u !Q: ERR: %d", top_roi, rc);
+		}
+
+		if (!delay && !queued)
+			Z_ERR(znd, "GC: Z#%u !Q .. M: %u E: %u PCT: %d ZF: %u",
+				   top_roi, state_metric, n_empty, pctfree,
+				   zone_zfest(znd, top_roi));
 	}
 out:
 	return queued;
@@ -5285,7 +5508,7 @@ static int z_zone_gc_compact(struct gc_state *gc_entry)
 	znd->age = jiffies_64;
 
 	if (test_bit(DO_GC_NEW, &gc_entry->gc_flags)) {
-		err = z_flush_bdev(znd);
+		err = z_flush_bdev(znd, GFP_KERNEL);
 		if (err) {
 			gc_entry->result = err;
 			goto out;
@@ -5305,6 +5528,7 @@ static int z_zone_gc_compact(struct gc_state *gc_entry)
 		wp |= Z_WP_GC_FULL;
 		wpg->wp_alloc[gzoff] = cpu_to_le32(wp);
 		set_bit(IS_DIRTY, &wpg->flags);
+		clear_bit(IS_FLUSH, &wpg->flags);
 		spin_unlock(&wpg->wplck);
 
 		err = _cached_to_tables(znd, gc_entry->z_gc);
@@ -5403,7 +5627,7 @@ next_in_queue:
 			goto out;
 		}
 
-		err = z_flush_bdev(znd);
+		err = z_flush_bdev(znd, GFP_KERNEL);
 		if (err) {
 			gc_entry->result = err;
 			goto out;
@@ -5425,6 +5649,7 @@ next_in_queue:
 		else if (znd->z_meta_resv & Z_WP_GC_ACTIVE)
 			znd->z_meta_resv = gc_entry->z_gc;
 		set_bit(IS_DIRTY, &wpg->flags);
+		clear_bit(IS_FLUSH, &wpg->flags);
 		spin_unlock(&wpg->wplck);
 
 		znd->gc_events++;
@@ -5504,7 +5729,7 @@ static inline int is_reserved(struct zoned *znd, const u32 z_pref)
  * @delay: Delay metric
  * @gfp: Allocation flags to use.
  */
-static int gc_can_cherrypick(struct zoned *znd, u32 bin, int delay, int gfp)
+static int gc_can_cherrypick(struct zoned *znd, u32 bin, int delay, gfp_t gfp)
 {
 	u32 z_id = bin * znd->stale.binsz;
 	u32 s_end = z_id + znd->stale.binsz;
@@ -5538,8 +5763,10 @@ static int gc_can_cherrypick(struct zoned *znd, u32 bin, int delay, int gfp)
  * @znd: ZDM Instance
  * @delay: Delay metric
  * @gfp: Allocation flags to use.
+ *
+ * Return 1 if gc in progress or queued. 0 otherwise.
  */
-static int gc_queue_with_delay(struct zoned *znd, int delay, int gfp)
+static int gc_queue_with_delay(struct zoned *znd, int delay, gfp_t gfp)
 {
 	int gc_idle = 0;
 	unsigned long flags;
@@ -5563,22 +5790,19 @@ static int gc_queue_with_delay(struct zoned *znd, int delay, int gfp)
 			gc_idle = 0;
 
 		/* Otherwise cherrypick *something* */
-		for (iter = 0; iter < znd->stale.count; iter++)
+		for (iter = 0; gc_idle && (iter < znd->stale.count); iter++)
 			if (gc_idle && (bin != iter) &&
 			    gc_can_cherrypick(znd, iter, delay, gfp))
 				gc_idle = 0;
 
 		/* Otherwise compact a zone in the stream */
-		if (gc_idle && gc_compact_check(znd, bin, delay, gfp))
+		if (gc_idle && gc_request_queued(znd, bin, delay, gfp))
 			gc_idle = 0;
 
-#if 0
 		/* Otherwise compact *something* */
-		for (iter = 0; iter < znd->stale.count; iter++)
-			if (gc_idle && gc_compact_check(znd, iter, delay, gfp))
+		for (iter = 0; gc_idle && (iter < znd->stale.count); iter++)
+			if (gc_idle && gc_request_queued(znd, iter, delay, gfp))
 				gc_idle = 0;
-#endif
-
 	}
 	return !gc_idle;
 }
@@ -5588,27 +5812,45 @@ static int gc_queue_with_delay(struct zoned *znd, int delay, int gfp)
  * @znd: ZDM Instance
  * @gfp: Allocation flags to use.
  */
-static int gc_immediate(struct zoned *znd, int gfp)
+static int gc_immediate(struct zoned *znd, int wait, gfp_t gfp)
 {
 	const int delay = 0;
 	int can_retry = 0;
+	int lock_owner = 0;
 	int queued;
 
+	/*
+	 * Lock on the first entry. On subsequent entries
+	 * only lock of a 'wait' was requested.
+	 *
+	 * Note: We really should be using a wait queue here but this
+	 *       mutex hack should do as a temporary workaround.
+	 */
 	atomic_inc(&znd->gc_throttle);
-
-	if (atomic_read(&znd->gc_throttle) > 1)
+	if (atomic_read(&znd->gc_throttle) == 1) {
+		mutex_lock(&znd->gc_wait);
+		lock_owner = 1;
+	} else if (atomic_read(&znd->gc_throttle) > 1) {
+		if (wait) {
+			mutex_lock(&znd->gc_wait);
+			can_retry = 1;
+			mutex_unlock(&znd->gc_wait);
+		}
 		goto out;
-
+	}
 	flush_delayed_work(&znd->gc_work);
 	queued = gc_queue_with_delay(znd, delay, gfp);
 	if (!queued) {
 		Z_ERR(znd, " ... GC immediate .. failed to queue GC!!.");
-		dump_stack();
+		z_discard_partial(znd, DISCARD_MAX_INGRESS, GFP_KERNEL);
+		can_retry = 1;
 		goto out;
 	}
 	can_retry = flush_delayed_work(&znd->gc_work);
 
 out:
+	if (lock_owner)
+		mutex_unlock(&znd->gc_wait);
 	atomic_dec(&znd->gc_throttle);
 
 	return can_retry;
@@ -5635,7 +5877,10 @@ static inline void set_current(struct zoned *znd, u32 flags, u32 zone)
 		znd->bmkeys->stream[stream_id] = cpu_to_le32(zone);
 	}
 	znd->z_current = zone;
-	znd->z_gc_free--;
+	if (znd->z_gc_free > 0)
+		znd->z_gc_free--;
+	else
+		Z_ERR(znd, "Dec z_gc_free below 0?");
 }
 
 /**
@@ -5740,6 +5985,7 @@ static void zone_filled_cleanup(struct zoned *znd)
 				wpg->wp_alloc[gzoff] = cpu_to_le32(wp
 						     | Z_WP_GC_READY);
 				set_bit(IS_DIRTY, &wpg->flags);
+				clear_bit(IS_FLUSH, &wpg->flags);
 			} else {
 				Z_ERR(znd, "Zone %u seems bogus.", zone);
 			}
@@ -5766,7 +6012,8 @@ static u64 z_acquire(struct zoned *znd, u32 flags, u32 nblks, u32 *nfound)
 	u32 z_pref = znd->z_current;
 	u32 stream_id = 0;
 	u32 z_find;
-	int gfp = flags & Z_AQ_NORMAL ? CRIT : NORMAL;
+	const int wait = 1;
+	gfp_t gfp = (flags & Z_AQ_NORMAL) ? GFP_ATOMIC : GFP_KERNEL;
 
 	zone_filled_cleanup(znd);
 
@@ -5788,7 +6035,7 @@ static u64 z_acquire(struct zoned *znd, u32 flags, u32 nblks, u32 *nfound)
 
 	if (znd->z_gc_free < 5) {
 		Z_DBG(znd, "... alloc - gc low on free space.");
-		gc_immediate(znd, gfp);
+		gc_immediate(znd, !wait, gfp);
 	}
 
 retry:
@@ -5810,9 +6057,10 @@ retry:
 	}
 
 	if (flags & Z_AQ_META) {
-		int can_retry = gc_immediate(znd, gfp);
+		int can_retry = gc_immediate(znd, wait, gfp);
 		u32 mresv = znd->z_meta_resv & Z_WP_VALUE_MASK;
 
+		Z_DBG(znd, "GC: Need META.");
 		if (can_retry)
 			goto retry;
 
@@ -5822,7 +6070,8 @@ retry:
 
 out:
 	if (!found && (*nfound == 0)) {
-		if (gc_immediate(znd, gfp))
+		Z_DBG(znd, "... alloc - out of space?");
+		if (gc_immediate(znd, wait, gfp))
 			goto retry;
 
 		Z_ERR(znd, "%s: -> Out of space.", __func__);
@@ -5987,6 +6236,7 @@ static void pg_crc(struct zoned *znd, struct map_pg *pg, __le16 md_crc)
 			crc_pg->data.crc[entry] = md_crc;
 			clear_bit(IS_READA, &crc_pg->flags);
 			set_bit(IS_DIRTY, &crc_pg->flags);
+			clear_bit(IS_FLUSH, &crc_pg->flags);
 			crc_pg->age = jiffies_64
 				    + msecs_to_jiffies(crc_pg->hotness);
 			deref_pg(crc_pg);
@@ -6221,20 +6471,25 @@ out_queued:
  * _sync_dirty() - Write all *dirty* ZLT blocks to disk (journal->SYNC->home)
  * @znd: ZDM instance
  * @bit_type: MAP blocks then CRC blocks.
- * @count: (MAX) Number of entries to write-back per call.
+ * @sync: If true write dirty blocks to disk
+ * @_drop: IN: Number of ZLT blocks to free.
+ *        OUT: Number of (clean) blocks removed tha are not FLUSH flagged.
  *
  * Return: 0 on success or -errno value
  */
-static int _sync_dirty(struct zoned *znd, int bit_type, int sync, int drop)
+static int _sync_dirty(struct zoned *znd, int bit_type, int sync, int *_drop)
 {
 	int err = 0;
 	int entries = 0;
+	int want_flush = 0;
+	int drop = *_drop;
 	struct map_pg *expg = NULL;
 	struct map_pg *_tpg;
 	struct map_pg **wset = NULL;
+	int dlstsz = 0;
+	LIST_HEAD(droplist);
 
 	wset = ZDM_CALLOC(znd, sizeof(*wset), MAX_WSET, KM_19, NORMAL);
-
 
 	spin_lock(&znd->zlt_lck);
 	if (list_empty(&znd->zltpool))
@@ -6269,30 +6524,46 @@ static int _sync_dirty(struct zoned *znd, int bit_type, int sync, int drop)
 			if (index > -1 && index < count &&
 			    getref_pg(expg) == 1 && expg == zlt[index]) {
 				zlt[expg->index] = NULL;
-
-				MutexLock(&expg->md_lock);
 				list_del(&expg->zltlst);
+				znd->in_zlt--;
 				clear_bit(IN_ZLT, &expg->flags);
 				drop--;
+				expg->age = jiffies_64;
+					  + msecs_to_jiffies(expg->hotness);
+
+#if ENABLE_PG_FREE_VIA_LAZY
+				if (test_bit(IS_LAZY, &expg->flags))
+					Z_ERR(znd, "** Pg is lazy && zlt %llx",
+						expg->lba);
+
+				if (!test_bit(IS_LAZY, &expg->flags)) {
+					list_add(&expg->lazy, &droplist);
+					znd->in_lzy++;
+					set_bit(IS_LAZY, &expg->flags);
+					set_bit(IS_DROPPED, &expg->flags);
+					dlstsz++;
+				}
+				zlt[expg->index] = expg; /* so undrop works */
+				deref_pg(expg);
+				if (getref_pg(expg) > 0)
+					Z_ERR(znd, "Moving elv ref: %u",
+					      getref_pg(expg));
+#else
+				MutexLock(&expg->md_lock);
 				if (expg->data.addr) {
 					void *pg = expg->data.addr;
 
 					expg->data.addr = NULL;
 					ZDM_FREE(znd, pg, Z_C4K, PG_27);
-					znd->incore_count--;
+					atomic_dec(&znd->incore);
+					if (!test_bit(IS_FLUSH, &expg->flags))
+						want_flush++;
 				}
-				expg->age = jiffies_64;
 				mutex_unlock(&expg->md_lock);
-
-#if ENABLE_PG_FREE_VIA_LAZY
-				lazy_pool_add(znd, expg, IS_DROPPED);
 				deref_pg(expg);
-
 				if (getref_pg(expg) > 0)
-					Z_ERR(znd, "Moving elv ref: %u",
+					Z_ERR(znd, "Dropped elv ref: %u",
 					      getref_pg(expg));
-#else
-				/* Delete has ref count elevated. It's Okay */
 				ZDM_FREE(znd, expg, sizeof(*expg), KM_20);
 #endif
 			}
@@ -6319,6 +6590,10 @@ writeback:
 	}
 
 out:
+	*_drop = want_flush;
+	if (!list_empty(&droplist))
+		lazy_pool_splice(znd, &droplist);
+
 	if (wset)
 		ZDM_FREE(znd, wset, sizeof(*wset) * MAX_WSET, KM_19);
 
@@ -6329,10 +6604,12 @@ out:
  * sync_dirty() - Write all *dirty* ZLT blocks to disk (journal->SYNC->home)
  * @znd: ZDM instance
  * @bit_type: MAP blocks then CRC blocks.
+ * @sync: Write dirty blocks
+ * @drop: In # of pages to free. Out # freed.
  *
  * Return: 0 on success or -errno value
  */
-static int sync_dirty(struct zoned *znd, int bit_type, int sync, int drop)
+static int sync_dirty(struct zoned *znd, int bit_type, int sync, int *drop)
 {
 	int err;
 
@@ -6357,9 +6634,10 @@ static int sync_dirty(struct zoned *znd, int bit_type, int sync, int drop)
  *
  * Return: 0 on success or -errno value
  */
-static int sync_mapped_pages(struct zoned *znd, int sync, int drop)
+static int sync_mapped_pages(struct zoned *znd, int sync, int *drop)
 {
 	int err;
+	int remove = 0;
 
 	err = sync_dirty(znd, IS_LUT, sync, drop);
 
@@ -6367,7 +6645,7 @@ static int sync_mapped_pages(struct zoned *znd, int sync, int drop)
 	if (err < 0)
 		return err;
 
-	err = sync_dirty(znd, IS_CRC, sync, 0);
+	err = sync_dirty(znd, IS_CRC, sync, &remove);
 
 	return err;
 }
@@ -6422,7 +6700,7 @@ static int map_addr_calc(struct zoned *znd, u64 origin, struct map_addr *out)
  *
  * Return: 1 if page exists, 0 if unmodified, else -errno on error.
  */
-static int read_pg(struct zoned *znd, struct map_pg *pg, u64 lba48, int gfp,
+static int read_pg(struct zoned *znd, struct map_pg *pg, u64 lba48, gfp_t gfp,
 		   struct mpinfo *mpi)
 {
 	int rcode = 0;
@@ -6508,7 +6786,7 @@ out:
  *
  * Return: 1 if page loaded from disk, 0 if empty, else -errno on error.
  */
-static int cache_pg(struct zoned *znd, struct map_pg *pg, int gfp,
+static int cache_pg(struct zoned *znd, struct map_pg *pg, gfp_t gfp,
 		    struct mpinfo *mpi)
 {
 	int rc = 0;
@@ -6536,7 +6814,8 @@ static int cache_pg(struct zoned *znd, struct map_pg *pg, int gfp,
 			rc = -ENOMEM;
 		}
 		if (pg->data.addr) {
-			znd->incore_count++;
+			set_bit(IS_FLUSH, &pg->flags);
+			atomic_inc(&znd->incore);
 			pg->age = jiffies_64 + msecs_to_jiffies(pg->hotness);
 			rc = pool_add(znd, pg);
 			Z_DBG(znd, "Page loaded: lba: %" PRIx64, pg->lba);
@@ -6554,7 +6833,7 @@ static int cache_pg(struct zoned *znd, struct map_pg *pg, int gfp,
  * @addr: Address to resolve (via FWD map).
  * @gfp: Current allocation flags.
  */
-static u64 z_lookup_table(struct zoned *znd, u64 addr, int gfp)
+static u64 z_lookup_table(struct zoned *znd, u64 addr, gfp_t gfp)
 {
 	struct map_addr maddr;
 	struct map_pg *pg;
@@ -6625,6 +6904,7 @@ static int update_map_entry(struct zoned *znd, struct map_pg *pg,
 				pg->age = jiffies_64
 					    + msecs_to_jiffies(pg->hotness);
 				set_bit(IS_DIRTY, &pg->flags);
+				clear_bit(IS_FLUSH, &pg->flags);
 				clear_bit(IS_READA, &pg->flags);
 				was_updated = 1;
 			} else if (value != MZTEV_UNUSED) {
@@ -6774,7 +7054,7 @@ out:
  * Add an unused block to the list of blocks to be discarded during
  * garbage collection.
  */
-static int unused_phy(struct zoned *znd, u64 lba, u64 orig_s, int gfp)
+static int unused_phy(struct zoned *znd, u64 lba, u64 orig_s, gfp_t gfp)
 {
 	int err = 0;
 	struct map_pg *pg;
@@ -6840,6 +7120,7 @@ static int unused_phy(struct zoned *znd, u64 lba, u64 orig_s, int gfp)
 		pg->age = jiffies_64 + msecs_to_jiffies(pg->hotness);
 		set_bit(IS_DIRTY, &pg->flags);
 		clear_bit(IS_READA, &pg->flags);
+		clear_bit(IS_FLUSH, &pg->flags);
 
 		SpinLock(&wpg->wplck);
 		wp = le32_to_cpu(wpg->wp_alloc[gzoff]);
@@ -6850,6 +7131,7 @@ static int unused_phy(struct zoned *znd, u64 lba, u64 orig_s, int gfp)
 			wpg->zf_est[gzoff] = cpu_to_le32(zf | stream_id);
 			wpg->wp_alloc[gzoff] = cpu_to_le32(wp | Z_WP_RRECALC);
 			set_bit(IS_DIRTY, &wpg->flags);
+			clear_bit(IS_FLUSH, &wpg->flags);
 		}
 		spin_unlock(&wpg->wplck);
 		if ((wp & Z_WP_VALUE_MASK) == Z_BLKSZ)

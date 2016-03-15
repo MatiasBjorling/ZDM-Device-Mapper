@@ -147,10 +147,9 @@ static ssize_t queue_discard_granularity_show(struct request_queue *q, char *pag
 
 static ssize_t queue_discard_max_hw_show(struct request_queue *q, char *page)
 {
-	unsigned long long val;
 
-	val = q->limits.max_hw_discard_sectors << 9;
-	return sprintf(page, "%llu\n", val);
+	return sprintf(page, "%llu\n",
+		(unsigned long long)q->limits.max_hw_discard_sectors << 9);
 }
 
 static ssize_t queue_discard_max_show(struct request_queue *q, char *page)
@@ -185,6 +184,11 @@ static ssize_t queue_discard_max_store(struct request_queue *q,
 static ssize_t queue_discard_zeroes_data_show(struct request_queue *q, char *page)
 {
 	return queue_var_show(queue_discard_zeroes_data(q), page);
+}
+
+static ssize_t queue_raid_discard_safe_show(struct request_queue *q, char *page)
+{
+	return queue_var_show(queue_raid_discard_safe(q), page);
 }
 
 static ssize_t queue_write_same_max_show(struct request_queue *q, char *page)
@@ -438,6 +442,11 @@ static struct queue_sysfs_entry queue_discard_zeroes_data_entry = {
 	.show = queue_discard_zeroes_data_show,
 };
 
+static struct queue_sysfs_entry queue_raid_discard_safe_entry = {
+	.attr = {.name = "raid_discard_safe", .mode = S_IRUGO },
+	.show = queue_raid_discard_safe_show,
+};
+
 static struct queue_sysfs_entry queue_write_same_max_entry = {
 	.attr = {.name = "write_same_max_bytes", .mode = S_IRUGO },
 	.show = queue_write_same_max_show,
@@ -497,6 +506,7 @@ static struct attribute *default_attrs[] = {
 	&queue_discard_max_entry.attr,
 	&queue_discard_max_hw_entry.attr,
 	&queue_discard_zeroes_data_entry.attr,
+	&queue_raid_discard_safe_entry.attr,
 	&queue_write_same_max_entry.attr,
 	&queue_nonrot_entry.attr,
 	&queue_nomerges_entry.attr,

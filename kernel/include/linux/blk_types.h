@@ -71,7 +71,6 @@ struct bio {
 	bio_end_io_t		*bi_end_io;
 
 	void			*bi_private;
-
 #ifdef CONFIG_BLK_CGROUP
 	/*
 	 * Optional ioc and css associated with this bio.  Put on bio
@@ -85,12 +84,6 @@ struct bio {
 		struct bio_integrity_payload *bi_integrity; /* data integrity */
 #endif
 	};
-
-/*
- * SST: HACK: most recent process id to open a file is held via BIO
- *      for later use as *stream_id*.
- */
-	pid_t			pid;
 
 	unsigned short		bi_vcnt;	/* how many bio_vec's */
 
@@ -119,21 +112,23 @@ struct bio {
 /*
  * bio flags
  */
-#define BIO_SEG_VALID	1	/* bi_phys_segments valid */
-#define BIO_CLONED	2	/* doesn't own data */
-#define BIO_BOUNCED	3	/* bio is a bounce bio */
-#define BIO_USER_MAPPED 4	/* contains user pages */
-#define BIO_NULL_MAPPED 5	/* contains invalid user pages */
-#define BIO_QUIET	6	/* Make BIO Quiet */
-#define BIO_CHAIN	7	/* chained bio, ->bi_remaining in effect */
-#define BIO_REFFED	8	/* bio has elevated ->bi_cnt */
-
-/*
- * Flags starting here get preserved by bio_reset() - this includes
- * BIO_POOL_IDX()
- */
-#define BIO_RESET_BITS	13
-#define BIO_OWNS_VEC	13	/* bio_free() should free bvec */
+enum {
+	BIO_SEG_VALID	= 0,	/* bi_phys_segments valid */
+	BIO_CLONED,		/* doesn't own data */
+	BIO_BOUNCED,		/* bio is a bounce bio */
+	BIO_USER_MAPPED,	/* contains user pages */
+	BIO_NULL_MAPPED,	/* contains invalid user pages */
+	BIO_QUIET,		/* Mnake BIO Quiet */
+	BIO_CHAIN,		/* chained bio, ->bi_remaining in effect */
+	BIO_REFFED,		/* bio has elevated ->bi_cnt */
+	BIO_OWNS_VEC,		/* bio_free() should free bvec */
+	BIO_FLAG_LAST,		/* end of bits */
+	/*
+	 * Flags starting here get preserved by bio_reset() - this includes
+	 * BIO_POOL_IDX()
+	 */
+	BIO_RESET_BITS = BIO_FLAG_LAST,
+};
 
 /*
  * top 4 bits of bio flags indicate the pool this bio came from
@@ -141,8 +136,34 @@ struct bio {
 #define BIO_POOL_BITS		(4)
 #define BIO_POOL_NONE		((1UL << BIO_POOL_BITS) - 1)
 #define BIO_POOL_OFFSET		(32 - BIO_POOL_BITS)
-#define BIO_POOL_MASK		(1UL << BIO_POOL_OFFSET)
 #define BIO_POOL_IDX(bio)	((bio)->bi_flags >> BIO_POOL_OFFSET)
+
+/*
+ * after the pool bits, next 16 bits are for the stream id
+ */
+#define BIO_STREAM_BITS		(16)
+#define BIO_STREAM_OFFSET	(BIO_POOL_OFFSET - BIO_STREAM_BITS)
+#define BIO_STREAM_MASK		((1 << BIO_STREAM_BITS) - 1)
+
+static inline unsigned long streamid_to_flags(unsigned int id)
+{
+	return (unsigned long) (id & BIO_STREAM_MASK) << BIO_STREAM_OFFSET;
+}
+
+static inline void bio_set_streamid(struct bio *bio, unsigned int id)
+{
+	bio->bi_flags |= streamid_to_flags(id);
+}
+
+static inline unsigned int bio_get_streamid(struct bio *bio)
+{
+	return (bio->bi_flags >> BIO_STREAM_OFFSET) & BIO_STREAM_MASK;
+}
+
+static inline bool bio_streamid_valid(struct bio *bio)
+{
+	return bio_get_streamid(bio) != 0;
+}
 
 #endif /* CONFIG_BLOCK */
 
@@ -168,6 +189,10 @@ enum rq_flag_bits {
 	__REQ_INTEGRITY,	/* I/O includes block integrity payload */
 	__REQ_FUA,		/* forced unit access */
 	__REQ_FLUSH,		/* request for cache flush */
+
+	__REQ_REPORT_ZONES,	/* Zoned device: Report Zones */
+	__REQ_OPEN_ZONE,	/* Zoned device: Open Zone */
+	__REQ_CLOSE_ZONE,	/* Zoned device: Close Zone */
 
 	/* bio only flags */
 	__REQ_RAHEAD,		/* read ahead, can fail anytime */
@@ -195,7 +220,6 @@ enum rq_flag_bits {
 	__REQ_PM,		/* runtime pm request */
 	__REQ_HASHED,		/* on IO scheduler merge hash */
 	__REQ_MQ_INFLIGHT,	/* track inflight for MQ */
-	__REQ_NO_TIMEOUT,	/* requests may never expire */
 	__REQ_NR_BITS,		/* stops here */
 };
 
@@ -216,7 +240,8 @@ enum rq_flag_bits {
 #define REQ_COMMON_MASK \
 	(REQ_WRITE | REQ_FAILFAST_MASK | REQ_SYNC | REQ_META | REQ_PRIO | \
 	 REQ_DISCARD | REQ_WRITE_SAME | REQ_NOIDLE | REQ_FLUSH | REQ_FUA | \
-	 REQ_SECURE | REQ_INTEGRITY)
+	 REQ_SECURE | REQ_INTEGRITY | \
+	 REQ_REPORT_ZONES | REQ_OPEN_ZONE | REQ_CLOSE_ZONE)
 #define REQ_CLONE_MASK		REQ_COMMON_MASK
 
 #define BIO_NO_ADVANCE_ITER_MASK	(REQ_DISCARD|REQ_WRITE_SAME)
@@ -249,7 +274,14 @@ enum rq_flag_bits {
 #define REQ_PM			(1ULL << __REQ_PM)
 #define REQ_HASHED		(1ULL << __REQ_HASHED)
 #define REQ_MQ_INFLIGHT		(1ULL << __REQ_MQ_INFLIGHT)
-#define REQ_NO_TIMEOUT		(1ULL << __REQ_NO_TIMEOUT)
+
+#define REQ_REPORT_ZONES	(1ULL << __REQ_REPORT_ZONES)
+#define REQ_OPEN_ZONE		(1ULL << __REQ_OPEN_ZONE)
+#define REQ_CLOSE_ZONE		(1ULL << __REQ_CLOSE_ZONE)
+
+#define REQ_ZONED_FLAGS \
+	(REQ_REPORT_ZONES | REQ_OPEN_ZONE | REQ_CLOSE_ZONE)
+
 
 typedef unsigned int blk_qc_t;
 #define BLK_QC_T_NONE	-1U

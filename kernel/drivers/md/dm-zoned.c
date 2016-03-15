@@ -25,7 +25,7 @@
 #include <linux/sort.h>
 #include <linux/ctype.h>
 #include <linux/types.h>
-#include <linux/blk-zoned-ctrl.h>
+#include <linux/blkzoned_api.h>
 #include <linux/timer.h>
 #include <linux/delay.h>
 #include <linux/kthread.h>
@@ -36,22 +36,20 @@
 #include <linux/bsearch.h>
 #include "dm-zoned.h"
 
-/*
- * FUTURE FIXME:
- * Current sd.c does not swizzle on report zones and no
- * scsi native drives exists so ... therefore all results are
- * little endian ...
- * When sd.c translates the output of report zones
- * then remove the 'everything is little endian' assumption.
- */
-#define REPORT_ZONES_LE_ONLY 1
-
 #define PRIu64 "llu"
 #define PRIx64 "llx"
 #define PRId32 "d"
 #define PRIx32 "x"
 #define PRIu32 "u"
 
+#define BIOSET_RESV 4
+
+/**
+ * _zdisk() - Return a pretty ZDM name.
+ * @znd: ZDM Instance
+ *
+ * Return: ZDM/backing device pretty name.
+ */
 static inline char *_zdisk(struct zoned *znd)
 {
 	return znd->bdev_name;
@@ -79,7 +77,6 @@ static int znd_async_io(struct zoned *znd,
 static int zoned_bio(struct zoned *znd, struct bio *bio);
 static int zoned_map_write(struct zoned *znd, struct bio*, u64 s_zdm);
 static sector_t get_dev_size(struct dm_target *ti);
-static int is_zoned_inquiry(struct zoned *znd, int ata);
 static int dmz_reset_wp(struct zoned *znd, u64 z_id);
 static int dmz_open_zone(struct zoned *znd, u64 z_id);
 static int dmz_close_zone(struct zoned *znd, u64 z_id);
@@ -88,11 +85,26 @@ static int dmz_report_zones(struct zoned *znd, u64 z_id,
 			    struct bdev_zone_report *report, size_t bufsz);
 static void activity_timeout(unsigned long data);
 static void zoned_destroy(struct zoned *);
-static int gc_can_cherrypick(struct zoned *znd, u32 sid, int delay, int gfp);
+static int gc_can_cherrypick(struct zoned *znd, u32 sid, int delay, gfp_t gfp);
 static void bg_work_task(struct work_struct *work);
 static void on_timeout_activity(struct zoned *znd, int delay);
 static int zdm_create_proc_entries(struct zoned *znd);
 static void zdm_remove_proc_entries(struct zoned *znd);
+
+/**
+ * get_bdev_bd_inode() - Get primary backing device inode
+ * @znd: ZDM Instance
+ *
+ * Return: backing device inode
+ */
+static inline struct inode *get_bdev_bd_inode(struct zoned *znd)
+{
+	return znd->dev->bdev->bd_inode;
+}
+
+#include "libzoned.c"
+
+#define BIO_CACHE_SECTORS (IO_VCACHE_PAGES * Z_BLOCKS_PER_DM_SECTOR)
 
 /**
  * bio_stream() - Decode stream id from BIO.
@@ -109,12 +121,13 @@ static inline u32 bio_stream(struct bio *bio)
 	 * use this heuristic to try to skip unnecessary co-mingling of data.
 	 */
 
-	if (bio->bi_rw & REQ_META)
+	if (bio->bi_rw & REQ_META) {
 		stream_id = 0xff;
-	else {
-		u32 upid = bio->pid;
+	} else {
+		unsigned int id = bio_get_streamid(bio);
 
-		stream_id = ((upid/97) + (upid/1031) + (upid)) & 0xff;
+		/* high 8 bits is hash of PID, low 8 bits is hash of inode# */
+		stream_id = id >> 8;
 		if (stream_id == 0)
 			stream_id++;
 		if (stream_id == 0xff)
@@ -125,76 +138,13 @@ static inline u32 bio_stream(struct bio *bio)
 }
 
 /**
- * get_bdev_bd_inode() - Get primary backing device inode
+ * zoned_map_discard() - Return a pretty ZDM name.
  * @znd: ZDM Instance
+ * @bio: struct bio hold discard information
+ * @s_zdm: tlba being discarded.
  *
- * Return: backing device inode
+ * Return: 0 on success, otherwise error code.
  */
-static inline struct inode *get_bdev_bd_inode(struct zoned *znd)
-{
-	return znd->dev->bdev->bd_inode;
-}
-
-#include "libzoned.c"
-
-/* -------------------------------------------------------------------------- */
-/* -------------------------------------------------------------------------- */
-
-static int is_zoned_inquiry(struct zoned *znd, int ata)
-{
-	struct gendisk *disk = znd->dev->bdev->bd_disk;
-
-	if (disk->queue) {
-		u8 extended = 1;
-		u8 page_op = 0xb1;
-		u8 *buf = NULL;
-		u16 sz = 64;
-		int wp_err;
-
-#ifdef CONFIG_BLK_ZONED_CTRL
-		if (ata) {
-			struct zoned_identity ident;
-
-			wp_err = blk_zoned_identify_ata(disk, &ident);
-			if (!wp_err) {
-				if (ident.type_id == HOST_AWARE) {
-					znd->bdev_is_zoned = 1;
-					znd->ata_passthrough = 1;
-				}
-			}
-			return 0;
-		}
-
-		buf = ZDM_ALLOC(znd, Z_C4K, PG_01, NORMAL); /* zoned inq */
-		if (!buf)
-			return -ENOMEM;
-
-		wp_err = blk_zoned_inquiry(disk, extended, page_op, sz, buf);
-		if (!wp_err) {
-			u8 iflags = buf[Z_VPD_INFO_BYTE] >> 4 & 0x03;
-
-			if (iflags == Z_TYPE_SMR_HA)
-				znd->bdev_is_zoned = 1;
-			if (!znd->bdev_is_zoned &&
-			    buf[4] == 0x17 && buf[5] == 0x5c) {
-				Z_ERR(znd, "Host Manged? Assuming zoned.");
-				znd->bdev_is_zoned = 1;
-			}
-			znd->ata_passthrough = 0;
-		}
-#else
-	#warning "CONFIG_BLK_ZONED_CTRL required."
-#endif
-		if (buf)
-			ZDM_FREE(znd, buf, Z_C4K, PG_01);
-	}
-
-	return 0;
-}
-
-/* -------------------------------------------------------------------------- */
-/* -------------------------------------------------------------------------- */
-
 static int zoned_map_discard(struct zoned *znd, struct bio *bio, u64 s_zdm)
 {
 	int rcode   = DM_MAPIO_SUBMITTED;
@@ -217,9 +167,13 @@ out:
 	return rcode;
 }
 
-/* -------------------------------------------------------------------------- */
-/* -------------------------------------------------------------------------- */
-
+/**
+ * is_non_wp_zone() - Test zone # to see if it flagged as conventional.
+ * @znd: ZDM Instance
+ * @z_id: Zone #
+ *
+ * Return: 1 if conventional zone. 0 if sequentional write zone.
+ */
 static int is_non_wp_zone(struct zoned *znd, u64 z_id)
 {
 	u32 gzoff = z_id % 1024;
@@ -229,128 +183,135 @@ static int is_non_wp_zone(struct zoned *znd, u64 z_id)
 	return (wp & Z_WP_NON_SEQ) ? 1 : 0;
 }
 
+/**
+ */
+struct zone_action {
+	struct work_struct work;
+	struct zoned *znd;
+	u64 s_addr;
+	unsigned long bi_rw;
+	int wp_err;
+};
 
-static int dmz_reset_wp(struct zoned *znd, u64 z_id)
+/**
+ * do_zone_action_work() - Issue a 'zone action' to the backing device.
+ * @work: Work to do.
+ */
+static void do_zone_action_work(struct work_struct *work)
 {
-	int wp_err = 0;
+	struct zone_action *za = container_of(work, struct zone_action, work);
 
-	if (is_non_wp_zone(znd, z_id))
-		return wp_err;
-
-#ifdef CONFIG_BLK_ZONED_CTRL
-	if (znd->bdev_is_zoned) {
-		struct gendisk *disk = znd->dev->bdev->bd_disk;
-		u64 z_offset = z_id + znd->zdstart;
-		u64 s_addr = zone_to_sector(z_offset);
-		int retry = 5;
-
-		wp_err = -1;
-		while (wp_err && --retry > 0) {
-			if (znd->ata_passthrough)
-				wp_err = blk_zoned_reset_wp_ata(disk, s_addr);
-			else
-				wp_err = blk_zoned_reset_wp(disk, s_addr);
-		}
-
-		if (wp_err) {
-			Z_ERR(znd, "Reset WP: %" PRIx64 " [Z:%" PRIu64
-			      "] -> %d failed.", s_addr, z_id, wp_err);
-			Z_ERR(znd, "ZAC/ZBC support disabled.");
-			znd->bdev_is_zoned = 0;
-			wp_err = -ENOTSUPP;
-		}
-	}
-#endif /* CONFIG_BLK_ZONED_CTRL */
-	return wp_err;
+	za->wp_err = blkdev_issue_zone_action(za->znd->dev->bdev,
+					      za->bi_rw, za->s_addr,
+					      GFP_KERNEL);
 }
 
-/* -------------------------------------------------------------------------- */
-/* -------------------------------------------------------------------------- */
-
-static int dmz_open_zone(struct zoned *znd, u64 z_id)
+/**
+ * dmz_zone_action() - Issue a 'zone action' to the backing device (via worker).
+ * @znd: ZDM Instance
+ * @z_id: Zone # to open.
+ * @rw: One of REQ_OPEN_ZONE, REQ_CLOSE_ZONE, or REQ_DISCARD.
+ *
+ * Return: 0 on success, otherwise error.
+ */
+static int dmz_zone_action(struct zoned *znd, u64 z_id, unsigned long rw)
 {
 	int wp_err = 0;
 
 	if (is_non_wp_zone(znd, z_id))
 		return wp_err;
 
-#ifdef CONFIG_BLK_ZONED_CTRL
-	if (znd->issue_open_zone && znd->bdev_is_zoned) {
-		struct gendisk *disk = znd->dev->bdev->bd_disk;
+	if (znd->bdev_is_zoned) {
 		u64 z_offset = z_id + znd->zdstart;
-		u64 s_addr = zone_to_sector(z_offset);
-		int retry = 5;
+		struct zone_action za = {
+			.znd = znd,
+			.bi_rw = rw,
+			.s_addr = zone_to_sector(z_offset),
+			.wp_err = 0,
+		};
+		if (znd->ata_passthrough)
+			za.bi_rw |= REQ_PRIO;
 
-		wp_err = -1;
-		while (wp_err && --retry > 0) {
-			if (znd->ata_passthrough)
-				wp_err = blk_zoned_open_ata(disk, s_addr);
-			else
-				wp_err = blk_zoned_open(disk, s_addr);
-		}
+		/*
+		 * Issue the synchronous I/O from a different thread
+		 * to avoid generic_make_request recursion.
+		 */
+		INIT_WORK_ONSTACK(&za.work, do_zone_action_work);
+		queue_work(znd->zone_action_wq, &za.work);
+		flush_workqueue(znd->zone_action_wq);
+		destroy_work_on_stack(&za.work);
+		wp_err = za.wp_err;
 
 		if (wp_err) {
 			Z_ERR(znd, "Open Zone: LBA: %" PRIx64
 			      " [Z:%" PRIu64 "] -> %d failed.",
-			      s_addr, z_id, wp_err);
+			      za.s_addr, z_id, wp_err);
 			Z_ERR(znd, "ZAC/ZBC support disabled.");
 			znd->bdev_is_zoned = 0;
 			wp_err = -ENOTSUPP;
 		}
 	}
-#endif /* CONFIG_BLK_ZONED_CTRL */
-
 	return wp_err;
 }
 
-/* -------------------------------------------------------------------------- */
-/* -------------------------------------------------------------------------- */
+/**
+ * dmz_reset_wp() - Reset write pointer for zone z_id.
+ * @znd: ZDM Instance
+ * @z_id: Zone # to reset.
+ *
+ * Return: 0 on success, otherwise error.
+ */
+static int dmz_reset_wp(struct zoned *znd, u64 z_id)
+{
+	return dmz_zone_action(znd, z_id, REQ_DISCARD);
+}
 
+/**
+ * dmz_open_zone() - Open zone for writing.
+ * @znd: ZDM Instance
+ * @z_id: Zone # to open.
+ *
+ * Return: 0 on success, otherwise error.
+ */
+static int dmz_open_zone(struct zoned *znd, u64 z_id)
+{
+	if (!znd->issue_open_zone)
+		return 0;
+
+	return dmz_zone_action(znd, z_id, REQ_OPEN_ZONE);
+
+}
+
+/**
+ * dmz_close_zone() - Close zone to writing.
+ * @znd: ZDM Instance
+ * @z_id: Zone # to close.
+ *
+ * Return: 0 on success, otherwise error.
+ */
 static int dmz_close_zone(struct zoned *znd, u64 z_id)
 {
-	int wp_err = 0;
+	if (!znd->issue_close_zone)
+		return 0;
 
-	if (znd->issue_close_zone && is_non_wp_zone(znd, z_id))
-		return wp_err;
-
-#ifdef CONFIG_BLK_ZONED_CTRL
-	if (znd->bdev_is_zoned) {
-		struct gendisk *disk = znd->dev->bdev->bd_disk;
-		u64 z_offset = z_id + znd->zdstart;
-		u64 s_addr = zone_to_sector(z_offset);
-		int retry = 5;
-
-		wp_err = -1;
-		while (wp_err && --retry > 0) {
-			if (znd->ata_passthrough)
-				wp_err = blk_zoned_close_ata(disk, s_addr);
-			else
-				wp_err = blk_zoned_close(disk, s_addr);
-		}
-
-		if (wp_err) {
-			Z_ERR(znd, "Close Zone: LBA: %" PRIx64
-			      " [Z:%" PRIu64 "] -> %d failed.",
-			      s_addr, z_id, wp_err);
-			Z_ERR(znd, "ZAC/ZBC support disabled.");
-			znd->bdev_is_zoned = 0;
-			wp_err = -ENOTSUPP;
-		}
-	}
-#endif /* CONFIG_BLK_ZONED_CTRL */
-	return wp_err;
+	return dmz_zone_action(znd, z_id, REQ_CLOSE_ZONE);
 }
 
-/* -------------------------------------------------------------------------- */
-/* -------------------------------------------------------------------------- */
-
+/**
+ * dmz_report_count() - Read number of zones returned.
+ * @znd: ZDM Instance
+ * @rpt_in: Report data.
+ * @bufsz: size of space allocated for report
+ *
+ * Return: Number of zones in report.
+ */
 static u32 dmz_report_count(struct zoned *znd, void *rpt_in, size_t bufsz)
 {
 	u32 count;
 	u32 max_count = (bufsz - sizeof(struct bdev_zone_report))
 		      /	 sizeof(struct bdev_zone_descriptor);
 
-	if (REPORT_ZONES_LE_ONLY || znd->ata_passthrough) {
+	if (znd->ata_passthrough) {
 		struct bdev_zone_report_le *report = rpt_in;
 
 		/* ZAC: ata results are little endian */
@@ -368,12 +329,9 @@ static u32 dmz_report_count(struct zoned *znd, void *rpt_in, size_t bufsz)
 	return count;
 }
 
-/* -------------------------------------------------------------------------- */
-/* -------------------------------------------------------------------------- */
-
 /**
  * dmz_report_zones() - issue report zones from z_id zones after zdstart
- * @znd: ZDM Target
+ * @znd: ZDM Instance
  * @z_id: Zone past zdstart
  * @report: structure filled
  * @bufsz: kmalloc()'d space reserved for report
@@ -385,22 +343,17 @@ static int dmz_report_zones(struct zoned *znd, u64 z_id,
 {
 	int wp_err = -ENOTSUPP;
 
-#ifdef CONFIG_BLK_ZONED_CTRL
 	if (znd->bdev_is_zoned) {
-		struct gendisk *disk = znd->dev->bdev->bd_disk;
-		u64 s_addr = (z_id + znd->zdstart) << 19;
 		u8  opt = ZOPT_NON_SEQ_AND_RESET;
-		int retry = 5;
+		unsigned long bi_rw = 0;
+		u64 s_addr = (z_id + znd->zdstart) << 19;
 
-		wp_err = -1;
-		while (wp_err && --retry > 0) {
-			if (znd->ata_passthrough)
-				wp_err = blk_zoned_report_ata(disk, s_addr, opt,
-							      report, bufsz);
-			else
-				wp_err = blk_zoned_report(disk, s_addr, opt,
-							  report, bufsz);
-		}
+		if (znd->ata_passthrough)
+			bi_rw = REQ_PRIO;
+
+		wp_err = blkdev_issue_zone_report(znd->dev->bdev, bi_rw, s_addr,
+						  opt, report, bufsz,
+						  GFP_KERNEL);
 
 		if (wp_err) {
 			Z_ERR(znd, "Report Zones: LBA: %" PRIx64
@@ -411,13 +364,26 @@ static int dmz_report_zones(struct zoned *znd, u64 z_id,
 			wp_err = -ENOTSUPP;
 		}
 	}
-#endif /* CONFIG_BLK_ZONED_CTRL */
 	return wp_err;
 }
 
-/* -------------------------------------------------------------------------- */
-/* -------------------------------------------------------------------------- */
+/**
+ * is_conventional() - Determine if zone is conventional.
+ * @dentry: Zone descriptor entry.
+ *
+ * Return: 1 if zone type is conventional.
+ */
+static inline int is_conventional(struct bdev_zone_descriptor *dentry)
+{
+	return (ZTYP_CONVENTIONAL == (dentry->type & 0x0F)) ? 1 : 0;
+}
 
+/**
+ * is_zone_reset() - Determine if zone is reset / ready for writing.
+ * @dentry: Zone descriptor entry.
+ *
+ * Return: 1 if zone condition is empty or zone type is conventional.
+ */
 static inline int is_zone_reset(struct bdev_zone_descriptor *dentry)
 {
 	u8 type = dentry->type & 0x0F;
@@ -426,9 +392,13 @@ static inline int is_zone_reset(struct bdev_zone_descriptor *dentry)
 	return (ZCOND_ZC1_EMPTY == cond || ZTYP_CONVENTIONAL == type) ? 1 : 0;
 }
 
-/* -------------------------------------------------------------------------- */
-/* -------------------------------------------------------------------------- */
-
+/**
+ * get_wp_from_descriptor() - Decode write pointer as # of blocks from start
+ * @znd: ZDM Instance
+ * @dentry_in: Zone descriptor entry.
+ *
+ * Return: Write Pointer as number of blocks from start of zone.
+ */
 static inline u32 get_wp_from_descriptor(struct zoned *znd, void *dentry_in)
 {
 	u32 wp = 0;
@@ -438,7 +408,7 @@ static inline u32 get_wp_from_descriptor(struct zoned *znd, void *dentry_in)
 	 * otherwise ZBC results are big endian.
 	 */
 
-	if (REPORT_ZONES_LE_ONLY || znd->ata_passthrough) {
+	if (znd->ata_passthrough) {
 		struct bdev_zone_descriptor_le *lil = dentry_in;
 
 		wp = le64_to_cpu(lil->lba_wptr) - le64_to_cpu(lil->lba_start);
@@ -450,19 +420,25 @@ static inline u32 get_wp_from_descriptor(struct zoned *znd, void *dentry_in)
 	return wp;
 }
 
-/* -------------------------------------------------------------------------- */
-/* -------------------------------------------------------------------------- */
-
-static inline int is_conventional(struct bdev_zone_descriptor *dentry)
-{
-	return (ZTYP_CONVENTIONAL == (dentry->type & 0x0F)) ? 1 : 0;
-}
-
-static inline void _inc_wp_free(struct meta_pg *wpg, u32 gzoff, u32 lost)
+/**
+ * _dec_wp_avail_by_lost() - Update free count due to lost/unusable blocks.
+ * @wpg: Write pointer metadata page.
+ * @gzoff: Zone entry in page.
+ * @lost: Number of blocks 'lost'.
+ */
+static inline
+void _dec_wp_avail_by_lost(struct meta_pg *wpg, u32 gzoff, u32 lost)
 {
 	wpg->zf_est[gzoff] = cpu_to_le32(le32_to_cpu(wpg->zf_est[gzoff])+lost);
 }
 
+/**
+ * zoned_wp_sync() - Re-Sync expected WP location with drive
+ * @znd: ZDM Instance
+ * @reset_non_empty: Reset the non-empty zones.
+ *
+ * Return: 0 on success, otherwise error.
+ */
 static int zoned_wp_sync(struct zoned *znd, int reset_non_empty)
 {
 	int rcode = 0;
@@ -533,7 +509,7 @@ static int zoned_wp_sync(struct zoned *znd, int reset_non_empty)
 			u32 lost = wp - wp_at;
 
 			wp_at = wp;
-			_inc_wp_free(wpg, gzoff, lost);
+			_dec_wp_avail_by_lost(wpg, gzoff, lost);
 
 			Z_ERR(znd, "Z#%u z:%x [wp:%x rz:%x] lost %u blocks.",
 			      iter, gzoff, wp_at, wp, lost);
@@ -595,6 +571,13 @@ out:
 	return err;
 }
 
+/**
+ * zoned_map() - Handle an incoming BIO
+ * @ti: Device Mapper Target Instance
+ * @bio: The BIO to disposition.
+ *
+ * Return: 0 on success, otherwise error.
+ */
 static int zoned_map(struct dm_target *ti, struct bio *bio)
 {
 	struct zoned *znd = ti->private;
@@ -615,6 +598,13 @@ static int zoned_map(struct dm_target *ti, struct bio *bio)
 
 #else
 
+/**
+ * zoned_map() - Handle an incoming BIO
+ * @ti: Device Mapper Target Instance
+ * @bio: The BIO to disposition.
+ *
+ * Return: 0 on success, otherwise error.
+ */
 static int zoned_map(struct dm_target *ti, struct bio *bio)
 {
 	struct zoned *znd = ti->private;
@@ -630,19 +620,25 @@ static int zoned_map(struct dm_target *ti, struct bio *bio)
 
 #endif
 
-/* -------------------------------------------------------------------------- */
-/* -------------------------------------------------------------------------- */
-
+/**
+ * zoned_actual_size() - Set number of 4k blocks available on block device.
+ * @ti: Device Mapper Target Instance
+ * @znd: ZDM Instance
+ *
+ * Return: 0 on success, otherwise error.
+ */
 static void zoned_actual_size(struct dm_target *ti, struct zoned *znd)
 {
 	znd->nr_blocks = i_size_read(get_bdev_bd_inode(znd)) / Z_C4K;
 }
 
-/* -------------------------------------------------------------------------- */
-/* -------------------------------------------------------------------------- */
-
 /**
- * <data dev> <format|check|force>
+ * zoned_ctr() - Create a ZDM Instance from DM Target Instance and args.
+ * @ti: Device Mapper Target Instance
+ * @argc: Number of args to handle.
+ * @argv: args to handle.
+ *
+ * Return: 0 on success, otherwise error.
  */
 static int zoned_ctr(struct dm_target *ti, unsigned argc, char **argv)
 {
@@ -667,6 +663,7 @@ static int zoned_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	}
 
 	znd->trim = 1;
+	znd->raid5_trim = 0;
 
 	if (argc < 1) {
 		ti->error = "Invalid argument count";
@@ -696,6 +693,8 @@ static int zoned_ctr(struct dm_target *ti, unsigned argc, char **argv)
 			znd->trim = 1;
 		if (!strcasecmp("nodiscard", argv[r]))
 			znd->trim = 0;
+		if (!strcasecmp("raid5_trim", argv[r]))
+			znd->raid5_trim = 1;
 
 		if (!strncasecmp("reserve=", argv[r], 8)) {
 			long long mz_resv;
@@ -775,10 +774,10 @@ static int zoned_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	znd->issue_close_zone = 1;
 	znd->filled_zone = NOZONE;
 
+	if (zac_probe)
+		znd->bdev_is_zoned = znd->ata_passthrough = 1;
 	if (zbc_probe)
-		is_zoned_inquiry(znd, 0);
-	else if (zac_probe)
-		is_zoned_inquiry(znd, 1);
+		znd->bdev_is_zoned = 1;
 
 	r = zoned_init_disk(ti, znd, create, force);
 	if (r) {
@@ -793,24 +792,25 @@ static int zoned_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		return -EINVAL;
 	}
 
-#if USE_KTHREAD
-
-	znd->bio_set = bioset_create(4, 0);
+	znd->bio_set = bioset_create(BIOSET_RESV, 0);
 	if (!znd->bio_set)
 		return -ENOMEM;
 
+#if USE_KTHREAD
 	r = kfifo_alloc(&znd->bio_fifo, KFIFO_SIZE, GFP_KERNEL);
 	if (r)
 		return r;
 
 	znd->bio_kthread = kthread_run(znd_bio_kthread, znd, "zdm-io-%s",
 		znd->bdev_name);
-	if (!znd->bio_kthread) {
+	if (IS_ERR(znd->bio_kthread)) {
+		r = PTR_ERR(znd->bio_kthread);
 		ti->error = "Couldn't alloc kthread";
 		zoned_destroy(znd);
-		return -EINVAL;
+		return r;
 	}
 #endif
+
 	r = zdm_create_proc_entries(znd);
 	if (r) {
 		ti->error = "Failed to create /proc entries";
@@ -823,9 +823,12 @@ static int zoned_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	return 0;
 }
 
-/* -------------------------------------------------------------------------- */
-/* -------------------------------------------------------------------------- */
-
+/**
+ * zoned_dtr() - Deconstruct a ZDM Instance from DM Target Instance.
+ * @ti: Device Mapper Target Instance
+ *
+ * Return: 0 on success, otherwise error.
+ */
 static void zoned_dtr(struct dm_target *ti)
 {
 	struct zoned *znd = ti->private;
@@ -844,19 +847,16 @@ static void zoned_dtr(struct dm_target *ti)
 	kthread_stop(znd->bio_kthread);
 	kfifo_free(&znd->bio_fifo);
 #endif
-
 	if (znd->bio_set)
 		bioset_free(znd->bio_set);
 	zdm_remove_proc_entries(znd);
-
 	zoned_destroy(znd);
 }
 
-/* -------------------------------------------------------------------------- */
-/* -------------------------------------------------------------------------- */
 
-/*
- * Read or write a chunk aligned and sized block of data from a device.
+/**
+ * do_io_work() - Read or write a data from a block device.
+ * @work: Work to be done.
  */
 static void do_io_work(struct work_struct *work)
 {
@@ -869,9 +869,20 @@ static void do_io_work(struct work_struct *work)
 		DMERR("ERROR: dm_io error: %lx", error_bits);
 }
 
-/* -------------------------------------------------------------------------- */
-/* -------------------------------------------------------------------------- */
-
+/**
+ * znd_async_io() - Issue I/O via dm_io async or sync (using worker thread).
+ * @znd: ZDM Instance
+ * @dtype: Type of memory in data
+ * @data: Data for I/O
+ * @block: bLBA for I/O
+ * @nDMsect: Number of 512 byte blocks to read/write.
+ * @rw: READ or WRITE
+ * @queue: if true then use worker thread for I/O and wait.
+ * @callback: callback to use on I/O complete.
+ * context: context to be passed to callback.
+ *
+ * Return 0 on success, otherwise error.
+ */
 static int znd_async_io(struct zoned *znd,
 			enum dm_io_mem_type dtype,
 			void *data,
@@ -938,7 +949,18 @@ done:
 	return rcode;
 }
 
-
+/**
+ * block_io() - Issue sync I/O maybe using using a worker thread.
+ * @znd: ZDM Instance
+ * @dtype: Type of memory in data
+ * @data: Data for I/O
+ * @s: bLBA for I/O [512 byte resolution]
+ * @n: Number of 512 byte blocks to read/write.
+ * @rw: READ or WRITE
+ * @queue: if true then use worker thread for I/O and wait.
+ *
+ * Return 0 on success, otherwise error.
+ */
 static int block_io(struct zoned *znd,
 		    enum dm_io_mem_type dtype,
 		    void *data, sector_t s, unsigned int n, int rw, int queue)
@@ -946,11 +968,16 @@ static int block_io(struct zoned *znd,
 	return znd_async_io(znd, dtype, data, s, n, rw, queue, NULL, NULL);
 }
 
-/* -------------------------------------------------------------------------- */
-/* -------------------------------------------------------------------------- */
-
-/*
- * count -> count in 4k sectors.
+/**
+ * read_block() - Issue sync read maybe using using a worker thread.
+ * @ti: Device Mapper Target Instance
+ * @dtype: Type of memory in data
+ * @data: Data for I/O
+ * @lba: bLBA for I/O [4k resolution]
+ * @count: Number of 4k blocks to read/write.
+ * @queue: if true then use worker thread for I/O and wait.
+ *
+ * Return 0 on success, otherwise error.
  */
 static int read_block(struct dm_target *ti, enum dm_io_mem_type dtype,
 		      void *data, u64 lba, unsigned int count, int queue)
@@ -976,14 +1003,19 @@ static int read_block(struct dm_target *ti, enum dm_io_mem_type dtype,
 	return rc;
 }
 
-/* -------------------------------------------------------------------------- */
-/* -------------------------------------------------------------------------- */
-
-/*
- * count -> count in 4k sectors.
+/**
+ * writef_block() - Issue sync write maybe using using a worker thread.
+ * @ti: Device Mapper Target Instance
+ * @dtype: Type of memory in data
+ * @data: Data for I/O
+ * @lba: bLBA for I/O [4k resolution]
+ * @count: Number of 4k blocks to read/write.
+ * @queue: if true then use worker thread for I/O and wait.
+ *
+ * Return 0 on success, otherwise error.
  */
-static int write_block(struct dm_target *ti, enum dm_io_mem_type dtype,
-		       void *data, u64 lba, unsigned int count, int queue)
+static int writef_block(struct dm_target *ti, int rw, enum dm_io_mem_type dtype,
+			void *data, u64 lba, unsigned int count, int queue)
 {
 	struct zoned *znd = ti->private;
 	sector_t block = lba << Z_SHFT4K;
@@ -998,6 +1030,23 @@ static int write_block(struct dm_target *ti, enum dm_io_mem_type dtype,
 	}
 
 	return rc;
+}
+
+/**
+ * write_block() - Issue sync write maybe using using a worker thread.
+ * @ti: Device Mapper Target Instance
+ * @dtype: Type of memory in data
+ * @data: Data for I/O
+ * @lba: bLBA for I/O [4k resolution]
+ * @count: Number of 4k blocks to read/write.
+ * @queue: if true then use worker thread for I/O and wait.
+ *
+ * Return 0 on success, otherwise error.
+ */
+static int write_block(struct dm_target *ti, enum dm_io_mem_type dtype,
+		       void *data, u64 lba, unsigned int count, int queue)
+{
+	return writef_block(ti, WRITE, dtype, data, lba, count, queue);
 }
 
 /**
@@ -1046,6 +1095,7 @@ static int hook_bio(struct zoned *znd, struct bio *split, bio_end_io_t *endiofn)
 
 	return 0;
 }
+
 
 /**
  * TODO: On write error such as this we can incr wp-used but we need
@@ -1162,9 +1212,16 @@ out:
 	return split;
 }
 
-/* -------------------------------------------------------------------------- */
-/* -------------------------------------------------------------------------- */
-
+/**
+ * zm_cow() - Read Modify Write to write less than 4k size blocks.
+ * @znd: ZDM Instance
+ * @bio: Bio to write
+ * @s_zdm: tLBA
+ * @blks: number of blocks to RMW (should be 1).
+ * @origin: Current bLBA
+ *
+ * Return: 0 on success, otherwise error.
+ */
 static int zm_cow(struct zoned *znd, struct bio *bio, u64 s_zdm, u32 blks,
 		  u64 origin)
 {
@@ -1255,11 +1312,6 @@ static int zm_cow(struct zoned *znd, struct bio *bio, u64 s_zdm, u32 blks,
 	return DM_MAPIO_SUBMITTED;
 }
 
-/* -------------------------------------------------------------------------- */
-/* -------------------------------------------------------------------------- */
-
-#define BIO_CACHE_SECTORS (IO_VCACHE_PAGES * Z_BLOCKS_PER_DM_SECTOR)
-
 /**
  * Write 4k blocks from cache to lba.
  * Move any remaining 512 byte blocks to the start of cache and update
@@ -1311,7 +1363,7 @@ static int zm_write_bios(struct zoned *znd, struct bio *bio, u64 s_zdm)
 			lba = z_acquire(znd, acqflgs, mapped, &mapped);
 
 		if (!lba) {
-			if (znd->gc_throttle.counter == 0) {
+			if (atomic_read(&znd->gc_throttle) == 0) {
 				err = -ENOSPC;
 				goto out;
 			}
@@ -1401,7 +1453,7 @@ reacquire:
 			lba = z_acquire(znd, acqflgs, mapped, &mapped);
 
 		if (!lba) {
-			if (znd->gc_throttle.counter == 0) {
+			if (atomic_read(&znd->gc_throttle) == 0) {
 				err = -ENOSPC;
 				goto out;
 			}
@@ -1731,9 +1783,10 @@ out:
 	return rcode;
 }
 
-/* -------------------------------------------------------------------------- */
-/* -------------------------------------------------------------------------- */
-
+/**
+ * zoned_bio() - Handle and incoming BIO.
+ * @znd: ZDM Instance
+ */
 static int zoned_bio(struct zoned *znd, struct bio *bio)
 {
 	bool is_write = (bio_data_dir(bio) == WRITE);
@@ -1756,7 +1809,12 @@ static int zoned_bio(struct zoned *znd, struct bio *bio)
 		}
 	}
 
-	/* check for SYNC flag */
+	/* check for REQ_FLUSH flag */
+	if (bio->bi_rw & REQ_FLUSH) {
+		bio->bi_rw &= ~(REQ_FLUSH);
+		set_bit(DO_FLUSH, &znd->flags);
+		force_sync_now = 1;
+	}
 	if (bio->bi_rw & REQ_SYNC) {
 		set_bit(DO_SYNC, &znd->flags);
 		force_sync_now = 1;
@@ -1769,13 +1827,14 @@ static int zoned_bio(struct zoned *znd, struct bio *bio)
 		if (bio->bi_rw & REQ_DISCARD) {
 			rcode = zoned_map_discard(znd, bio, s_zdm);
 		} else if (is_write) {
+			const int wait = 1;
 			u32 blks = bio->bi_iter.bi_size >> 12;
 
 			rcode = zoned_map_write(znd, bio, s_zdm);
 			if (rcode == DM_MAPIO_SUBMITTED) {
 				z_discard_partial(znd, blks, CRIT);
 				if (znd->z_gc_free < 5)
-					gc_immediate(znd, CRIT);
+					gc_immediate(znd, !wait, CRIT);
 			}
 		} else {
 			rcode = zm_read_bios(znd, bio, s_zdm);
@@ -1783,7 +1842,8 @@ static int zoned_bio(struct zoned *znd, struct bio *bio)
 		znd->age = jiffies;
 	}
 
-	if (test_bit(DO_SYNC, &znd->flags) ||
+	if (test_bit(DO_FLUSH, &znd->flags) ||
+	    test_bit(DO_SYNC, &znd->flags) ||
 	    test_bit(DO_JOURNAL_MOVE, &znd->flags) ||
 	    test_bit(DO_MEMPOOL, &znd->flags)) {
 		if (!test_bit(DO_METAWORK_QD, &znd->flags) &&
@@ -1816,14 +1876,15 @@ done:
 	return rcode;
 }
 
-/* -------------------------------------------------------------------------- */
-/* -------------------------------------------------------------------------- */
-
+/**
+ * _do_mem_purge() - conditionally trigger a reduction of cache memory
+ * @znd: ZDM Instance
+ */
 static inline int _do_mem_purge(struct zoned *znd)
 {
 	int do_work = 0;
 
-	if (znd->incore_count > 3) {
+	if (atomic_read(&znd->incore) > 3) {
 		set_bit(DO_MEMPOOL, &znd->flags);
 		if (!work_pending(&znd->meta_work))
 			do_work = 1;
@@ -1856,6 +1917,9 @@ static void on_timeout_activity(struct zoned *znd, int delay)
 		if (count != 1 || --max_tries < 0)
 			break;
 
+		if (test_bit(ZF_FREEZE, &znd->flags))
+			return;
+
 	} while (is_expired_msecs(znd->age, DISCARD_IDLE_MSECS));
 
 	gc_queue_with_delay(znd, delay, NORMAL);
@@ -1864,9 +1928,10 @@ static void on_timeout_activity(struct zoned *znd, int delay)
 		queue_work(znd->meta_wq, &znd->meta_work);
 }
 
-/* -------------------------------------------------------------------------- */
-/* -------------------------------------------------------------------------- */
-
+/**
+ * bg_work_task() - periodic background worker
+ * @work: context for worker thread
+ */
 static void bg_work_task(struct work_struct *work)
 {
 	struct zoned *znd;
@@ -1879,9 +1944,10 @@ static void bg_work_task(struct work_struct *work)
 	on_timeout_activity(znd, delay);
 }
 
-/* -------------------------------------------------------------------------- */
-/* -------------------------------------------------------------------------- */
-
+/**
+ * activity_timeout() - Handler for timer used to trigger background worker.
+ * @data: context for timer.
+ */
 static void activity_timeout(unsigned long data)
 {
 	struct zoned *znd = (struct zoned *) data;
@@ -1893,9 +1959,12 @@ static void activity_timeout(unsigned long data)
 		mod_timer(&znd->timer, jiffies + msecs_to_jiffies(2500));
 }
 
-/* -------------------------------------------------------------------------- */
-/* -------------------------------------------------------------------------- */
-
+/**
+ * get_dev_size() - Report accessible size of device to upper layer.
+ * @ti: DM Target
+ *
+ * Return: Size in 512 byte sectors
+ */
 static sector_t get_dev_size(struct dm_target *ti)
 {
 	struct zoned *znd = ti->private;
@@ -1911,9 +1980,12 @@ static sector_t get_dev_size(struct dm_target *ti)
 	return to_sector(sz);
 }
 
-/* -------------------------------------------------------------------------- */
-/* -------------------------------------------------------------------------- */
-
+/**
+ * zoned_iterate_devices() - Iterate over devices call fn() at each.
+ * @ti: DM Target
+ * @fn: Function for each callout
+ * @data: Context for fn().
+ */
 static int zoned_iterate_devices(struct dm_target *ti,
 				 iterate_devices_callout_fn fn, void *data)
 {
@@ -1952,13 +2024,18 @@ static void zoned_io_hints(struct dm_target *ti, struct queue_limits *limits)
 		limits->max_discard_sectors = 1 << 30;
 		limits->max_hw_discard_sectors = 1 << 30;
 		limits->discard_zeroes_data = 1;
-		limits->raid_discard_safe = 1;
+		limits->raid_discard_safe = znd->raid5_trim;
 	}
 }
 
-/* -------------------------------------------------------------------------- */
-/* -------------------------------------------------------------------------- */
-
+/**
+ * zoned_status() - Report status of DM Target
+ * @ti: DM Target
+ * @type: Type of status to report.
+ * @status_flags: Flags
+ * @result: Fill in with status.
+ * @maxlen: Maximum number of bytes for result.
+ */
 static void zoned_status(struct dm_target *ti, status_type_t type,
 			 unsigned status_flags, char *result, unsigned maxlen)
 {
@@ -2236,7 +2313,7 @@ static int zdm_status_show(struct seq_file *seqf, void *unused)
 
 	status.memstat = znd->memstat;
 	memcpy(status.bins, znd->bins, sizeof(status.bins));
-	status.mlut_blocks = znd->incore_count;
+	status.mlut_blocks = atomic_read(&znd->incore);
 
 	return seq_write(seqf, &status, sizeof(status));
 }
@@ -2270,17 +2347,19 @@ static int zdm_info_show(struct seq_file *seqf, void *unused)
 {
 	struct zoned *znd = seqf->private;
 
-	seq_printf(seqf, "On device:    %s\n", _zdisk(znd));
-	seq_printf(seqf, "Data Zones:   %u\n", znd->data_zones);
-	seq_printf(seqf, "Empty Zones:  %u\n", znd->z_gc_free);
-	seq_printf(seqf, "Cached Pages: %u\n", znd->mc_entries);
+	seq_printf(seqf, "On device:     %s\n", _zdisk(znd));
+	seq_printf(seqf, "Data Zones:    %u\n", znd->data_zones);
+	seq_printf(seqf, "Empty Zones:   %u\n", znd->z_gc_free);
+	seq_printf(seqf, "Cached Pages:  %u\n", znd->mc_entries);
 	seq_printf(seqf, "Discard Pages: %u\n", znd->dc_entries);
-
-	seq_printf(seqf, "ZTL Pages:    %u\n", znd->incore_count);
-	seq_printf(seqf, "RAM in Use:   %lu\n", znd->memstat);
-	seq_printf(seqf, "Zones GC'd:   %u\n", znd->gc_events);
+	seq_printf(seqf, "ZTL Pages:     %d\n", atomic_read(&znd->incore));
+	seq_printf(seqf, "   in ZTL:     %d\n", znd->in_zlt);
+	seq_printf(seqf, "   in LZY:     %d\n", znd->in_lzy);
+	seq_printf(seqf, "RAM in Use:    %lu\n", znd->memstat);
+	seq_printf(seqf, "Zones GC'd:    %u\n", znd->gc_events);
+	seq_printf(seqf, "GC Throttle:   %d\n", atomic_read(&znd->gc_throttle));
 #if ALLOC_DEBUG
-	seq_printf(seqf, "Max Allocs:   %u\n", znd->hw_allocs);
+	seq_printf(seqf, "Max Allocs:    %u\n", znd->hw_allocs);
 #endif
 
 	return 0;

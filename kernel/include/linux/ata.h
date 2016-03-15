@@ -305,7 +305,7 @@ enum {
 	/* marked obsolete in the ATA/ATAPI-7 spec */
 	ATA_CMD_RESTORE		= 0x10,
 
-	/* ZAC commands - need update when ZAC spec is available */
+	/* ZAC commands */
 	ATA_CMD_ZONE_MAN_OUT	= 0x9F,
 
 	ATA_SUBCMD_CLOSE_ZONES	= 0x01,
@@ -498,8 +498,8 @@ enum ata_tf_protocols {
 };
 
 enum ata_ioctls {
-	ATA_IOC_GET_IO32	= 0x309,
-	ATA_IOC_SET_IO32	= 0x324,
+	ATA_IOC_GET_IO32	= 0x309, /* HDIO_GET_32BIT */
+	ATA_IOC_SET_IO32	= 0x324, /* HDIO_SET_32BIT */
 };
 
 /* core structures */

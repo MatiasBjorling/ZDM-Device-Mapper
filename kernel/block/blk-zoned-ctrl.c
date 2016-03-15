@@ -48,19 +48,6 @@
  */
 #define ZAC_ATA_OPCODE_IDENTIFY    ATA_CMD_ID_ATA
 
-/**
- * zac/zbc common sub command/action codes
- */
-#define ZONE_CLOSE      ATA_SUBCMD_CLOSE_ZONES
-#define ZONE_FINISH     ATA_SUBCMD_FINISH_ZONES
-#define ZONE_OPEN       ATA_SUBCMD_OPEN_ZONES
-#define ZONE_RESET_WP   ATA_SUBCMD_RESET_WP
-
-/**
- * ZBC zone command
- */
-#define ZBC_ZONE_ACTION  ZONE_COMMAND
-
 static inline void _len_to_cmd_zbc(u8 *cmd, u32 _len)
 {
 	__be32 len = cpu_to_be32(_len);
@@ -214,8 +201,8 @@ int blk_zoned_report(struct gendisk *disk,
 	u8 cmd[CMD_LEN] = {0};
 	u8 sense_buf[SCSI_SENSE_BUFFERSIZE] = {0};
 
-	cmd[0] = REPORT_ZONES;
-	cmd[1] = ATA_SUBCMD_REP_ZONES;
+	cmd[0] = ZBC_REPORT_ZONES;
+	cmd[1] = ZBC_REPORT_OPT;
 
 	_lba_to_cmd_zbc(&cmd[2],  start_lba);
 	_len_to_cmd_zbc(&cmd[10], (u32)bufsz);
@@ -280,7 +267,7 @@ static int blk_zoned_cmd(struct gendisk *disk, u64 start_lba, u8 command)
 		start_lba = 0;
 	}
 
-	cmd[0] = ZBC_ZONE_ACTION;
+	cmd[0] = ZBC_ACTION;
 	cmd[1] = command;
 
 	_lba_to_cmd_zbc(&cmd[2], start_lba);
@@ -300,25 +287,25 @@ static int blk_zoned_cmd(struct gendisk *disk, u64 start_lba, u8 command)
 
 int blk_zoned_close(struct gendisk *disk, u64 start_lba)
 {
-	return blk_zoned_cmd(disk, start_lba, ZONE_CLOSE);
+	return blk_zoned_cmd(disk, start_lba, ZBC_SA_ZONE_CLOSE);
 }
 EXPORT_SYMBOL(blk_zoned_close);
 
 int blk_zoned_finish(struct gendisk *disk, u64 start_lba)
 {
-	return blk_zoned_cmd(disk, start_lba, ZONE_FINISH);
+	return blk_zoned_cmd(disk, start_lba, ZBC_SA_ZONE_FINISH);
 }
 EXPORT_SYMBOL(blk_zoned_finish);
 
 int blk_zoned_open(struct gendisk *disk, u64 start_lba)
 {
-	return blk_zoned_cmd(disk, start_lba, ZONE_OPEN);
+	return blk_zoned_cmd(disk, start_lba, ZBC_SA_ZONE_OPEN);
 }
 EXPORT_SYMBOL(blk_zoned_open);
 
 int blk_zoned_reset_wp(struct gendisk *disk, u64 start_lba)
 {
-	return blk_zoned_cmd(disk, start_lba, ZONE_RESET_WP);
+	return blk_zoned_cmd(disk, start_lba, ZBC_SA_RESET_WP);
 }
 EXPORT_SYMBOL(blk_zoned_reset_wp);
 
@@ -448,25 +435,25 @@ static int _blk_zoned_command_ata(struct gendisk *disk, u64 start_lba,
 
 int blk_zoned_close_ata(struct gendisk *disk, u64 start_lba)
 {
-	return _blk_zoned_command_ata(disk, start_lba, ZONE_CLOSE);
+	return _blk_zoned_command_ata(disk, start_lba, ATA_SUBCMD_CLOSE_ZONES);
 }
 EXPORT_SYMBOL(blk_zoned_close_ata);
 
 int blk_zoned_finish_ata(struct gendisk *disk, u64 start_lba)
 {
-	return _blk_zoned_command_ata(disk, start_lba, ZONE_FINISH);
+	return _blk_zoned_command_ata(disk, start_lba, ATA_SUBCMD_FINISH_ZONES);
 }
 EXPORT_SYMBOL(blk_zoned_finish_ata);
 
 int blk_zoned_open_ata(struct gendisk *disk, u64 start_lba)
 {
-	return _blk_zoned_command_ata(disk, start_lba, ZONE_OPEN);
+	return _blk_zoned_command_ata(disk, start_lba, ATA_SUBCMD_OPEN_ZONES);
 }
 EXPORT_SYMBOL(blk_zoned_open_ata);
 
 int blk_zoned_reset_wp_ata(struct gendisk *disk, u64 start_lba)
 {
-	return _blk_zoned_command_ata(disk, start_lba, ZONE_RESET_WP);
+	return _blk_zoned_command_ata(disk, start_lba, ATA_SUBCMD_RESET_WP);
 }
 EXPORT_SYMBOL(blk_zoned_reset_wp_ata);
 

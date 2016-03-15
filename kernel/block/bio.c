@@ -584,7 +584,7 @@ void __bio_clone_fast(struct bio *bio, struct bio *bio_src)
 	bio->bi_rw = bio_src->bi_rw;
 	bio->bi_iter = bio_src->bi_iter;
 	bio->bi_io_vec = bio_src->bi_io_vec;
-	bio->pid = bio_src->pid;
+	bio_set_streamid(bio, bio_get_streamid(bio_src));
 }
 EXPORT_SYMBOL(__bio_clone_fast);
 
@@ -667,7 +667,6 @@ struct bio *bio_clone_bioset(struct bio *bio_src, gfp_t gfp_mask,
 	bio->bi_rw		= bio_src->bi_rw;
 	bio->bi_iter.bi_sector	= bio_src->bi_iter.bi_sector;
 	bio->bi_iter.bi_size	= bio_src->bi_iter.bi_size;
-	bio->pid		= bio_src->pid;
 
 	if (bio->bi_rw & REQ_DISCARD)
 		goto integrity_clone;
@@ -691,6 +690,7 @@ integrity_clone:
 		}
 	}
 
+	bio_set_streamid(bio, bio_get_streamid(bio_src));
 	return bio;
 }
 EXPORT_SYMBOL(bio_clone_bioset);
@@ -876,7 +876,7 @@ int submit_bio_wait(int rw, struct bio *bio)
 	bio->bi_private = &ret;
 	bio->bi_end_io = submit_bio_wait_endio;
 	submit_bio(rw, bio);
-	wait_for_completion(&ret.event);
+	wait_for_completion_io(&ret.event);
 
 	return ret.error;
 }
@@ -1092,9 +1092,12 @@ int bio_uncopy_user(struct bio *bio)
 	if (!bio_flagged(bio, BIO_NULL_MAPPED)) {
 		/*
 		 * if we're in a workqueue, the request is orphaned, so
-		 * don't copy into a random user address space, just free.
+		 * don't copy into a random user address space, just free
+		 * and return -EINTR so user space doesn't expect any data.
 		 */
-		if (current->mm && bio_data_dir(bio) == READ)
+		if (!current->mm)
+			ret = -EINTR;
+		else if (bio_data_dir(bio) == READ)
 			ret = bio_copy_to_iter(bio, bmd->iter);
 		if (bmd->is_our_pages)
 			bio_free_pages(bio);
@@ -1127,7 +1130,7 @@ struct bio *bio_copy_user_iov(struct request_queue *q,
 	int i, ret;
 	int nr_pages = 0;
 	unsigned int len = iter->count;
-	unsigned int offset = map_data ? map_data->offset & ~PAGE_MASK : 0;
+	unsigned int offset = map_data ? offset_in_page(map_data->offset) : 0;
 
 	for (i = 0; i < iter->nr_segs; i++) {
 		unsigned long uaddr;
@@ -1306,7 +1309,7 @@ struct bio *bio_map_user_iov(struct request_queue *q,
 			goto out_unmap;
 		}
 
-		offset = uaddr & ~PAGE_MASK;
+		offset = offset_in_page(uaddr);
 		for (j = cur_page; j < page_limit; j++) {
 			unsigned int bytes = PAGE_SIZE - offset;
 
@@ -2087,6 +2090,9 @@ static void __init biovec_init_slabs(void)
 
 static int __init init_bio(void)
 {
+	BUILD_BUG_ON(BIO_FLAG_LAST > ((8 * sizeof(unsigned int)) -
+			BIO_POOL_BITS - BIO_STREAM_BITS));
+
 	bio_slab_max = 2;
 	bio_slab_nr = 0;
 	bio_slabs = kzalloc(bio_slab_max * sizeof(struct bio_slab), GFP_KERNEL);

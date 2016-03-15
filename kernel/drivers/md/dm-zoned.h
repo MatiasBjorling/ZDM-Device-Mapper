@@ -137,6 +137,7 @@ struct z_io_req_t {
 enum pg_flag_enum {
 	IS_DIRTY,
 	IS_STALE,
+	IS_FLUSH,
 
 	IS_FWD,
 	IS_REV,
@@ -181,6 +182,7 @@ enum znd_flags_enum {
 	DO_JOURNAL_MOVE,
 	DO_MEMPOOL,
 	DO_SYNC,
+	DO_FLUSH,
 	DO_JOURNAL_LOAD,
 	DO_GC_NO_PURGE,
 	DO_METAWORK_QD,
@@ -434,7 +436,9 @@ struct mz_superkey {
 	__le16 md_crc;
 	__le16 wp_crc[64];
 	__le16 zf_crc[64];
-	u8 reserved[1912];
+	__le16 discards;
+	__le16 maps;
+	u8 reserved[1908];
 	__le32 crc32;
 	__le64 generation;
 	__le64 magic;
@@ -520,6 +524,7 @@ struct stale_tracking {
  * @gc_postmap:
  * @io_client:
  * @io_wq:
+ * @zone_action_wq:
  * @timer:
  * @bins:	Memory usage accounting/reporting.
  * @bdev_name:
@@ -550,6 +555,7 @@ struct zoned {
 	spinlock_t mapkey_lock; /* access LUT and CRC array of pointers */
 	spinlock_t ct_lock; /* access LUT and CRC array of pointers */
 
+	struct mutex gc_wait;
 	struct mutex pool_mtx;
 	struct mutex mz_io_mutex;
 	struct mutex vcio_lock;
@@ -607,7 +613,7 @@ struct zoned {
 	u32 gz_count;
 	u32 zdstart;
 	u32 z_gc_free;
-	s32 incore_count;
+	atomic_t incore;
 	u32 discard_count;
 	u32 z_current;
 	u32 z_meta_resv;
@@ -615,6 +621,8 @@ struct zoned {
 	u32 gc_events;
 	int mc_entries;
 	int dc_entries;
+	int in_zlt;
+	int in_lzy;
 	int meta_result;
 	struct stale_tracking stale;
 
@@ -628,6 +636,7 @@ struct zoned {
 	struct map_cache gc_postmap;
 	struct dm_io_client *io_client;
 	struct workqueue_struct *io_wq;
+	struct workqueue_struct *zone_action_wq;
 	struct timer_list timer;
 
 	u32 bins[40];
@@ -654,6 +663,7 @@ struct zoned {
 	unsigned issue_close_zone:1;
 	unsigned is_empty:1;
 	unsigned trim:1;
+	unsigned raid5_trim:1;
 
 };
 
@@ -703,4 +713,3 @@ struct zdm_ioc_status {
 #endif
 
 #endif /* _DM_ZONED_H */
-

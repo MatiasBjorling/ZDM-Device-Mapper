@@ -55,7 +55,7 @@ xfs_count_page_state(
 	} while ((bh = bh->b_this_page) != head);
 }
 
-STATIC struct block_device *
+struct block_device *
 xfs_find_bdev_for_inode(
 	struct inode		*inode)
 {
@@ -382,6 +382,7 @@ xfs_submit_ioend_bio(
 	atomic_inc(&ioend->io_remaining);
 	bio->bi_private = ioend;
 	bio->bi_end_io = xfs_end_bio;
+	bio_set_streamid(bio, inode_streamid(ioend->io_inode));
 	submit_bio(wbc->sync_mode == WB_SYNC_ALL ? WRITE_SYNC : WRITE, bio);
 }
 
@@ -1208,6 +1209,10 @@ xfs_vm_writepages(
 	struct writeback_control *wbc)
 {
 	xfs_iflags_clear(XFS_I(mapping->host), XFS_ITRUNCATED);
+	if (dax_mapping(mapping))
+		return dax_writeback_mapping_range(mapping,
+				xfs_find_bdev_for_inode(mapping->host), wbc);
+
 	return generic_writepages(mapping, wbc);
 }
 
@@ -1917,6 +1922,7 @@ xfs_vm_readpage(
 	struct file		*unused,
 	struct page		*page)
 {
+	trace_xfs_vm_readpage(page->mapping->host, 1);
 	return mpage_readpage(page, xfs_get_blocks);
 }
 
@@ -1927,6 +1933,7 @@ xfs_vm_readpages(
 	struct list_head	*pages,
 	unsigned		nr_pages)
 {
+	trace_xfs_vm_readpages(mapping->host, nr_pages);
 	return mpage_readpages(mapping, pages, nr_pages, xfs_get_blocks);
 }
 

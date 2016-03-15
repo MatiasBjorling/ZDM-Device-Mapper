@@ -201,10 +201,6 @@ static inline int scsi_is_wlun(u64 lun)
 #define DRIVER_HARD         0x07
 #define DRIVER_SENSE	    0x08
 
-/* Op code for ZBC */
-#define ZONE_COMMAND		0x94
-#define REPORT_ZONES		0x95
-
 /*
  * Internal return values.
  */
@@ -303,14 +299,6 @@ static inline int scsi_is_wlun(u64 lun)
 
 /* Used to obtain the PCI location of a device */
 #define SCSI_IOCTL_GET_PCI		0x5387
-
-/* Used for Zone based SMR devices */
-#define SCSI_IOCTL_INQUIRY		0x10000
-#define SCSI_IOCTL_CLOSE_ZONE		0x10001
-#define SCSI_IOCTL_FINISH_ZONE		0x10002
-#define SCSI_IOCTL_OPEN_ZONE		0x10003
-#define SCSI_IOCTL_RESET_WP		0x10004
-#define SCSI_IOCTL_REPORT_ZONES		0x10005
 
 /* Pull a u32 out of a SCSI message (using BE SCSI conventions) */
 static inline __u32 scsi_to_u32(__u8 *ptr)

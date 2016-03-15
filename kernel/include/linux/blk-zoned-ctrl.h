@@ -14,6 +14,7 @@
 #ifndef BLK_ZONED_CTRL_H
 #define BLK_ZONED_CTRL_H
 
+#include <linux/blkzoned_api.h>
 #include <uapi/linux/blk-zoned-ctrl.h>
 
 /* this is basically scsi_execute */
