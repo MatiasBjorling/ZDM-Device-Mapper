@@ -125,7 +125,7 @@ If not, please see http://www.gnu.org/licenses/.
 
 ## Contact and Bug Reports
 
-  - Adrian Palmer [adrian.palmer@seagate.com](mailto:adrian.palmer@seagate.com)
+  - Shaun Tancheff [shaun.tancheff@seagate.com](mailto:shaun.tancheff@seagate.com)
 
 ## ZDM Patches for other projects
 
@@ -133,36 +133,25 @@ If not, please see http://www.gnu.org/licenses/.
     * 0.94.5 [ceph patch](/patches/ceph)
   - util-linux
     * 2.20.1 [2.20.1 in use by Ubuntu 14.04](/patches/util-linux/2.20.1)
-    * 2.27 [2.27 development](/patches/util-linux/2.27)
+    * 2.27.1 [2.27.1 development](/patches/util-linux/2.27.1) Includes blkreport, blkzonecmd
   - util-linux-ng
     * 2.17.2 [2.17.2 in use by CentOS 6.7](/patches/util-linux-ng)
 
 ## ZDM Linux Kernel
 
   - Patches
-    * v4.1 [ZDM r101 patches for linux v4.1](/patches/linux/v4.1+ZDM-r101)
-    * v4.2 [ZDM r101 patches for linux v4.2](/patches/linux/v4.2+ZDM-r101)
-    * v4.3 [ZDM r101 patches for linux v4.3](/patches/linux/v4.3+ZDM-r101)
-    * v4.4 [ZDM r103 patches for linux v4.4](/patches/linux/v4.4+ZDM-r103)
+    * v4.2 [ZDM r101 patches for linux v4.2](/patches/linux/v4.2+ZDM-r106)
+    * v4.5 [ZDM r103 patches for linux v4.4](/patches/linux/v4.4+ZDM-r106)
   - Linux kernel with ZDM patches applied.
-    * v4.1 https://seagit.okla.seagate.com/ZDM-Release/zdm-kernel/tree/v4.1+ZDM-r101
-    * v4.2 https://seagit.okla.seagate.com/ZDM-Release/zdm-kernel/tree/v4.2+ZDM-r101
-    * v4.3 https://seagit.okla.seagate.com/ZDM-Release/zdm-kernel/tree/v4.3+ZDM-r101
-    * v4.4 https://seagit.okla.seagate.com/ZDM-Release/zdm-kernel/tree/v4.4+ZDM-r103
+    * v4.2 https://seagit.okla.seagate.com/ZDM-Release/zdm-kernel/tree/v4.2+ZDM-r106
+    * v4.5 https://seagit.okla.seagate.com/ZDM-Release/zdm-kernel/tree/v4.4+ZDM-r106
 
-## Observations and Known Issues in this release (#103)
+## Observations and Known Issues in this release (#106)
 
-  - Discard cache support is incomplete and unbounded, theoretically it could use up a lot of memory.
-     * In practice this is not happening.
-     * Fix is planned for #105.
-  - Bug: Discard on-disk format is not handled during for restore.
-     * Fix is planned for #104.
-  - Bug: Write back of metadata could cause inconsitency in case of sudden power loss between SYNC's
-     * Fix is planned for #105.
-  - Bug: A race condition exists causing corrupt metadata and -ENOSPC will be reported and halting writes.
-     * Fixed for next release.
-  - Bug: A race condition exists allowing ingress to overwhelm GC rate -ENOSPC will be reported and ingress halted.
-     * Fixed in next release.
+  - Bug: Write back of metadata could cause inconsistency in case of sudden power loss between SYNC's
+     * Fix is planned for #107.
+  - Bug: GC can deadlock when GC emergency reserves are depleted.
+     * Fix is planned for #107.
 
 ## Changes from Initial Release
 
@@ -202,3 +191,20 @@ If not, please see http://www.gnu.org/licenses/.
     * Enabled discard support for md-raid to be enabled by ZDM block devices.
     * Added an experimental prototype hack to use PID as stream id.
     * Changed userspace ioctl to use procfs as ioctl are disabled in v4.4 and later kernels.
+
+  - ZDM #104
+    * Transition to using streamid patches from Jens Axobe.
+    * Add ZAC->ZBC report zones little to big endian translation.
+    * Add flags to struct bio to support ZBC commands: Report zones, reset, open and close zone(s).
+    * Reworked flush handling to ensure metadata is durable before releasing.
+
+  - ZDM #105
+    * Bug Fixes
+       * Memory leak during undrop.
+       * Bio set not allocated.
+       * GC queuing bugs .. wrap under on free zone count.
+       * Reworked immediate/wait logic.
+     * Update to v4.5 kernel.
+
+  - ZDM #106
+    * Bug Fix: Change lazy-drop timeout back to 15s

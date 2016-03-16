@@ -1,0 +1,47 @@
+From 223818596d10a617877fe4f771afe712eafc6884 Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Wed, 16 Mar 2016 00:15:01 -0500
+Subject: [PATCH 24/24] BUG: Increase lazy drop delay to 15s
+
+While fixing the memory leak introduced during _maybe_undrop()
+failing to re-add the page to the ZLT pool the default hold
+time in the lazy drop pool was reduced to 5s.
+
+This does not appear to be enough settle time for the SAS HBA
+controller. It also indicates a deeper issue with DIRTY and
+FLUSH flag handling that may need to be moved directly into
+the z_mapped_sync() handler.
+
+In the meantime restore the 15s default and determine if that
+is enough time to not regress from r104.
+
+Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
+---
+ drivers/md/libzoned.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/md/libzoned.c b/drivers/md/libzoned.c
+index 4dd1c30..b7b22fe 100644
+--- a/drivers/md/libzoned.c
++++ b/drivers/md/libzoned.c
+@@ -12,7 +12,7 @@
+  * warranty of any kind, whether express or implied.
+  */
+ 
+-#define BUILD_NO		105
++#define BUILD_NO		106
+ 
+ #define EXTRA_DEBUG		0
+ #define ENABLE_PG_FREE_VIA_LAZY	1
+@@ -3020,7 +3020,7 @@ static int manage_lazy_activity(struct zoned *znd)
+ 	struct map_pg *expg;
+ 	struct map_pg *_tpg;
+ 	int want_flush = 0;
+-	const u32 msecs = MEM_HOT_BOOST_INC;
++	const u32 msecs = MEM_PURGE_MSECS;
+ 
+ 	spin_lock(&znd->lzy_lck);
+ 	expg = list_first_entry_or_null(&znd->lzy_pool, typeof(*expg), lazy);
+-- 
+2.7.0
+
