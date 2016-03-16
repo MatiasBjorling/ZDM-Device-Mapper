@@ -12,7 +12,7 @@
  * warranty of any kind, whether express or implied.
  */
 
-#define BUILD_NO		105
+#define BUILD_NO		106
 
 #define EXTRA_DEBUG		0
 #define ENABLE_PG_FREE_VIA_LAZY	1
@@ -3020,7 +3020,7 @@ static int manage_lazy_activity(struct zoned *znd)
 	struct map_pg *expg;
 	struct map_pg *_tpg;
 	int want_flush = 0;
-	const u32 msecs = MEM_HOT_BOOST_INC;
+	const u32 msecs = MEM_PURGE_MSECS;
 
 	spin_lock(&znd->lzy_lck);
 	expg = list_first_entry_or_null(&znd->lzy_pool, typeof(*expg), lazy);
