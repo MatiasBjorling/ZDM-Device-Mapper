@@ -1,50 +1,3 @@
-From b4615098df9978dd13e09ad9ecabe976ccb0f8ac Mon Sep 17 00:00:00 2001
-From: Shaun Tancheff <shaun@tancheff.com>
-Date: Tue, 15 Mar 2016 04:03:37 -0500
-Subject: [PATCH 1/2] Support for ZAC/ZBC block devices.
-
-Zoned block devices (such as Host Aware and Host Managed
-SMR drives) are now becoming availble.
-
-New kernel features are being exposed to support the ZAC/ZBC
-command set. New ioctls are being added support this interface
-for raw block device users.
-
-Add support for sending BLKREPORT ioctls to block devices.
-
-Add support for sending BLKOPENZONE and BLKCLOSEZONE ioctls
-to block devices.
-
-In addtion to the block level ioctl support there is also a
-new DM target for zoned devices that helps zoned block
-devices behave like traditional block devices.
-
-This also adds support for detection of devices using this
-DM target by blkid.
-
-Add support for ZDM superblock detection by blkid.
-
-Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
----
- configure.ac                           |  14 +
- include/strutils.h                     |   1 +
- lib/strutils.c                         |   8 +-
- libblkid/src/Makemodule.am             |   1 +
- libblkid/src/superblocks/superblocks.c |   1 +
- libblkid/src/superblocks/superblocks.h |   1 +
- libblkid/src/superblocks/zdm.c         |  90 ++++++
- sys-utils/Makemodule.am                |  14 +
- sys-utils/blkreport.8                  |  95 ++++++
- sys-utils/blkreport.c                  | 547 +++++++++++++++++++++++++++++++++
- sys-utils/blkzonecmd.8                 |  78 +++++
- sys-utils/blkzonecmd.c                 | 228 ++++++++++++++
- 12 files changed, 1076 insertions(+), 2 deletions(-)
- create mode 100644 libblkid/src/superblocks/zdm.c
- create mode 100644 sys-utils/blkreport.8
- create mode 100644 sys-utils/blkreport.c
- create mode 100644 sys-utils/blkzonecmd.8
- create mode 100644 sys-utils/blkzonecmd.c
-
 diff --git a/configure.ac b/configure.ac
 index 2aa2e82..13dbbdd 100644
 --- a/configure.ac
@@ -90,7 +43,7 @@ index ec2a8ac..93296c5 100644
  extern double strtod_or_err(const char *str, const char *errmesg);
  
 diff --git a/lib/strutils.c b/lib/strutils.c
-index 30dc090..b57770d 100644
+index 30dc090..8d26673 100644
 --- a/lib/strutils.c
 +++ b/lib/strutils.c
 @@ -314,7 +314,7 @@ err:
@@ -102,15 +55,6 @@ index 30dc090..b57770d 100644
  {
  	uintmax_t num;
  	char *end = NULL;
-@@ -322,7 +322,7 @@ uint64_t strtou64_or_err(const char *str, const char *errmesg)
- 	if (str == NULL || *str == '\0')
- 		goto err;
- 	errno = 0;
--	num = strtoumax(str, &end, 10);
-+	num = strtoumax(str, &end, base);
- 
- 	if (errno || str == end || (end && *end))
- 		goto err;
 @@ -335,6 +335,10 @@ err:
  	errx(STRTOXX_EXIT_CODE, "%s: '%s'", errmesg, str);
  }
@@ -382,10 +326,10 @@ index 0000000..05f1d19
 +.UE .
 diff --git a/sys-utils/blkreport.c b/sys-utils/blkreport.c
 new file mode 100644
-index 0000000..ec82c24
+index 0000000..c4fdf81
 --- /dev/null
 +++ b/sys-utils/blkreport.c
-@@ -0,0 +1,547 @@
+@@ -0,0 +1,546 @@
 +/*
 + * blkreport.c -- request a zone report on part (or all) of the block device.
 + *
@@ -635,7 +579,7 @@ index 0000000..ec82c24
 +#endif
 +
 +#ifndef BLKREPORT
-+#define BLKREPORT _IOWR(0x12,128, struct bdev_zone_report_io)
++# define BLKREPORT	_IOWR(0x12, 130, struct bdev_zone_report_io)
 +#endif
 +
 +static const char * same_text[] = {
@@ -740,7 +684,7 @@ index 0000000..ec82c24
 +		}
 +		fprintf(stdout,
 +			"  start: %9lx, len %7lx, wptr %8lx"
-+                        " reset:%u non-seq:%u, zcond:%2u(%s) [type: %u(%s)]\n",
++			" reset:%u non-seq:%u, zcond:%2u(%s) [type: %u(%s)]\n",
 +		start, len, wp - start, flags & 0x01, (flags & 0x02) >> 1,
 +		cond, zone_condition_str(cond), type, type_text[type]);
 +	}
@@ -751,7 +695,6 @@ index 0000000..ec82c24
 +	return (ropt <= ZOPT_ZC7_OFFLINE || ropt == ZOPT_RESET ||
 +		ropt == ZOPT_NON_SEQ || ropt == ZOPT_NON_WP_ZONES);
 +}
-+
 +
 +static int do_report(int fd, uint64_t lba, uint64_t len, uint8_t ropt, int do_ata, int verbose)
 +{
@@ -1019,10 +962,10 @@ index 0000000..6aef31a
 +.UE .
 diff --git a/sys-utils/blkzonecmd.c b/sys-utils/blkzonecmd.c
 new file mode 100644
-index 0000000..b2ebc7c
+index 0000000..28c31c3
 --- /dev/null
 +++ b/sys-utils/blkzonecmd.c
-@@ -0,0 +1,228 @@
+@@ -0,0 +1,242 @@
 +/*
 + * blkreport.c -- request a zone report on part (or all) of the block device.
 + *
@@ -1077,11 +1020,11 @@ index 0000000..b2ebc7c
 +#endif
 +
 +#ifndef BLKOPENZONE
-+# define BLKOPENZONE	_IO(0x12,129)
++# define BLKOPENZONE	_IO(0x12, 131)
 +#endif
 +
 +#ifndef BLKCLOSEZONE
-+# define BLKCLOSEZONE	_IO(0x12,130)
++# define BLKCLOSEZONE	_IO(0x12, 132)
 +#endif
 +
 +enum {
@@ -1106,6 +1049,15 @@ index 0000000..b2ebc7c
 +		printf(_("%s: Unknown Action on %" PRIu64 "\n"), path, lba);
 +		break;
 +	}
++}
++
++#define DEFAULT_ZONE_ORDER (19 + 9)
++
++static inline int issue_discard(int fd, uint64_t zone_lba, uint64_t ata)
++{
++	uint64_t range[2] = { zone_lba, 1 << DEFAULT_ZONE_ORDER };
++
++	return ioctl(fd, BLKDISCARD, &range);
 +}
 +
 +static void __attribute__((__noreturn__)) usage(FILE *out)
@@ -1140,7 +1092,7 @@ index 0000000..b2ebc7c
 +	uint64_t blksize;
 +	struct stat sb;
 +	uint64_t zone_lba = 0ul;
-+	uint64_t ata = 0;
++	int ata = 0;
 +	int act = ACT_OPEN_ZONE;
 +
 +	static const struct option longopts[] = {
@@ -1228,21 +1180,26 @@ index 0000000..b2ebc7c
 +	if (zone_lba > blksize)
 +		errx(EXIT_FAILURE, _("%s: offset is greater than device size"), path);
 +
++	if (ata) {
++		zone_lba |= 1ul; /* ensure low bit is set */
++	} else {
++		zone_lba &= ~1ul; /* ensure low bit is clear */
++	}
++
 +	switch (act) {
 +	case ACT_OPEN_ZONE:
-+		if (ioctl(fd, BLKOPENZONE, zone_lba | ata))
++		if (ioctl(fd, BLKOPENZONE, zone_lba))
 +			 err(EXIT_FAILURE, _("%s: BLKOPENZONE ioctl failed"), path);
 +		break;
 +	case ACT_CLOSE_ZONE:
-+		if (ioctl(fd, BLKSECDISCARD, zone_lba | ata))
++		if (ioctl(fd, ACT_CLOSE_ZONE, zone_lba))
 +			err(EXIT_FAILURE, _("%s: BLKSECDISCARD ioctl failed"), path);
 +		break;
 +
-+// TODO:
-+//	case ACT_RESET_ZONE:
-+//		if (ioctl(fd, BLKDISCARD, &range))
-+//			err(EXIT_FAILURE, _("%s: BLKDISCARD ioctl failed"), path);
-+//		break;
++	case ACT_RESET_ZONE:
++		if (issue_discard(fd, zone_lba, ata))
++			err(EXIT_FAILURE, _("%s: BLKDISCARD ioctl failed"), path);
++		break;
 +	}
 +
 +	if (verbose && zone_lba)
@@ -1251,6 +1208,3 @@ index 0000000..b2ebc7c
 +	close(fd);
 +	return EXIT_SUCCESS;
 +}
--- 
-2.7.0
-
