@@ -1,3 +1,38 @@
+From f4da1a1a344463eae981248c0653c6f29d634411 Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Fri, 18 Mar 2016 13:31:49 -0500
+Subject: [PATCH 1/3] ATA passthrough fixes ZAC block devices.
+
+SATA devices connected through SAS/HBA's which do not support
+the ZBC command set cannot properly work with ZAC devices.
+However such HBA's support ATA 16 passthrough which in generally
+works correctly.
+
+This support sending ATA 16 commands via the SCSI ATA passthrough
+to SATA devices allowing such devices to work until the firmware
+for such SAS HBA's are updated or replaced.
+
+Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
+---
+ configure.ac                           |  14 +
+ include/strutils.h                     |   1 +
+ lib/strutils.c                         |   6 +-
+ libblkid/src/Makemodule.am             |   1 +
+ libblkid/src/superblocks/superblocks.c |   1 +
+ libblkid/src/superblocks/superblocks.h |   1 +
+ libblkid/src/superblocks/zdm.c         |  90 ++++++
+ sys-utils/Makemodule.am                |  14 +
+ sys-utils/blkreport.8                  |  95 ++++++
+ sys-utils/blkreport.c                  | 546 +++++++++++++++++++++++++++++++++
+ sys-utils/blkzonecmd.8                 |  78 +++++
+ sys-utils/blkzonecmd.c                 | 242 +++++++++++++++
+ 12 files changed, 1088 insertions(+), 1 deletion(-)
+ create mode 100644 libblkid/src/superblocks/zdm.c
+ create mode 100644 sys-utils/blkreport.8
+ create mode 100644 sys-utils/blkreport.c
+ create mode 100644 sys-utils/blkzonecmd.8
+ create mode 100644 sys-utils/blkzonecmd.c
+
 diff --git a/configure.ac b/configure.ac
 index 2aa2e82..13dbbdd 100644
 --- a/configure.ac
@@ -1208,3 +1243,6 @@ index 0000000..28c31c3
 +	close(fd);
 +	return EXIT_SUCCESS;
 +}
+-- 
+2.7.0
+

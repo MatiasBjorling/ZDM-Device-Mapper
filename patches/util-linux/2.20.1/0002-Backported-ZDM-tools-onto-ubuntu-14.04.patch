@@ -1,3 +1,35 @@
+From c672b8557120c372a93cea9f44a4667926d91a46 Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun.tancheff@seagate.com>
+Date: Fri, 18 Mar 2016 12:53:19 -0500
+Subject: [PATCH 2/4] Backported ZDM tools onto ubuntu 14.04.
+
+---
+ configure.ac                           |   5 +
+ debian/changelog                       |   6 +
+ include/c.h                            | 146 ++++++++-
+ include/crc64.h                        |   9 +
+ include/strutils.h                     |   2 +
+ lib/crc64.c                            | 109 +++++++
+ lib/strutils.c                         |  26 ++
+ libblkid/src/Makefile.am               |   1 +
+ libblkid/src/superblocks/Makefile.am   |   1 +
+ libblkid/src/superblocks/superblocks.c |   1 +
+ libblkid/src/superblocks/superblocks.h |   1 +
+ libblkid/src/superblocks/zdm.c         |  98 ++++++
+ sys-utils/Makefile.am                  |   7 +-
+ sys-utils/blkreport.8                  |  95 ++++++
+ sys-utils/blkreport.c                  | 543 +++++++++++++++++++++++++++++++++
+ sys-utils/blkzonecmd.8                 |  78 +++++
+ sys-utils/blkzonecmd.c                 | 239 +++++++++++++++
+ 17 files changed, 1355 insertions(+), 12 deletions(-)
+ create mode 100644 include/crc64.h
+ create mode 100644 lib/crc64.c
+ create mode 100644 libblkid/src/superblocks/zdm.c
+ create mode 100644 sys-utils/blkreport.8
+ create mode 100644 sys-utils/blkreport.c
+ create mode 100644 sys-utils/blkzonecmd.8
+ create mode 100644 sys-utils/blkzonecmd.c
+
 diff --git a/configure.ac b/configure.ac
 index 19d8548..204cee0 100644
 --- a/configure.ac
@@ -14,6 +46,20 @@ index 19d8548..204cee0 100644
  
  AC_CHECK_DECLS([_NL_TIME_WEEK_1STDAY],[],[],[[#include <langinfo.h>]])
  
+diff --git a/debian/changelog b/debian/changelog
+index d1a63dd..93a3641 100644
+--- a/debian/changelog
++++ b/debian/changelog
+@@ -1,3 +1,9 @@
++util-linux (2.20.1-9.1ubuntu20.7+zdm) UNRELEASED; urgency=medium
++
++  * ZDM support.
++
++ -- shaun <shaun@kHack>  Fri, 18 Mar 2016 12:44:05 -0500
++
+ util-linux (2.20.1-5.1ubuntu20.7) trusty; urgency=medium
+ 
+   * Use the correct parameter to index node names. (LP: #1427995)
 diff --git a/include/c.h b/include/c.h
 index d50e4c4..2a317eb 100644
 --- a/include/c.h
@@ -1602,3 +1648,6 @@ index 0000000..6351be6
 +	close(fd);
 +	return EXIT_SUCCESS;
 +}
+-- 
+2.7.0
+
