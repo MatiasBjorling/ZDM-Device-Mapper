@@ -1,0 +1,171 @@
+From 035f028bdfbfaeba28a45885e2615d12d4839f7d Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Tue, 15 Mar 2016 23:33:31 -0500
+Subject: [PATCH 22/23] Stream Id: Use PID to seed Stream Id construction.
+
+Experimental:
+
+Use file open PID and inode's i_no to differentiate seed
+generation streamid when fadvise is not supplied.
+
+Effectivly attempting simulate the effect that stream id may have
+on certain predictable workloads.
+
+Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
+---
+ drivers/md/dm-zoned.c | 12 +++++++++++-
+ fs/ext4/file.c        |  1 +
+ fs/xfs/xfs_aops.c     |  2 +-
+ fs/xfs/xfs_file.c     |  1 +
+ include/linux/fs.h    | 24 +++++++++++++++---------
+ 5 files changed, 29 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/md/dm-zoned.c b/drivers/md/dm-zoned.c
+index 046bf92..d5c12bf 100644
+--- a/drivers/md/dm-zoned.c
++++ b/drivers/md/dm-zoned.c
+@@ -121,8 +121,18 @@ static inline u32 bio_stream(struct bio *bio)
+ 	 * use this heuristic to try to skip unnecessary co-mingling of data.
+ 	 */
+ 
+-	if (bio->bi_rw & REQ_META)
++	if (bio->bi_rw & REQ_META) {
+ 		stream_id = 0xff;
++	} else {
++		unsigned int id = bio_get_streamid(bio);
++
++		/* high 8 bits is hash of PID, low 8 bits is hash of inode# */
++		stream_id = id >> 8;
++		if (stream_id == 0)
++			stream_id++;
++		if (stream_id == 0xff)
++			stream_id--;
++	}
+ 
+ 	return stream_id;
+ }
+diff --git a/fs/ext4/file.c b/fs/ext4/file.c
+index bc313ac..a8e95c3 100644
+--- a/fs/ext4/file.c
++++ b/fs/ext4/file.c
+@@ -260,6 +260,7 @@ static int ext4_file_open(struct inode * inode, struct file * filp)
+ 	char buf[64], *cp;
+ 	int ret;
+ 
++	inode->pid = get_current()->pid;
+ 	if (unlikely(!(sbi->s_mount_flags & EXT4_MF_MNTDIR_SAMPLED) &&
+ 		     !(sb->s_flags & MS_RDONLY))) {
+ 		sbi->s_mount_flags |= EXT4_MF_MNTDIR_SAMPLED;
+diff --git a/fs/xfs/xfs_aops.c b/fs/xfs/xfs_aops.c
+index ba14f61..c0ed78e 100644
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@ -375,7 +375,7 @@ xfs_submit_ioend_bio(
+ 	atomic_inc(&ioend->io_remaining);
+ 	bio->bi_private = ioend;
+ 	bio->bi_end_io = xfs_end_bio;
+-	bio_set_streamid(bio, ioend->io_inode->i_streamid);
++	bio_set_streamid(bio, inode_streamid(ioend->io_inode));
+ 	submit_bio(wbc->sync_mode == WB_SYNC_ALL ? WRITE_SYNC : WRITE, bio);
+ }
+ 
+diff --git a/fs/xfs/xfs_file.c b/fs/xfs/xfs_file.c
+index db4acc1..1fb86c4 100644
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@ -1028,6 +1028,7 @@ xfs_file_open(
+ 		return -EFBIG;
+ 	if (XFS_FORCED_SHUTDOWN(XFS_M(inode->i_sb)))
+ 		return -EIO;
++	inode->pid = get_current()->pid;
+ 	return 0;
+ }
+ 
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 2d2a612..b537b88 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -30,6 +30,7 @@
+ #include <linux/lockdep.h>
+ #include <linux/percpu-rwsem.h>
+ #include <linux/blk_types.h>
++#include <linux/hash.h>
+ 
+ #include <asm/byteorder.h>
+ #include <uapi/linux/fs.h>
+@@ -272,7 +273,7 @@ struct iattr {
+  */
+ #define FILESYSTEM_MAX_STACK_DEPTH 2
+ 
+-/** 
++/**
+  * enum positive_aop_returns - aop return codes with specific semantics
+  *
+  * @AOP_WRITEPAGE_ACTIVATE: Informs the caller that page writeback has
+@@ -282,7 +283,7 @@ struct iattr {
+  * 			    be a candidate for writeback again in the near
+  * 			    future.  Other callers must be careful to unlock
+  * 			    the page if they get this return.  Returned by
+- * 			    writepage(); 
++ * 			    writepage();
+  *
+  * @AOP_TRUNCATED_PAGE: The AOP method that was handed a locked page has
+  *  			unlocked it and the page might have been truncated.
+@@ -676,15 +677,20 @@ struct inode {
+ 	__u32			i_fsnotify_mask; /* all events this inode cares about */
+ 	struct hlist_head	i_fsnotify_marks;
+ #endif
++	pid_t			pid; /* use PID for fallback streamid */
+ 
+ 	void			*i_private; /* fs or device private pointer */
+ };
+ 
+ static inline unsigned int inode_streamid(struct inode *inode)
+ {
+-	if (inode)
+-		return inode->i_streamid;
++	if (inode) {
++		if (inode->i_streamid)
++			return inode->i_streamid;
+ 
++		return ((hash_32(inode->pid, 8) << 8)
++			|hash_32(inode->i_ino, 8));
++	}
+ 	return 0;
+ }
+ 
+@@ -914,10 +920,10 @@ static inline struct file *get_file(struct file *f)
+ 
+ #define	MAX_NON_LFS	((1UL<<31) - 1)
+ 
+-/* Page cache limit. The filesystems should put that into their s_maxbytes 
+-   limits, otherwise bad things can happen in VM. */ 
++/* Page cache limit. The filesystems should put that into their s_maxbytes
++   limits, otherwise bad things can happen in VM. */
+ #if BITS_PER_LONG==32
+-#define MAX_LFS_FILESIZE	(((loff_t)PAGE_CACHE_SIZE << (BITS_PER_LONG-1))-1) 
++#define MAX_LFS_FILESIZE	(((loff_t)PAGE_CACHE_SIZE << (BITS_PER_LONG-1))-1)
+ #elif BITS_PER_LONG==64
+ #define MAX_LFS_FILESIZE 	((loff_t)0x7fffffffffffffffLL)
+ #endif
+@@ -1949,7 +1955,7 @@ int sync_inode_metadata(struct inode *inode, int wait);
+ struct file_system_type {
+ 	const char *name;
+ 	int fs_flags;
+-#define FS_REQUIRES_DEV		1 
++#define FS_REQUIRES_DEV		1
+ #define FS_BINARY_MOUNTDATA	2
+ #define FS_HAS_SUBTYPE		4
+ #define FS_USERNS_MOUNT		8	/* Can be mounted by userns root */
+@@ -2556,7 +2562,7 @@ extern int kernel_read(struct file *, loff_t, char *, unsigned long);
+ extern ssize_t kernel_write(struct file *, const char *, size_t, loff_t);
+ extern ssize_t __kernel_write(struct file *, const char *, size_t, loff_t *);
+ extern struct file * open_exec(const char *);
+- 
++
+ /* fs/dcache.c -- generic fs support functions */
+ extern int is_subdir(struct dentry *, struct dentry *);
+ extern int path_is_under(struct path *, struct path *);
+-- 
+1.9.1
+
