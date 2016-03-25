@@ -36,7 +36,7 @@ provided the required amount of conventional space is available.
 
 ## Software Requirements
 
-  - Current Linux Kernel v4.1 to v.4.4 with ZDM patches
+  - Current Linux Kernel v4.1 to v.4.5 with ZDM patches
   - Recommended: sg3utils (1.41 or later) or sd-tools.
 
 ## Caveat Emptor - Warning
@@ -176,8 +176,8 @@ If not, please see http://www.gnu.org/licenses/.
     * Patches provided to apply cleanly against 4.1 (stable), 4.2, and 4.3.
 
   - ZDM #97
-    * Fix block ata zoned_command (Reset WP). Using wrong psudo constant.
-    * Fix a deadlock when gc_immediate is called from multple threads.
+    * Fix block ata zoned_command (Reset WP). Using wrong psuedo constant.
+    * Fix a deadlock when gc_immediate is called from multiple threads.
 
   - ZDM #101
     * Added Stream Id to manage co-location of data with similar expected lifetimes.
@@ -188,7 +188,7 @@ If not, please see http://www.gnu.org/licenses/.
     * Added read-ahead for LT entries.
     * Removed big io_mutex
     * Added discard extent cache
-    * Enabled discard support for md-raid to be enabled by ZDM block devices.
+    * Enable discard support for md-raid to be enabled by ZDM block devices.
     * Added an experimental prototype hack to use PID as stream id.
     * Changed userspace ioctl to use procfs as ioctl are disabled in v4.4 and later kernels.
 
@@ -210,7 +210,7 @@ If not, please see http://www.gnu.org/licenses/.
     * Bug Fix: Change lazy-drop timeout back to 15s
     
   - ZDM #107
-    * Bug Fix: sync() NULL de-reference bug fix
+    * Bug Fix: sync() NULL dereference bug fix
     
   - ZDM #108
     * Bug Fix: Rework BIO flags, fix zone off-by-1 error when partition is not zone aligned.
