@@ -142,9 +142,6 @@ If not, please see http://www.gnu.org/licenses/.
   - Patches
     * v4.2 [ZDM r108 patches for linux v4.2](/patches/linux/v4.2+ZDM-r108)
     * v4.5 [ZDM r108 patches for linux v4.5](/patches/linux/v4.5+ZDM-r108)
-  - Linux kernel with ZDM patches applied.
-    * v4.2 https://seagit.okla.seagate.com/ZDM-Release/zdm-kernel/tree/v4.2+ZDM-r108
-    * v4.5 https://seagit.okla.seagate.com/ZDM-Release/zdm-kernel/tree/v4.5+ZDM-r108
 
 ## Observations and Known Issues in this release (#108)
 
