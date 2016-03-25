@@ -538,6 +538,7 @@ int ZonesWidget::updateView(int zoom)
 
 void ZonesWidget::doDrawZones(QPainter& painter, QRect& area)
 {
+    QColor recalc    (0x1f, 0x4f, 0x8f);
     QColor gc_ready  (0x1f, 0x4f, 0x8f);
     QColor gc_target (0x1f, 0xcf, 0x00);
     QColor gc_active (0x00, 0xcf, 0xff);
@@ -634,6 +635,18 @@ void ZonesWidget::doDrawZones(QPainter& painter, QRect& area)
                 else if  ( Z_WP_NON_SEQ & wp )
                 {
                     usage = non_seq;
+                }
+                else if  ( Z_WP_RESV_01 & wp ) /* RECALC */
+                {
+                    usage = recalc;
+                }
+                else if  ( Z_WP_RESV_02 & wp )
+                {
+                    usage = gc_ready;
+                }
+                else if  ( Z_WP_RESV_03 & wp )
+                {
+                    usage = gc_ready;
                 }
                 else
                 {

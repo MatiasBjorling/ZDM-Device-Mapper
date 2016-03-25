@@ -229,8 +229,20 @@ static void usage(void)
 	       sdtools_VERSION_MAJOR, sdtools_VERSION_MINOR );
 
 	printf("Usage:\n");
-	printf("  " PGM_NAME " [ata] [<lba>] <device>\n");
+	printf("  " PGM_NAME " [-r opt] [ata] [<lba>] <device>\n");
 	printf("\nwhere:\n"
+	       "    opt is the numeric value from \"enum zone_report_option\".\n"
+	       "             0 - non seq. and reset (default)\n"
+	       "             1 - empty\n"
+	       "             2 - open implicit\n"
+	       "             3 - open explicit\n"
+	       "             4 - closed\n"
+	       "             5 - full\n"
+	       "             6 - read only\n"
+	       "             7 - offline\n"
+	       "          0x10 - reset\n"
+	       "          0x11 - non sequential\n"
+	       "          0x3f - non write pointer zones\n"
 	       "    ata will cause ATA ZAC commands to be used.\n"
 	       "        default is to use SCSI ZBC commands\n"
 	       "    lba default value is 0\n"
@@ -259,6 +271,8 @@ int main(int argc, char *argv[])
 	while ((opt = getopt(argc, argv, "r:")) != -1) {
 		switch (opt) {
 		case 'r': /* old option not used here */
+			ropt = strtol(optarg, NULL, 0);
+			break;
 		default:
 			usage();
 			return 1;

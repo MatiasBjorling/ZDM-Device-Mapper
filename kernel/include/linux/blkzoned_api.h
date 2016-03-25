@@ -19,6 +19,7 @@
 extern int blkdev_issue_zone_action(struct block_device *, unsigned long bi_rw,
 				    sector_t, gfp_t);
 extern int blkdev_issue_zone_report(struct block_device *, unsigned long bi_rw,
-				    sector_t, u8 opt, void *, size_t, gfp_t);
+				    sector_t, u8 opt, struct page *, size_t,
+				    gfp_t);
 
 #endif /* _BLKZONED_API_H */

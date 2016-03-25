@@ -22,6 +22,7 @@
 #define DEBUG 1
 
 #include <utypes.h>
+#include <linux/blkzoned_api.h>
 #include <linux/blk-zoned-ctrl.h>
 
 /* Used for Zone based SMR devices */

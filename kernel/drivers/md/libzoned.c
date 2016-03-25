@@ -12,7 +12,7 @@
  * warranty of any kind, whether express or implied.
  */
 
-#define BUILD_NO		106
+#define BUILD_NO		108
 
 #define EXTRA_DEBUG		0
 #define ENABLE_PG_FREE_VIA_LAZY	1
@@ -43,7 +43,8 @@
  *   A? Does not seem to ...
  */
 #define GC_MAX_STRIPE		256
-#define REPORT_BUFFER		65 /* 65 -> min # pages for 4096 descriptors */
+#define REPORT_ORDER		7
+#define REPORT_FILL_PGS		65 /* 65 -> min # pages for 4096 descriptors */
 #define SYNC_IO_ORDER		2
 #define SYNC_IO_SZ		((1 << SYNC_IO_ORDER) * PAGE_SIZE)
 
@@ -83,7 +84,7 @@ static void meta_work_task(struct work_struct *work);
 static u64 mcache_greatest_gen(struct zoned *, int, u64 *, u64 *);
 static u64 mcache_find_gen(struct zoned *, u64 base, int, u64 *out);
 static int find_superblock(struct zoned *znd, int use_wq, int do_init);
-static int sync_mapped_pages(struct zoned *znd, int sync, int *drop);
+static int sync_mapped_pages(struct zoned *znd, int sync, int drop);
 static int unused_phy(struct zoned *znd, u64 lba, u64 orig_s, gfp_t gfp);
 static struct io_4k_block *get_io_vcache(struct zoned *znd, gfp_t gfp);
 static int put_io_vcache(struct zoned *znd, struct io_4k_block *cache);
@@ -3170,14 +3171,12 @@ static int do_sync_metadata(struct zoned *znd, int sync, int drop)
 	if (want_flush)
 		set_bit(DO_FLUSH, &znd->flags);
 
-	err = sync_mapped_pages(znd, sync, &drop);
+	/* if drop is non-zero, DO_FLUSH may be set on return */
+	err = sync_mapped_pages(znd, sync, drop);
 	if (err) {
 		Z_ERR(znd, "Uh oh: sync_mapped_pages -> %d", err);
 		goto out;
 	}
-
-	if (drop)
-		set_bit(DO_FLUSH, &znd->flags);
 
 	/*
 	 * If we are lucky then this sync will get us to a 'clean'
@@ -6472,17 +6471,15 @@ out_queued:
  * @znd: ZDM instance
  * @bit_type: MAP blocks then CRC blocks.
  * @sync: If true write dirty blocks to disk
- * @_drop: IN: Number of ZLT blocks to free.
- *        OUT: Number of (clean) blocks removed tha are not FLUSH flagged.
+ * @drop: Number of ZLT blocks to free.
  *
  * Return: 0 on success or -errno value
  */
-static int _sync_dirty(struct zoned *znd, int bit_type, int sync, int *_drop)
+static int _sync_dirty(struct zoned *znd, int bit_type, int sync, int drop)
 {
 	int err = 0;
 	int entries = 0;
 	int want_flush = 0;
-	int drop = *_drop;
 	struct map_pg *expg = NULL;
 	struct map_pg *_tpg;
 	struct map_pg **wset = NULL;
@@ -6590,7 +6587,8 @@ writeback:
 	}
 
 out:
-	*_drop = want_flush;
+	if (want_flush)
+		set_bit(DO_FLUSH, &znd->flags);
 	if (!list_empty(&droplist))
 		lazy_pool_splice(znd, &droplist);
 
@@ -6605,11 +6603,11 @@ out:
  * @znd: ZDM instance
  * @bit_type: MAP blocks then CRC blocks.
  * @sync: Write dirty blocks
- * @drop: In # of pages to free. Out # freed.
+ * @drop: IN: # of pages to free.
  *
  * Return: 0 on success or -errno value
  */
-static int sync_dirty(struct zoned *znd, int bit_type, int sync, int *drop)
+static int sync_dirty(struct zoned *znd, int bit_type, int sync, int drop)
 {
 	int err;
 
@@ -6634,10 +6632,10 @@ static int sync_dirty(struct zoned *znd, int bit_type, int sync, int *drop)
  *
  * Return: 0 on success or -errno value
  */
-static int sync_mapped_pages(struct zoned *znd, int sync, int *drop)
+static int sync_mapped_pages(struct zoned *znd, int sync, int drop)
 {
 	int err;
-	int remove = 0;
+	int remove = drop ? 1 : 0;
 
 	err = sync_dirty(znd, IS_LUT, sync, drop);
 
@@ -6645,7 +6643,8 @@ static int sync_mapped_pages(struct zoned *znd, int sync, int *drop)
 	if (err < 0)
 		return err;
 
-	err = sync_dirty(znd, IS_CRC, sync, &remove);
+	/* TBD: purge CRC's on ref-count? */
+	err = sync_dirty(znd, IS_CRC, sync, remove);
 
 	return err;
 }

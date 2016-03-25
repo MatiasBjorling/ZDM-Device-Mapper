@@ -91,7 +91,8 @@ void print_status(struct zdm_ioc_status * status, int sram)
     printf("   b_available  %'" PRIu64 "\n", status->b_available );
     printf("   b_discard    %'" PRIu64 "\n", status->b_discard );
     printf("   m_zones      %'" PRIu64 "\n", status->m_zones );
-    printf("   mc_entries   %'" PRIu64 "\n", status->mc_entries );
+    printf("   mc_entries   %'" PRIu32 "\n", status->mc_entries );
+    printf("   dc_entries   %'" PRIu32 "\n", status->dc_entries );
     printf("   mlut_blocks  %'" PRIu64 "\n", status->mlut_blocks );
     printf("   crc_blocks   %'" PRIu64 "\n", status->crc_blocks );
 

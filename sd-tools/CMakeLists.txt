@@ -14,7 +14,7 @@ else (EXISTS /usr/include/linux/blk-zoned-ctrl.h)
 endif (EXISTS /usr/include/linux/blk-zoned-ctrl.h)
 
 set (sdtools_VERSION_MAJOR 1)
-set (sdtools_VERSION_MINOR 1)
+set (sdtools_VERSION_MINOR 4)
 
 # configure a header file to pass some of the CMake settings
 # to the source code
@@ -31,18 +31,23 @@ add_executable(sd_reset_wp     sd_reset_wp/sd_reset_wp.c    sd_reset_wp/is_mount
 add_executable(sd_zone_finish  sd_reset_wp/sd_zone_finish.c sd_reset_wp/is_mounted.c)
 add_executable(sd_zone_close   sd_reset_wp/sd_zone_close.c  sd_reset_wp/is_mounted.c)
 add_executable(sd_zone_open    sd_reset_wp/sd_zone_open.c   sd_reset_wp/is_mounted.c)
+add_executable(ext4_ioctl      ext4_ioctl/ext4_ioctl.c)
 add_executable(sd_identify     sd_identify/sd_identify.c)
 add_executable(sd_report_zones sd_report_zones/sd_report_zones.c)
-add_executable(blkreport       sd_report_zones/blkreport.c)
+add_executable(sd_blkreport    sd_report_zones/sd_blkreport.c)
+add_executable(sg-reset-wp     sg-reset-wp/sg-reset-wp.cpp)
+add_executable(fileio          fileio/fileio.cpp)
 
 install(TARGETS
             sd_reset_wp
             sd_zone_finish
             sd_zone_close
             sd_zone_open
+            ext4_ioctl
             sd_identify
             sd_report_zones
-            blkreport
+            sd_blkreport
+            sg-reset-wp
         RUNTIME DESTINATION bin
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib)

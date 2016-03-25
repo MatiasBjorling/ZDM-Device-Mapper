@@ -1,0 +1,26 @@
+From 67619aa443ed322d39ca3ba4b18d533445785d98 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@fb.com>
+Date: Wed, 25 Mar 2015 08:32:23 -0600
+Subject: [PATCH 11/23] ext4: add support for write stream IDs
+
+Cc: Theodore Ts'o <tytso@mit.edu>
+Signed-off-by: Jens Axboe <axboe@fb.com>
+---
+ fs/ext4/page-io.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/fs/ext4/page-io.c b/fs/ext4/page-io.c
+index 090b349..1973a5d 100644
+--- a/fs/ext4/page-io.c
++++ b/fs/ext4/page-io.c
+@@ -403,6 +403,7 @@ submit_and_retry:
+ 		ret = io_submit_init_bio(io, bh);
+ 		if (ret)
+ 			return ret;
++		bio_set_streamid(io->io_bio, inode_streamid(inode));
+ 	}
+ 	ret = bio_add_page(io->io_bio, page, bh->b_size, bh_offset(bh));
+ 	if (ret != bh->b_size)
+-- 
+1.9.1
+

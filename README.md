@@ -140,18 +140,16 @@ If not, please see http://www.gnu.org/licenses/.
 ## ZDM Linux Kernel
 
   - Patches
-    * v4.2 [ZDM r101 patches for linux v4.2](/patches/linux/v4.2+ZDM-r106)
-    * v4.5 [ZDM r103 patches for linux v4.4](/patches/linux/v4.4+ZDM-r106)
+    * v4.5 [ZDM r108 patches for linux v4.4](/patches/linux/v4.4+ZDM-r108)
   - Linux kernel with ZDM patches applied.
-    * v4.2 https://seagit.okla.seagate.com/ZDM-Release/zdm-kernel/tree/v4.2+ZDM-r106
-    * v4.5 https://seagit.okla.seagate.com/ZDM-Release/zdm-kernel/tree/v4.4+ZDM-r106
+    * v4.5 https://seagit.okla.seagate.com/ZDM-Release/zdm-kernel/tree/v4.4+ZDM-r108
 
 ## Observations and Known Issues in this release (#106)
 
   - Bug: Write back of metadata could cause inconsistency in case of sudden power loss between SYNC's
-     * Fix is planned for #107.
+     * Fix is planned for #109.
   - Bug: GC can deadlock when GC emergency reserves are depleted.
-     * Fix is planned for #107.
+     * Fix is planned for #109.
 
 ## Changes from Initial Release
 
@@ -208,3 +206,10 @@ If not, please see http://www.gnu.org/licenses/.
 
   - ZDM #106
     * Bug Fix: Change lazy-drop timeout back to 15s
+    
+  - ZDM #107
+    * Bug Fix: sync() NULL de-reference bug fix
+    
+  - ZDM #108
+    * Bug Fix: Rework BIO flags, fix zone off-by-1 error when partition is not zone aligned.
+    

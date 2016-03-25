@@ -216,5 +216,6 @@ struct bdev_zone_report_io {
 #define BLKREPORT	_IOWR(0x12, 130, struct bdev_zone_report_io)
 #define BLKOPENZONE	_IO(0x12, 131)
 #define BLKCLOSEZONE	_IO(0x12, 132)
+#define BLKRESETZONE	_IO(0x12, 133)
 
 #endif /* _UAPI_BLKZONED_API_H */

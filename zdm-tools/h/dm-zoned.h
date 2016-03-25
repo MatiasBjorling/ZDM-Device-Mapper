@@ -644,7 +644,8 @@ struct zdm_ioc_status {
 	u64 b_available;
 	u64 b_discard;
 	u64 m_zones;
-	u64 mc_entries;
+	u32 mc_entries;
+	u32 dc_entries;
 	u64 mlut_blocks;
 	u64 crc_blocks;
 	u64 memstat;

@@ -82,7 +82,7 @@ static int dmz_open_zone(struct zoned *znd, u64 z_id);
 static int dmz_close_zone(struct zoned *znd, u64 z_id);
 static u32 dmz_report_count(struct zoned *znd, void *report, size_t bufsz);
 static int dmz_report_zones(struct zoned *znd, u64 z_id,
-			    struct bdev_zone_report *report, size_t bufsz);
+			    struct page *pgs, size_t bufsz);
 static void activity_timeout(unsigned long data);
 static void zoned_destroy(struct zoned *);
 static int gc_can_cherrypick(struct zoned *znd, u32 sid, int delay, gfp_t gfp);
@@ -200,17 +200,22 @@ struct zone_action {
 static void do_zone_action_work(struct work_struct *work)
 {
 	struct zone_action *za = container_of(work, struct zone_action, work);
+	struct zoned *znd = za->znd;
+	struct block_device *bdev = znd->dev->bdev;
+	const gfp_t gfp = GFP_KERNEL;
 
-	za->wp_err = blkdev_issue_zone_action(za->znd->dev->bdev,
-					      za->bi_rw, za->s_addr,
-					      GFP_KERNEL);
+	/* Explictly work on device lbas not partition offsets. */
+	if (bdev != bdev->bd_contains)
+		bdev = bdev->bd_contains;
+
+	za->wp_err = blkdev_issue_zone_action(bdev, za->bi_rw, za->s_addr, gfp);
 }
 
 /**
  * dmz_zone_action() - Issue a 'zone action' to the backing device (via worker).
  * @znd: ZDM Instance
  * @z_id: Zone # to open.
- * @rw: One of REQ_OPEN_ZONE, REQ_CLOSE_ZONE, or REQ_DISCARD.
+ * @rw: One of REQ_OPEN_ZONE, REQ_CLOSE_ZONE, or REQ_RESET_ZONE.
  *
  * Return: 0 on success, otherwise error.
  */
@@ -222,16 +227,15 @@ static int dmz_zone_action(struct zoned *znd, u64 z_id, unsigned long rw)
 		return wp_err;
 
 	if (znd->bdev_is_zoned) {
-		u64 z_offset = z_id + znd->zdstart;
+		u64 z_offset = zone_to_sector(z_id + znd->zdstart);
 		struct zone_action za = {
 			.znd = znd,
 			.bi_rw = rw,
-			.s_addr = zone_to_sector(z_offset),
+			.s_addr = z_offset,
 			.wp_err = 0,
 		};
 		if (znd->ata_passthrough)
-			za.bi_rw |= REQ_PRIO;
-
+			za.bi_rw |= REQ_META;
 		/*
 		 * Issue the synchronous I/O from a different thread
 		 * to avoid generic_make_request recursion.
@@ -243,7 +247,7 @@ static int dmz_zone_action(struct zoned *znd, u64 z_id, unsigned long rw)
 		wp_err = za.wp_err;
 
 		if (wp_err) {
-			Z_ERR(znd, "Open Zone: LBA: %" PRIx64
+			Z_ERR(znd, "Zone Cmd: LBA: %" PRIx64
 			      " [Z:%" PRIu64 "] -> %d failed.",
 			      za.s_addr, z_id, wp_err);
 			Z_ERR(znd, "ZAC/ZBC support disabled.");
@@ -263,7 +267,7 @@ static int dmz_zone_action(struct zoned *znd, u64 z_id, unsigned long rw)
  */
 static int dmz_reset_wp(struct zoned *znd, u64 z_id)
 {
-	return dmz_zone_action(znd, z_id, REQ_DISCARD);
+	return dmz_zone_action(znd, z_id, REQ_RESET_ZONE);
 }
 
 /**
@@ -277,7 +281,6 @@ static int dmz_open_zone(struct zoned *znd, u64 z_id)
 {
 	if (!znd->issue_open_zone)
 		return 0;
-
 	return dmz_zone_action(znd, z_id, REQ_OPEN_ZONE);
 
 }
@@ -293,7 +296,6 @@ static int dmz_close_zone(struct zoned *znd, u64 z_id)
 {
 	if (!znd->issue_close_zone)
 		return 0;
-
 	return dmz_zone_action(znd, z_id, REQ_CLOSE_ZONE);
 }
 
@@ -339,22 +341,24 @@ static u32 dmz_report_count(struct zoned *znd, void *rpt_in, size_t bufsz)
  * Return: -ENOTSUPP or 0 on success
  */
 static int dmz_report_zones(struct zoned *znd, u64 z_id,
-			    struct bdev_zone_report *report, size_t bufsz)
+			    struct page *pgs, size_t bufsz)
 {
 	int wp_err = -ENOTSUPP;
 
 	if (znd->bdev_is_zoned) {
 		u8  opt = ZOPT_NON_SEQ_AND_RESET;
 		unsigned long bi_rw = 0;
-		u64 s_addr = (z_id + znd->zdstart) << 19;
+		struct block_device *bdev = znd->dev->bdev;
+		u64 s_addr = zone_to_sector(z_id + znd->zdstart);
+
+		if (bdev != bdev->bd_contains)
+			s_addr -= znd->start_sect << Z_SHFT4K;
 
 		if (znd->ata_passthrough)
-			bi_rw = REQ_PRIO;
+			bi_rw = REQ_META;
 
-		wp_err = blkdev_issue_zone_report(znd->dev->bdev, bi_rw, s_addr,
-						  opt, report, bufsz,
-						  GFP_KERNEL);
-
+		wp_err = blkdev_issue_zone_report(bdev, bi_rw, s_addr, opt,
+						  pgs, bufsz, GFP_KERNEL);
 		if (wp_err) {
 			Z_ERR(znd, "Report Zones: LBA: %" PRIx64
 			      " [Z:%" PRIu64 " -> %d failed.",
@@ -444,8 +448,12 @@ static int zoned_wp_sync(struct zoned *znd, int reset_non_empty)
 	int rcode = 0;
 	u32 rcount = 0;
 	u32 iter;
-	size_t bufsz = REPORT_BUFFER * Z_C4K;
-	struct bdev_zone_report *report = kmalloc(bufsz, GFP_KERNEL);
+	struct bdev_zone_report *report = NULL;
+	int order = REPORT_ORDER;
+	size_t bufsz = REPORT_FILL_PGS * Z_C4K;
+	struct page *pgs = alloc_pages(GFP_KERNEL, order);
+	if (pgs)
+		report = page_address(pgs);
 
 	if (!report) {
 		rcode = -ENOMEM;
@@ -463,7 +471,7 @@ static int zoned_wp_sync(struct zoned *znd, int reset_non_empty)
 		u32 wp;
 
 		if (entry == 0) {
-			int err = dmz_report_zones(znd, iter, report, bufsz);
+			int err = dmz_report_zones(znd, iter, pgs, bufsz);
 
 			if (err) {
 				Z_ERR(znd, "report zones-> %d", err);
@@ -479,7 +487,7 @@ static int zoned_wp_sync(struct zoned *znd, int reset_non_empty)
 			int err = 0;
 
 			if (!is_zone_reset(dentry))
-				err = dmz_reset_wp(znd, gzoff);
+				err = dmz_reset_wp(znd, iter);
 
 			if (err) {
 				Z_ERR(znd, "reset wp-> %d", err);
@@ -518,7 +526,8 @@ static int zoned_wp_sync(struct zoned *znd, int reset_non_empty)
 	}
 
 out:
-	kfree(report);
+	if (pgs)
+		__free_pages(pgs, order);
 
 	return rcode;
 }

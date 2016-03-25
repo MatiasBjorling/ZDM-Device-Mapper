@@ -175,8 +175,9 @@ static void zdmadm_show(const char * dname, zdm_super_block_t *sblk)
 		printf("label   - %s\n", sblk->label );
 	}
 	printf("start   - %"PRIu64"\n", sblk->sect_start);
-	printf("data    - %"PRIu64" [zone %" PRIu64 "]\n",
-		sblk->data_start * sblk->zone_size, sblk->data_start);
+	printf("data    - %"PRIx64" [zone %" PRIu64 " @ %"PRIx64"]\n",
+		sblk->data_start * sblk->zone_size,
+		sblk->data_start, sblk->data_start << 16);
 	printf("size    - %"PRIu64"\n", sblk->sect_size);
 	printf("zdm sz  - %"PRIu64"\n", sblk->zdm_blocks);
 	printf("resv    - %u [%u: metadata + %u: over provision]\n",
@@ -513,7 +514,7 @@ printf("Loading %"PRIx64 " ?? \n", lba );
 			if (!mapped->mdata) {
 				int err;
 				err = zdm_mentry_page(megaz, mapped, dm_s, is_to);
-                                if (err < 0) {
+				if (err < 0) {
 					printf("Repair failed dm_s %" PRIx64
 						" Err %d.\n", dm_s, err );
 					goto out;
@@ -545,7 +546,7 @@ printf("Loading %"PRIx64 " ?? \n", lba );
 			if (!mapped->mdata) {
 				int err;
 				err = zdm_mentry_page(megaz, mapped, lba, 0);
-                                if (err < 0) {
+				if (err < 0) {
 					printf("Repair failed lba %" PRIx64
 						" Err %d.\n", lba, err );
 					goto out;
@@ -846,6 +847,18 @@ static inline int is_conv_or_relaxed(unsigned int type)
 }
 
 /* assuming 4k sectors aka ssize < 16TB */
+/**
+ * Here we attempt to report the amount of metadata we need to reserve
+ * @ssize: Total size of partition.
+ * @zonesz: Size of zones (256MiB)
+ * @mzc: # of zones needed for Forward Lookup Tables.
+ * @cache: # of blocks needed for super block and accounting/journaling etc.
+ * @min: # Minimum reservation [FWD Lookup + cache (sized at 1 zone)]
+ * @pref: # FWD/REV + CRC blks (in zones) + cache blocks (in zones).
+ *
+ * NOTE: cache blocks and CRC blocks are rounded up and reported as # of zones.
+ * 
+ */
 static int minimums(u64 ssize, u64 zonesz, u64 *mzc, u64 * cache, u64 * min, u64 * pref)
 {
 	u64 zonesz_4k   = zonesz / 8;
@@ -857,13 +870,13 @@ static int minimums(u64 ssize, u64 zonesz, u64 *mzc, u64 * cache, u64 * min, u64
 
 	*mzc = lut_zones;
 	*cache = cache_syncs;
-	*min = lut_zones + 1;
+	*min = lut_zones + 1; /* forward LUT + Super block [Z0] reservation */
 	*pref = (lut_zones * 2) + 2; /* cache(1) + fwd(N) + rev(N) + crcs(1) */
 
 	return 0;
 }
 
-int zdmadm_probe_zones(int fd, zdm_super_block_t * sblk)
+int zdmadm_probe_zones(int fd, zdm_super_block_t * sblk, int verbose)
 {
 	int rcode = 0;
 	size_t size = 128 * 4096;
@@ -879,6 +892,7 @@ int zdmadm_probe_zones(int fd, zdm_super_block_t * sblk)
 			printf("report zones failure: %d\n", rcode);
 		} else  {
 			int zone = 0;
+			int zone_absolute_start = 0;
 			struct bdev_zone_report *info = &report->data.out;
 			struct bdev_zone_descriptor *entry = &info->descriptors[zone];
 			int is_be = zdm_is_big_endian_report(info);
@@ -896,19 +910,48 @@ int zdmadm_probe_zones(int fd, zdm_super_block_t * sblk)
 				rcode = -1;
 				goto out;
 			}
-
-			while (sblk->sect_start >= fz_at) {
+			zone_absolute_start = fz_at / fz_sz;
+			if (verbose) {
+				printf("LBA start of first zone: %6" PRIx64 " Z# %d\n", fz_at, zone);
+				printf("LBA start of partition:  %6" PRIx64 "\n", sblk->sect_start);
+				printf("LBA partition is in zone #%d\n", zone_absolute_start);
+				printf(" ... Min cache needed before data starts: %" PRIx64 "\n", (cache * 8));
+			}
+			while (fz_at < sblk->sect_start) {
+				if (verbose)
+					printf("Finding first zone *AFTER START OF PARTITION*\n");
 				entry = &info->descriptors[++zone];
 				fz_at = is_be ? be64toh(entry->lba_start) : entry->lba_start;
 				fz_sz = is_be ? be64toh(entry->length) : entry->length;
 			}
-
-			if ( (fz_at - sblk->sect_start) > (cache * 8) ) {
- 				printf("Using non-aligned space start of partition for metadata.\n");
-				mdzcount++;
-				zone++;
+			if (verbose) {
+				printf("LBA start of first zone: %6" PRIx64 " Z# %d\n", fz_at, zone);
+				printf("LBA start of partition:  %6" PRIx64 "\n", sblk->sect_start);
+				printf(" ... Min cache needed before data starts: %" PRIx64 "\n", (cache * 8));
+			}
+			while (sblk->sect_start >= fz_at) {
+				if (verbose)
+					printf("Skipping forward\n");
+				entry = &info->descriptors[++zone];
+				fz_at = is_be ? be64toh(entry->lba_start) : entry->lba_start;
+				fz_sz = is_be ? be64toh(entry->length) : entry->length;
+			}
+			if (verbose) {
+				printf("LBA start of first zone: %6" PRIx64 " Z# %d\n", fz_at, zone);
+				printf("LBA start of partition:  %6" PRIx64 "\n", sblk->sect_start);
 			}
 
+
+// printf("Using non-aligned space start of partition for metadata.*\n");
+
+
+			if ((fz_at - sblk->sect_start) > (cache * 8))
+				mdzcount++; /* really pref-- */
+
+			/*
+			 * using an 'Sanity' cut off of 200.
+			 * This is probably just paranoia and could be removed.
+			 */
 			for (; mdzcount < pref && zone < 200; zone++) {
 				u64 length;
 
@@ -930,7 +973,7 @@ int zdmadm_probe_zones(int fd, zdm_super_block_t * sblk)
 				}
 				mdzcount++;
 			}
-			sblk->data_start = zone;
+			sblk->data_start = zone + zone_absolute_start;
 			sblk->zone_size = fz_sz;
 		}
 	}
@@ -997,7 +1040,7 @@ int zdmadm_initmd(int fd, zdm_super_block_t * sblk, int use_force, int verbose)
 		       " zone-alignment\n", pool_lba);
 	}
 
-	printf(" ... clearing %" PRIu64 " pool zones from %"
+	printf(" ... clearing %" PRIu64 " ZTL zones from %"
 		PRIx64 " - %" PRIx64 "\n",
 		pref - 2, pool_lba, pool_lba + ((pref - 2) << 16) );
 
@@ -1006,12 +1049,12 @@ int zdmadm_initmd(int fd, zdm_super_block_t * sblk, int use_force, int verbose)
 	if ( (pref - mdzcount) <= sblk->data_start) {
 		locations *= 2;
 		if (verbose)
-			printf(" ... including reverse pool zones\n");
+			printf(" ... including reverse ZTL zones\n");
 	}
 
 	printf(" ... %d writes of %d 4k blocks [%ld bytes]\n",
 		locations, IO_VCACHE_PAGES, wchunk);
-
+	printf("         lba of partition | drive\n");
 	lba = pool_lba;
 	for (iter = 0; iter < locations; iter++) {
 		rc = pwrite64(fd, io_vcache, wchunk, lba << 12);
@@ -1021,7 +1064,8 @@ int zdmadm_initmd(int fd, zdm_super_block_t * sblk, int use_force, int verbose)
 		}
 
 		if (0 == (iter % 256)) {
-			printf("    ... writing .. %" PRIx64 "\n", lba );
+			printf("    ... writing .. %6"PRIx64" | %6"PRIx64"\n",
+				lba, lba + (sblk->sect_start >> 3));
 		}
 
 		lba += IO_VCACHE_PAGES;
@@ -1031,8 +1075,11 @@ int zdmadm_initmd(int fd, zdm_super_block_t * sblk, int use_force, int verbose)
 		__le16 crc;
 		__le16 *crcs = data;
 
-		printf(" ... inititalize Meta CRCs %" PRIx64 " - %" PRIx64 "\n",
+		printf(" ... inititalize Meta CRCs %6"PRIx64" - %6"PRIx64"\n",
 			lba, lba + (0x40 * mz_count));
+		printf(" ...              absolute %6"PRIx64" - %6"PRIx64"\n",
+			lba + (sblk->sect_start >> 3),
+			lba + (0x40 * mz_count) + (sblk->sect_start >> 3));
 
 		memset(data, 0xFF, Z_C4K);
 		crc = crc_md_le16(data, Z_CRC_4K);
@@ -1375,7 +1422,7 @@ int zdmadm_probe_default(const char * dname, int fd, zdm_super_block_t * sblk,
 
 	if (sblk->zac_zbc) {
 		/* test 'size' for sanity */
-		if (zdmadm_probe_zones(fd, sblk) < 0) {
+		if (zdmadm_probe_zones(fd, sblk, verbose) < 0) {
 			exCode = 4;
 			goto out;
 		}
@@ -1597,7 +1644,6 @@ int main(int argc, char *argv[])
 
 				/* closes fd before
 				 * starting ZDM instance */
-
 				exCode = zdmadm_restore(dname, fd, &sblk);
 				if (exCode < 0) {
 					printf("ZDM Restore failed.\n");
@@ -1649,12 +1695,10 @@ int main(int argc, char *argv[])
 						dname);
 					goto next;
 				}
-
 				if (use_force) {
 					close(fd);
 					fd = open(dname, O_RDWR);
 				}
-
 				exCode = zdmadm_check(dname, fd, &sblk, use_force);
 				if (exCode < 0) {
 					printf("ZDM check failed.\n");
@@ -1695,5 +1739,3 @@ next:
 out:
 	return exCode;
 }
-
-

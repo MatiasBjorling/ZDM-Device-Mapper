@@ -12163,7 +12163,7 @@ W:	http://seagate.com
 W:	https://github.com/Seagate/ZDM-Device-Mapper
 L:	linux-block@vger.kernel.org
 S:	Maintained
-F:      include/linux/blkzoned_api.h
+F:	include/linux/blkzoned_api.h
 F:	include/uapi/linux/blkzoned_api.h
 
 ZBUD COMPRESSED PAGE ALLOCATOR

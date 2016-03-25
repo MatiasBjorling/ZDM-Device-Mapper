@@ -200,16 +200,18 @@ static int blk_zoned_report_ioctl(struct block_device *bdev, fmode_t mode,
 		void __user *parg)
 {
 	int error = -EFAULT;
-	int gfp = GFP_KERNEL|GFP_DMA;
+	gfp_t gfp = GFP_KERNEL;
 	struct bdev_zone_report_io *zone_iodata = NULL;
-	u32 alloc_size = max(PAGE_SIZE, sizeof(*zone_iodata));
+	int order = 0;
+	struct page * pgs = NULL;
+	u32 alloc_size = PAGE_SIZE;
 	unsigned long bi_rw = 0;
 	u8 opt = 0;
 
 	if (!(mode & FMODE_READ))
 		return -EBADF;
 
-	zone_iodata = kmalloc(alloc_size, gfp);
+	zone_iodata = (void *)get_zeroed_page(gfp);
 	if (!zone_iodata) {
 		error = -ENOMEM;
 		goto report_zones_out;
@@ -219,16 +221,23 @@ static int blk_zoned_report_ioctl(struct block_device *bdev, fmode_t mode,
 		goto report_zones_out;
 	}
 	if (zone_iodata->data.in.return_page_count > alloc_size) {
-		void *tmp;
+		int npages;
 
 		alloc_size = zone_iodata->data.in.return_page_count;
-		if (alloc_size < KMALLOC_MAX_SIZE) {
-			tmp = krealloc(zone_iodata, alloc_size, gfp);
-			if (!tmp) {
+		npages = (alloc_size + PAGE_SIZE - 1) / PAGE_SIZE;
+		order =  ilog2(roundup_pow_of_two(npages));
+		pgs = alloc_pages(gfp, order);
+		if (pgs) {
+			void *mem = page_address(pgs);
+
+			if (!mem) {
 				error = -ENOMEM;
 				goto report_zones_out;
 			}
-			zone_iodata = tmp;
+			memset(mem, 0, alloc_size);
+			memcpy(mem, zone_iodata, sizeof(*zone_iodata));
+			free_page((unsigned long)zone_iodata);
+			zone_iodata = mem;
 		} else {
 			/* Result requires DMA capable memory */
 			pr_err("Not enough memory available for request.\n");
@@ -238,11 +247,12 @@ static int blk_zoned_report_ioctl(struct block_device *bdev, fmode_t mode,
 	}
 	opt = zone_iodata->data.in.report_option & 0x7F;
 	if (zone_iodata->data.in.report_option & ZOPT_USE_ATA_PASS)
-		bi_rw = REQ_PRIO;
+		bi_rw |= REQ_META;
 
 	error = blkdev_issue_zone_report(bdev, bi_rw,
 			zone_iodata->data.in.zone_locator_lba, opt,
-			zone_iodata, alloc_size, GFP_KERNEL);
+			pgs ? pgs : virt_to_page(zone_iodata),
+			alloc_size, GFP_KERNEL);
 
 	if (error)
 		goto report_zones_out;
@@ -251,7 +261,10 @@ static int blk_zoned_report_ioctl(struct block_device *bdev, fmode_t mode,
 		error = -EFAULT;
 
 report_zones_out:
-	kfree(zone_iodata);
+	if (pgs)
+		__free_pages(pgs, order);
+	else if (zone_iodata)
+		free_page((unsigned long)zone_iodata);
 	return error;
 }
 
@@ -262,6 +275,15 @@ static int blk_zoned_action_ioctl(struct block_device *bdev, fmode_t mode,
 
 	if (!(mode & FMODE_WRITE))
 		return -EBADF;
+
+	/*
+	 * When acting on zones we explicitly disallow using a partition.
+	 */
+	if (bdev != bdev->bd_contains) {
+		pr_err("%s: All zone operations disallowed on this device\n",
+			__func__);
+		return -EFAULT;
+	}
 
 	/*
 	 * When the low bit is set force ATA passthrough try to work around
@@ -275,7 +297,7 @@ static int blk_zoned_action_ioctl(struct block_device *bdev, fmode_t mode,
 	 *     device....
 	 */
 	if (arg & 1) {
-		bi_rw = REQ_PRIO;
+		bi_rw |= REQ_META;
 		if (arg != ~0ul)
 			arg &= ~1ul; /* ~1 :: 0xFF...FE */
 	} else {
@@ -283,18 +305,27 @@ static int blk_zoned_action_ioctl(struct block_device *bdev, fmode_t mode,
 			arg = ~0ul;
 	}
 
+	/*
+	 * When acting on zones we explicitly disallow using a partition.
+	 */
+	if (bdev != bdev->bd_contains) {
+		pr_err("%s: All zone operations disallowed on this device\n",
+			__func__);
+		return -EFAULT;
+	}
+
 	switch (cmd) {
 	case BLKOPENZONE:
-		bi_rw = REQ_OPEN_ZONE;
+		bi_rw |= REQ_OPEN_ZONE;
 		break;
 	case BLKCLOSEZONE:
-		bi_rw = REQ_CLOSE_ZONE;
+		bi_rw |= REQ_CLOSE_ZONE;
 		break;
-	case BLKDISCARD:
-		bi_rw = REQ_DISCARD;
+	case BLKRESETZONE:
+		bi_rw |= REQ_RESET_ZONE;
 		break;
 	default:
-		pr_err("%s: Unknown action: %u", __func__, cmd);
+		pr_err("%s: Unknown action: %u\n", __func__, cmd);
 		WARN_ON(1);
 	}
 	return blkdev_issue_zone_action(bdev, bi_rw, arg, GFP_KERNEL);
@@ -314,9 +345,6 @@ static int blk_ioctl_discard(struct block_device *bdev, fmode_t mode,
 
 	start = range[0];
 	len = range[1];
-
-	if (start & 3 && len == (1 << 29))
-		return blk_zoned_action_ioctl(bdev, mode, BLKDISCARD, start);
 
 	if (start & 511)
 		return -EINVAL;
@@ -710,6 +738,7 @@ int blkdev_ioctl(struct block_device *bdev, fmode_t mode, unsigned cmd,
 		return blk_zoned_report_ioctl(bdev, mode, argp);
 	case BLKOPENZONE:
 	case BLKCLOSEZONE:
+	case BLKRESETZONE:
 		return blk_zoned_action_ioctl(bdev, mode, cmd, arg);
 	case BLKDAXGET:
 		return put_int(arg, !!(bdev->bd_inode->i_flags & S_DAX));

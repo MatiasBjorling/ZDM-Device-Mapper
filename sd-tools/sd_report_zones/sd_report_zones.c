@@ -21,6 +21,7 @@
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <linux/fs.h>
+#include <linux/blkzoned_api.h>
 #include <linux/blk-zoned-ctrl.h>
 
 #include "sdtools.h"

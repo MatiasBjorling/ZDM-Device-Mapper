@@ -696,12 +696,6 @@ static void sd_config_discard(struct scsi_disk *sdkp, unsigned int mode)
 		q->limits.discard_zeroes_data = sdkp->lbprz;
 		break;
 
-	case SD_LBP_RESET_WP:
-		max_blocks = min_not_zero(sdkp->max_unmap_blocks,
-					  (u32)SD_MAX_WS16_BLOCKS);
-		q->limits.discard_zeroes_data = sdkp->lbprz;
-		break;
-
 	case SD_LBP_ZERO:
 		max_blocks = min_not_zero(sdkp->max_ws_blocks,
 					  (u32)SD_MAX_WS10_BLOCKS);
@@ -755,20 +749,6 @@ static int sd_setup_discard_cmnd(struct scsi_cmnd *cmd)
 		put_unaligned_be32(nr_sectors, &buf[16]);
 
 		len = 24;
-		break;
-
-	case SD_LBP_RESET_WP:
-		cmd->cmd_len = 16;
-		cmd->cmnd[0] = ZBC_ACTION;
-		cmd->cmnd[1] = ZBC_SA_RESET_WP;
-		cmd->cmnd[14] = 0;
-		if (sector == ~0ul) {
-			cmd->cmnd[14] = 1;
-			sector = 0;
-		}
-		put_unaligned_be64(sector, &cmd->cmnd[2]);
-		len = 0;
-		cmd->sc_data_direction = DMA_NONE;
 		break;
 
 	case SD_LBP_WS16:
@@ -1177,8 +1157,7 @@ static int sd_setup_zoned_cmnd(struct scsi_cmnd *cmd)
 	int ret = BLKPREP_KILL;
 	u8 allbit = 0;
 
-	if (rq->cmd_flags & REQ_REPORT_ZONES) {
-		WARN_ON(rq_data_dir(rq) != READ);
+	if (rq->cmd_flags & REQ_REPORT_ZONES && rq_data_dir(rq) == READ) {
 		WARN_ON(nr_bytes == 0);
 
 		/*
@@ -1205,14 +1184,16 @@ static int sd_setup_zoned_cmnd(struct scsi_cmnd *cmd)
 		if (ret != BLKPREP_OK)
 			goto out;
 
-		ret = BLKPREP_KILL;
 		cmd = rq->special;
 		if (sdp->changed) {
 			pr_err("SCSI disk has been changed or is not present.");
+			ret = BLKPREP_KILL;
 			goto out;
 		}
 
-		if (rq->cmd_flags & REQ_PRIO) {
+		cmd->cmd_len = 16;
+		memset(cmd->cmnd, 0, cmd->cmd_len);
+		if (rq->cmd_flags & REQ_META) {
 			cmd->cmnd[0] = ATA_16;
 			cmd->cmnd[1] = (0x6 << 1) | 1;
 			cmd->cmnd[2] = 0x0e;
@@ -1244,22 +1225,23 @@ static int sd_setup_zoned_cmnd(struct scsi_cmnd *cmd)
 	if (!sdp->zabc)
 		goto out;
 
-	/* zone action requests don't perform I/O, zero the S/G table */
-	memset(&cmd->sdb, 0, sizeof(cmd->sdb));
-
 	if (sector == ~0ul) {
 		allbit = 1;
 		sector = 0;
 	}
 
-	if (rq->cmd_flags & REQ_PRIO) {
+	cmd->cmd_len = 16;
+	memset(cmd->cmnd, 0, cmd->cmd_len);
+	memset(&cmd->sdb, 0, sizeof(cmd->sdb));
+
+	if (rq->cmd_flags & REQ_META) {
 		cmd->cmnd[0] = ATA_16;
 		cmd->cmnd[1] = (3 << 1) | 1;
 		cmd->cmnd[3] = allbit;
 		cmd->cmnd[4] = ATA_SUBCMD_OPEN_ZONES;
 		if (rq->cmd_flags & REQ_CLOSE_ZONE)
 			cmd->cmnd[4] = ATA_SUBCMD_CLOSE_ZONES;
-		if (rq->cmd_flags & REQ_DISCARD)
+		if (rq->cmd_flags & REQ_RESET_ZONE)
 			cmd->cmnd[4] = ATA_SUBCMD_RESET_WP;
 		_lba_to_cmd_ata(&cmd->cmnd[7], sector);
 		cmd->cmnd[13] = 1 << 6;
@@ -1269,16 +1251,16 @@ static int sd_setup_zoned_cmnd(struct scsi_cmnd *cmd)
 		cmd->cmnd[1] = ZBC_SA_ZONE_OPEN;
 		if (rq->cmd_flags & REQ_CLOSE_ZONE)
 			cmd->cmnd[1] = ZBC_SA_ZONE_CLOSE;
-		if (rq->cmd_flags & REQ_DISCARD)
+		if (rq->cmd_flags & REQ_RESET_ZONE)
 			cmd->cmnd[1] = ZBC_SA_RESET_WP;
 		cmd->cmnd[14] = allbit;
 		put_unaligned_be64(sector, &cmd->cmnd[2]);
 	}
-	cmd->cmd_len = 16;
 	cmd->transfersize = 0;
 	cmd->underflow = 0;
 	cmd->allowed = SD_MAX_RETRIES;
 	cmd->sc_data_direction = DMA_NONE;
+
 	ret = BLKPREP_OK;
  out:
 	return ret;
@@ -1288,23 +1270,23 @@ static int sd_init_command(struct scsi_cmnd *cmd)
 {
 	struct request *rq = cmd->request;
 
-	if ((rq->cmd_flags & REQ_ZONED_FLAGS) ||
-	   ((rq->cmd_flags & REQ_PRIO) && (rq->cmd_flags & REQ_DISCARD)))
+	if (rq->cmd_flags & REQ_ZONED_FLAGS)
 		return sd_setup_zoned_cmnd(cmd);
-	if (rq->cmd_flags & REQ_DISCARD)
+	else if (rq->cmd_flags & REQ_DISCARD)
 		return sd_setup_discard_cmnd(cmd);
-	if (rq->cmd_flags & REQ_WRITE_SAME)
+	else if (rq->cmd_flags & REQ_WRITE_SAME)
 		return sd_setup_write_same_cmnd(cmd);
-	if (rq->cmd_flags & REQ_FLUSH)
+	else if (rq->cmd_flags & REQ_FLUSH)
 		return sd_setup_flush_cmnd(cmd);
-	return sd_setup_read_write_cmnd(cmd);
+	else
+		return sd_setup_read_write_cmnd(cmd);
 }
 
 static void sd_uninit_command(struct scsi_cmnd *SCpnt)
 {
 	struct request *rq = SCpnt->request;
 
-	if ((rq->cmd_flags & REQ_DISCARD) && !(rq->cmd_flags & REQ_PRIO))
+	if (rq->cmd_flags & REQ_DISCARD)
 		__free_page(rq->completion_data);
 
 	if (SCpnt->cmnd != rq->cmd) {
@@ -2910,17 +2892,12 @@ static void sd_read_block_characteristics(struct scsi_disk *sdkp)
 		 * A Host Aware ZBC device 'reset wp' operation will discard
 		 * a zone of data. A zone can be very large and need not all
 		 * be of the same size on a single drive so we will defer
-		 * all of that to the layer handling the zones geometry and
-		 * issuing the DISCARD to the device.
-		 * ...WS16_BLOCKS seems like a nice large number to use as
-		 * an analog to the size of a zone.
+		 * all of that to the kernel layer handling the zones geometry
+		 * and issuing the RESET_ZONE to the device.
 		 *
 		 * Any subsequent reads will be zero'd.
 		 */
 		sdkp->device->zabc = 1;
-		sdkp->lbprz = 1;
-		sdkp->max_unmap_blocks = SD_MAX_WS16_BLOCKS;
-		sd_config_discard(sdkp, SD_LBP_RESET_WP);
 	} else {
 		unsigned char cmd[16] = { 0 };
 
@@ -2937,9 +2914,6 @@ static void sd_read_block_characteristics(struct scsi_disk *sdkp)
 
 		if (ata_drive_zac_ha((u16 *)buffer)) {
 			sdkp->device->zabc = 1;
-			sdkp->lbprz = 1;
-			sdkp->max_unmap_blocks = SD_MAX_WS16_BLOCKS;
-			sd_config_discard(sdkp, SD_LBP_RESET_WP);
 		}
 	}
 
