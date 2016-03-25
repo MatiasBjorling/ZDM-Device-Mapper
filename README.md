@@ -131,20 +131,20 @@ If not, please see http://www.gnu.org/licenses/.
 
   - CEPH: Enable ceph to created and used an OSD that used ZDM. NOTE: depends on blkid support from util-linux or util-linux-ng.
     * 0.94.5 [ceph patch](/patches/ceph)
-  - util-linux
-    * 2.20.1 [2.20.1 in use by Ubuntu 14.04](/patches/util-linux/2.20.1)
-    * 2.27.1 [2.27.1 development](/patches/util-linux/2.27.1) Includes blkreport, blkzonecmd
-  - util-linux-ng
-    * 2.17.2 [2.17.2 in use by CentOS 6.7](/patches/util-linux-ng)
+  - util-linux -- Added: blkreport, blkzonecmd
+    * 2.20.1 [For Ubuntu 14.04](/patches/util-linux/2.20.1)
+    * 2.27.1 [For Debian sid development](/patches/util-linux/2.27.1) 
+  - util-linux-ng -- Missing: blkreport, blkzonecmd
+    * 2.17.2 [For CentOS 6.7](/patches/util-linux-ng)
 
 ## ZDM Linux Kernel
 
   - Patches
-    * v4.5 [ZDM r108 patches for linux v4.4](/patches/linux/v4.4+ZDM-r108)
+    * v4.5 [ZDM r108 patches for linux v4.5](/patches/linux/v4.5+ZDM-r108)
   - Linux kernel with ZDM patches applied.
-    * v4.5 https://seagit.okla.seagate.com/ZDM-Release/zdm-kernel/tree/v4.4+ZDM-r108
+    * v4.5 https://seagit.okla.seagate.com/ZDM-Release/zdm-kernel/tree/v4.5+ZDM-r108
 
-## Observations and Known Issues in this release (#106)
+## Observations and Known Issues in this release (#108)
 
   - Bug: Write back of metadata could cause inconsistency in case of sudden power loss between SYNC's
      * Fix is planned for #109.
