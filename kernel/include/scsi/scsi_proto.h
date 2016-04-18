@@ -115,10 +115,8 @@
 #define VERIFY_16	      0x8f
 #define SYNCHRONIZE_CACHE_16  0x91
 #define WRITE_SAME_16	      0x93
-/* Op codes for Zoned Block Commands */
-#define ZBC_ACTION		0x94
-#define ZBC_REPORT_ZONES	0x95
-
+#define ZBC_OUT		      0x94
+#define ZBC_IN		      0x95
 #define SERVICE_ACTION_BIDIRECTIONAL 0x9d
 #define SERVICE_ACTION_IN_16  0x9e
 #define SERVICE_ACTION_OUT_16 0x9f
@@ -147,6 +145,13 @@
 #define MO_SET_PRIORITY       0x0e
 #define MO_SET_TIMESTAMP      0x0f
 #define MO_MANAGEMENT_PROTOCOL_OUT 0x10
+/* values for ZBC_IN */
+#define ZI_REPORT_ZONES	      0x00
+/* values for ZBC_OUT */
+#define ZO_CLOSE_ZONE	      0x01
+#define ZO_FINISH_ZONE	      0x02
+#define ZO_OPEN_ZONE	      0x03
+#define ZO_RESET_WRITE_POINTER 0x04
 /* values for variable length command */
 #define XDREAD_32	      0x03
 #define XDWRITE_32	      0x04
@@ -160,16 +165,6 @@
 /* Values for T10/04-262r7 */
 #define	ATA_16		      0x85	/* 16-byte pass-thru */
 #define	ATA_12		      0xa1	/* 12-byte pass-thru */
-
-/* ZBC_ACTION: Values for T-10 ZBC sub action */
-#define ZBC_SA_ZONE_CLOSE	0x01
-#define ZBC_SA_ZONE_FINISH	0x02
-#define ZBC_SA_ZONE_OPEN	0x03
-#define ZBC_SA_RESET_WP		0x04
-
-/* ZBC_REPORT_ZONES: Default report option. T-10 ZBC report zones */
-#define ZBC_REPORT_OPT		0x00
-
 
 /* Vendor specific CDBs start here */
 #define VENDOR_SPECIFIC_CDB 0xc0
@@ -291,5 +286,17 @@ struct scsi_lun {
 	__u8 scsi_lun[8];
 };
 
+/* SPC asymmetric access states */
+#define SCSI_ACCESS_STATE_OPTIMAL     0x00
+#define SCSI_ACCESS_STATE_ACTIVE      0x01
+#define SCSI_ACCESS_STATE_STANDBY     0x02
+#define SCSI_ACCESS_STATE_UNAVAILABLE 0x03
+#define SCSI_ACCESS_STATE_LBA         0x04
+#define SCSI_ACCESS_STATE_OFFLINE     0x0e
+#define SCSI_ACCESS_STATE_TRANSITIONING 0x0f
+
+/* Values for REPORT TARGET GROUP STATES */
+#define SCSI_ACCESS_STATE_MASK        0x0f
+#define SCSI_ACCESS_STATE_PREFERRED   0x80
 
 #endif /* _SCSI_PROTO_H_ */

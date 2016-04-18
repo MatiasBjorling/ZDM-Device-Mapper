@@ -43,7 +43,7 @@ int blkdev_issue_discard(struct block_device *bdev, sector_t sector,
 {
 	DECLARE_COMPLETION_ONSTACK(wait);
 	struct request_queue *q = bdev_get_queue(bdev);
-	int type = REQ_WRITE | REQ_DISCARD;
+	int type = 0;
 	unsigned int granularity;
 	int alignment;
 	struct bio_batch bb;
@@ -103,13 +103,15 @@ int blkdev_issue_discard(struct block_device *bdev, sector_t sector,
 		bio->bi_end_io = bio_batch_end_io;
 		bio->bi_bdev = bdev;
 		bio->bi_private = &bb;
+		bio->bi_op = REQ_OP_DISCARD;
+		bio->bi_rw = type;
 
 		bio->bi_iter.bi_size = req_sects << 9;
 		nr_sects -= req_sects;
 		sector = end_sect;
 
 		atomic_inc(&bb.done);
-		submit_bio(type, bio);
+		submit_bio(bio);
 
 		/*
 		 * We can loop for a long time in here, if someone does
@@ -178,6 +180,7 @@ int blkdev_issue_write_same(struct block_device *bdev, sector_t sector,
 		bio->bi_io_vec->bv_page = page;
 		bio->bi_io_vec->bv_offset = 0;
 		bio->bi_io_vec->bv_len = bdev_logical_block_size(bdev);
+		bio->bi_op = REQ_OP_WRITE_SAME;
 
 		if (nr_sects > max_write_same_sectors) {
 			bio->bi_iter.bi_size = max_write_same_sectors << 9;
@@ -189,7 +192,7 @@ int blkdev_issue_write_same(struct block_device *bdev, sector_t sector,
 		}
 
 		atomic_inc(&bb.done);
-		submit_bio(REQ_WRITE | REQ_WRITE_SAME, bio);
+		submit_bio(bio);
 	}
 
 	/* Wait for bios in-flight */
@@ -239,6 +242,7 @@ static int __blkdev_issue_zeroout(struct block_device *bdev, sector_t sector,
 		bio->bi_bdev   = bdev;
 		bio->bi_end_io = bio_batch_end_io;
 		bio->bi_private = &bb;
+		bio->bi_op = REQ_OP_WRITE;
 
 		while (nr_sects != 0) {
 			sz = min((sector_t) PAGE_SIZE >> 9 , nr_sects);
@@ -250,7 +254,7 @@ static int __blkdev_issue_zeroout(struct block_device *bdev, sector_t sector,
 		}
 		ret = 0;
 		atomic_inc(&bb.done);
-		submit_bio(WRITE, bio);
+		submit_bio(bio);
 	}
 
 	/* Wait for bios in-flight */
@@ -305,7 +309,7 @@ EXPORT_SYMBOL(blkdev_issue_zeroout);
  * blkdev_issue_zone_report - queue a report zones operation
  * @bdev:	target blockdev
  * @bi_rw:	extra bio rw flags. If unsure, use 0.
- * @sector:	start sector
+ * @sector:	starting sector (report will include this sector).
  * @page:	one or more contiguous pages.
  * @pgsz:	up to size of page in bytes, size of report.
  * @gfp_mask:	memory allocation flags (for bio_alloc)
@@ -313,7 +317,7 @@ EXPORT_SYMBOL(blkdev_issue_zeroout);
  * Description:
  *    Issue a zone report request for the sectors in question.
  */
-int blkdev_issue_zone_report(struct block_device *bdev, unsigned long bi_rw,
+int blkdev_issue_zone_report(struct block_device *bdev, unsigned int bi_rw,
 			     sector_t sector, u8 opt, struct page *page,
 			     size_t pgsz, gfp_t gfp_mask)
 {
@@ -343,10 +347,13 @@ int blkdev_issue_zone_report(struct block_device *bdev, unsigned long bi_rw,
 	bio->bi_private = &bb;
 	bio->bi_vcnt = 0;
 	bio->bi_iter.bi_size = 0;
+	bio->bi_op = REQ_OP_READ;
+	bio->bi_rw = bi_rw | REQ_REPORT_ZONES;
+
 	bio_set_streamid(bio, opt);
 	bio_add_page(bio, page, pgsz, 0);
 	atomic_inc(&bb.done);
-	submit_bio(bi_rw | REQ_REPORT_ZONES, bio);
+	submit_bio(bio);
 
 	/* Wait for bios in-flight */
 	if (!atomic_dec_and_test(&bb.done))
@@ -377,14 +384,14 @@ EXPORT_SYMBOL(blkdev_issue_zone_report);
 /**
  * blkdev_issue_zone_action - queue a report zones operation
  * @bdev:	target blockdev
- * @bi_rw:	REQ_OPEN_ZONE or REQ_CLOSE_ZONE.
- * @sector:	start sector
+ * @bi_rw:	REQ_OPEN_ZONE, REQ_CLOSE_ZONE, or REQ_RESET_ZONE.
+ * @sector:	starting lba of sector
  * @gfp_mask:	memory allocation flags (for bio_alloc)
  *
  * Description:
  *    Issue a zone report request for the sectors in question.
  */
-int blkdev_issue_zone_action(struct block_device *bdev, unsigned long bi_rw,
+int blkdev_issue_zone_action(struct block_device *bdev, unsigned int bi_rw,
 			     sector_t sector, gfp_t gfp_mask)
 {
 	DECLARE_COMPLETION_ONSTACK(wait);
@@ -406,9 +413,11 @@ int blkdev_issue_zone_action(struct block_device *bdev, unsigned long bi_rw,
 	bio->bi_private = &bb;
 	bio->bi_vcnt = 0;
 	bio->bi_iter.bi_size = 0;
+	bio->bi_op = REQ_OP_WRITE;
+	bio->bi_rw = bi_rw;
 
 	atomic_inc(&bb.done);
-	submit_bio(REQ_WRITE | bi_rw, bio);
+	submit_bio(bio);
 
 	/* Wait for bios in-flight */
 	if (!atomic_dec_and_test(&bb.done))

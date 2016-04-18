@@ -249,6 +249,7 @@ config DM_DEBUG_BLOCK_STACK_TRACING
 	 block manager locking used by thin provisioning and caching.
 
 	 If unsure, say N.
+
 config DM_BIO_PRISON
        tristate
        depends on BLK_DEV_DM
@@ -304,16 +305,6 @@ config DM_CACHE
          algorithms used to select which blocks are promoted, demoted,
          cleaned etc.  It supports writeback and writethrough modes.
 
-config DM_CACHE_MQ
-       tristate "MQ Cache Policy (EXPERIMENTAL)"
-       depends on DM_CACHE
-       default y
-       ---help---
-         A cache policy that uses a multiqueue ordered by recent hit
-         count to select which blocks should be promoted and demoted.
-         This is meant to be a general purpose policy.  It prioritises
-         reads over writes.
-
 config DM_CACHE_SMQ
        tristate "Stochastic MQ Cache Policy (EXPERIMENTAL)"
        depends on DM_CACHE
@@ -346,15 +337,36 @@ config DM_ERA
          vendor snapshots.
 
 config DM_ZONED
+	tristate "Zoned cache write target support (EXPERIMENTAL)"
+	depends on BLK_DEV_DM
+	---help---
+	 This device-mapper target implements a caching layer for
+	 zoned block devices (ZBC).
+
+	 To compile this code as a module, choose M here: the module will
+	 be called dm-zoned.
+
+	 If unsure, say N.
+
+config DM_ZDM
        tristate "ZDM: Zoned based device target (EXPERIMENTAL)"
        depends on BLK_DEV_DM
        default n
        select LIBCRC32C
        ---help---
-         dm-zoned provides a rand access block device on top of a
-         ZBC/ZAC block device.
-         Forward writing within zones, garbage collection within zones.
+         This device-mapper target implements a translation layer
+	 for zoned block devices (ZBC/ZAC)
+	 ZDM performs write serialization and copy-on-write data to
+	 ensure forward writing within zones. ZDM also includes a
+	 garbage collection model to reclaim stale blocks and remap
+	 in use blocks.
+
          Use zdmadm to create, repair and/or restore ZDM instances.
+
+	 To compile this code as a module, choose M here: the module will
+	 be called dm-zoned.
+
+	 If unsure, say N.
 
 config DM_MIRROR
        tristate "Mirror target"
@@ -517,7 +529,5 @@ config DM_LOG_WRITES
 
 	  To compile this code as a module, choose M here: the module will
 	  be called dm-log-writes.
-
-	  If unsure, say N.
 
 endif # MD

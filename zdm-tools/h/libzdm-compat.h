@@ -113,9 +113,9 @@ extern "C" {
 #define ZDM_ALLOC(z, sz, id)       _zdm_alloc((z), (sz), (id) )
 #define ZDM_CALLOC(z, n, sz, id)   _zdm_calloc((z), (n), (sz), (id) )
 
-void _zdm_free(struct zoned * znd, void *p, size_t sz, u32 code);
-void * _zdm_alloc(struct zoned * znd, size_t sz, int code);
-void * _zdm_calloc(struct zoned * znd, size_t n, size_t sz, int code);
+void _zdm_free(struct zdm * znd, void *p, size_t sz, u32 code);
+void * _zdm_alloc(struct zdm * znd, size_t sz, int code);
+void * _zdm_calloc(struct zdm * znd, size_t n, size_t sz, int code);
 
 #define sb_check(a) \
 	zdm_superblock_check( (a) )
@@ -130,14 +130,10 @@ void * _zdm_calloc(struct zoned * znd, size_t n, size_t sz, int code);
 	zdm_unused_phy(a, b)
 #define unused_addr(megaz, dm_s) \
 	zdm_unused_addr(megaz, dm_s)
-#define z_lookup(megaz, maddr) \
-	zdm_lookup(megaz, maddr)
 #define z_mapped_addmany(megaz, dm_s, lba, count) \
 	zdm_mapped_addmany(megaz, dm_s, lba, count)
 #define z_mapped_discard(megaz, dm_s, lba) \
 	zdm_mapped_discard(megaz, dm_s, lba)
-#define z_mapped_to_list(megaz, dm_s, lba) \
-	zdm_mapped_to_list(megaz, dm_s, lba)
 #define z_mapped_sync(megaz) \
 	zdm_mapped_sync(megaz)
 #define z_mapped_init(megaz) \
@@ -166,14 +162,14 @@ void * _zdm_calloc(struct zoned * znd, size_t n, size_t sz, int code);
 	zdm_get_meta_pg_crc(megaz, maddr, is_map_to), (void)X
 #define fpages(megaz, allowed_pages) \
 	zdm_free_unused(megaz, allowed_pages)
-#define meta_integrity_test(megaz) \
-	zdm_mz_integrity_check(megaz)
 #define mcache_greatest_gen(mz, at, _a, _b) \
 	zdm_mcache_greatest_gen(mz, at, _a, _b)
+#define zoned_wp_sync(a, b) \
+	zdm_zoned_wp_sync(a, b)
 
-static inline struct zoned *get_znd(struct dm_target *ti)
+static inline struct zdm *get_znd(struct dm_target *ti)
 {
-	struct zoned *znd = ti->private;
+	struct zdm *znd = ti->private;
 	return znd;
 }
 
@@ -181,6 +177,9 @@ static inline struct zoned *get_znd(struct dm_target *ti)
 	zdm_read(get_znd(ti), data, lba, count), (void)X, (void)Y
 #define write_block(ti, X, data, lba, count, Y) \
 	zdm_write(get_znd(ti), data, lba, count), (void)X, (void)Y
+#define writef_block(ti, X, data, lba, Z, count, Y) \
+	zdm_write(get_znd(ti), data, lba, count), (void)X, (void)Y, (void)Z
+
 #define crc_md_le16(data, len) \
 	zdm_crc16_le16(data, len)
 #define map_value(megaz, delta) \

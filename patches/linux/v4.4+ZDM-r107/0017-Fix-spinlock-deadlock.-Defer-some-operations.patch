@@ -1,0 +1,279 @@
+From fe1a99abe68fd6cdd2d688128c9aa879dca067b2 Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Mon, 7 Mar 2016 15:35:38 -0600
+Subject: [PATCH 17/29] Fix spinlock deadlock. Defer some operations.
+
+---
+ drivers/md/libzoned.c | 106 +++++++++++++++++++++++++++++++++++++-------------
+ 1 file changed, 80 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/md/libzoned.c b/drivers/md/libzoned.c
+index 66deba5..5589142 100644
+--- a/drivers/md/libzoned.c
++++ b/drivers/md/libzoned.c
+@@ -83,7 +83,7 @@ static void meta_work_task(struct work_struct *work);
+ static u64 mcache_greatest_gen(struct zoned *, int, u64 *, u64 *);
+ static u64 mcache_find_gen(struct zoned *, u64 base, int, u64 *out);
+ static int find_superblock(struct zoned *znd, int use_wq, int do_init);
+-static int sync_mapped_pages(struct zoned *znd, int sync, int drop);
++static int sync_mapped_pages(struct zoned *znd, int sync, int *drop);
+ static int unused_phy(struct zoned *znd, u64 lba, u64 orig_s, gfp_t gfp);
+ static struct io_4k_block *get_io_vcache(struct zoned *znd, gfp_t gfp);
+ static int put_io_vcache(struct zoned *znd, struct io_4k_block *cache);
+@@ -408,6 +408,24 @@ void lazy_pool_add(struct zoned *znd, struct map_pg *expg, int bit)
+ }
+ 
+ /**
++ * lazy_pool_splice - Add a list of pages to the lazy pool
++ * @znd: ZDM Instance
++ * @list: List of map table page to add.
++ *
++ * Lazy pool is used for deferred adding and delayed removal.
++ */
++static __always_inline
++void lazy_pool_splice(struct zoned *znd, struct list_head *list)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&znd->lzy_lck, flags);
++	list_splice(list, &znd->lzy_pool);
++	spin_unlock_irqrestore(&znd->lzy_lck, flags);
++}
++
++
++/**
+  * pool_add() - Add metadata block to zltlst
+  * @znd: ZDM instance
+  * @expg: current metadata block to add to zltlst list.
+@@ -2925,10 +2943,11 @@ static int z_flush_bdev(struct zoned *znd, gfp_t gfp)
+  * Forced inline as it is 'optional' and because it is called with
+  * spin locks enabled and only from a single caller.
+  */
+-static __always_inline void pg_delete(struct zoned *znd, struct map_pg *expg)
++static __always_inline int pg_delete(struct zoned *znd, struct map_pg *expg)
+ {
+ 	struct map_pg **zlt;
+ 	spinlock_t *lock;
++	int release = 0;
+ 	int index = expg->index;
+ 	int is_lut = test_bit(IS_LUT, &expg->flags);
+ 	int is_fwd = test_bit(IS_FWD, &expg->flags);
+@@ -2942,11 +2961,11 @@ static __always_inline void pg_delete(struct zoned *znd, struct map_pg *expg)
+ 		lock = &znd->ct_lock;
+ 	}
+ 
+-	spin_lock_nested(lock, SINGLE_DEPTH_NESTING);
++	if (!spin_trylock(lock))
++		return release;
++
+ 	if (index > -1 && index < count && expg == zlt[index] &&
+ 	    test_and_clear_bit(IS_DROPPED, &expg->flags)) {
+-		int release = 0;
+-
+ 		zlt[index] = NULL;
+ 		MutexLock(&expg->md_lock);
+ 		if (test_and_clear_bit(IS_LAZY, &expg->flags)) {
+@@ -2968,6 +2987,7 @@ static __always_inline void pg_delete(struct zoned *znd, struct map_pg *expg)
+ 			ZDM_FREE(znd, expg, sizeof(*expg), KM_20);
+ 	}
+ 	spin_unlock(lock);
++	return release;
+ }
+ 
+ /**
+@@ -2981,10 +3001,11 @@ static __always_inline void pg_delete(struct zoned *znd, struct map_pg *expg)
+  *     the default we can catch it and make it 'hotter' before the
+  *     hotness indicator is lost.
+  */
+-void manage_lazy_activity(struct zoned *znd)
++static int manage_lazy_activity(struct zoned *znd)
+ {
+ 	struct map_pg *expg;
+ 	struct map_pg *_tpg;
++	int want_flush = 0;
+ 
+ 	spin_lock(&znd->lzy_lck);
+ 
+@@ -2997,28 +3018,30 @@ void manage_lazy_activity(struct zoned *znd)
+ 		/*
+ 		 * Migrage pg to zltlst list
+ 		 */
+-		if (test_and_clear_bit(DELAY_ADD, &expg->flags)) {
+-			spin_lock(&znd->zlt_lck);
+-			list_del(&expg->lazy);
+-			clear_bit(IS_LAZY, &expg->flags);
+-			clear_bit(IS_DROPPED, &expg->flags);
+-
+-			if (!test_bit(IN_ZLT, &expg->flags)) {
+-				set_bit(IN_ZLT, &expg->flags);
+-				list_add(&expg->zltlst, &znd->zltpool);
++		if (test_bit(DELAY_ADD, &expg->flags)) {
++			if (spin_trylock(&znd->zlt_lck)) {
++				list_del(&expg->lazy);
++				clear_bit(IS_LAZY, &expg->flags);
++				clear_bit(IS_DROPPED, &expg->flags);
++
++				if (!test_bit(IN_ZLT, &expg->flags)) {
++					set_bit(IN_ZLT, &expg->flags);
++					list_add(&expg->zltlst, &znd->zltpool);
++				}
++				clear_bit(DELAY_ADD, &expg->flags);
++				spin_unlock(&znd->zlt_lck);
+ 			}
+-			spin_unlock(&znd->zlt_lck);
+ #if ENABLE_PG_FREE_VIA_LAZY
+ 		} else {
+ 			/*
+ 			 * Delete page
+ 			 */
+ 			if (!test_bit(IN_ZLT, &expg->flags) &&
+-			    test_bit(IS_DROPPED, &expg->flags)) {
++			     test_bit(IS_DROPPED, &expg->flags)) {
+ 				u32 msecs = MEM_PURGE_MSECS;
+ 
+ 				if (is_expired_msecs(expg->age, msecs)) {
+-					pg_delete(znd, expg);
++					want_flush |= pg_delete(znd, expg);
+ 				}
+ 			}
+ #endif
+@@ -3029,6 +3052,7 @@ void manage_lazy_activity(struct zoned *znd)
+ 
+ out:
+ 	spin_unlock(&znd->lzy_lck);
++	return want_flush;
+ }
+ 
+ /**
+@@ -3040,15 +3064,21 @@ out:
+ static int do_sync_metadata(struct zoned *znd, int sync, int drop)
+ {
+ 	int err = 0;
++	int want_flush;
+ 
+-	manage_lazy_activity(znd);
++	want_flush = manage_lazy_activity(znd);
++	if (want_flush)
++		set_bit(DO_FLUSH, &znd->flags);
+ 
+-	err = sync_mapped_pages(znd, sync, drop);
++	err = sync_mapped_pages(znd, sync, &drop);
+ 	if (err) {
+ 		Z_ERR(znd, "Uh oh: sync_mapped_pages -> %d", err);
+ 		goto out;
+ 	}
+ 
++	if (drop)
++		set_bit(DO_FLUSH, &znd->flags);
++
+ 	err = z_mapped_sync(znd);
+ 	if (err) {
+ 		Z_ERR(znd, "Uh oh. z_mapped_sync -> %d", err);
+@@ -3118,6 +3148,13 @@ static int do_sync_to_disk(struct zoned *znd)
+ 	if (test_and_clear_bit(DO_MEMPOOL, &znd->flags)) {
+ 		int pool_size = MZ_MEMPOOL_SZ * 4;
+ 
++#if ENABLE_PG_FREE_VIA_LAZY
++		/**
++		 * Trust our cache miss algo
++		 */
++		pool_size = MZ_MEMPOOL_SZ * 3;
++#endif
++
+ 		if (is_expired_msecs(znd->age, MEM_PURGE_MSECS * 2))
+ 			pool_size = 3;
+ 		else if (is_expired_msecs(znd->age, MEM_PURGE_MSECS))
+@@ -6294,16 +6331,20 @@ out_queued:
+  *
+  * Return: 0 on success or -errno value
+  */
+-static int _sync_dirty(struct zoned *znd, int bit_type, int sync, int drop)
++static int _sync_dirty(struct zoned *znd, int bit_type, int sync, int *_drop)
+ {
+ 	int err = 0;
+ 	int entries = 0;
++	int removed = 0;
++	int drop = *_drop;
+ 	struct map_pg *expg = NULL;
+ 	struct map_pg *_tpg;
+ 	struct map_pg **wset = NULL;
++	struct list_head droplist;
+ 
+-	wset = ZDM_CALLOC(znd, sizeof(*wset), MAX_WSET, KM_19, NORMAL);
++	INIT_LIST_HEAD(&droplist);
+ 
++	wset = ZDM_CALLOC(znd, sizeof(*wset), MAX_WSET, KM_19, NORMAL);
+ 
+ 	spin_lock(&znd->zlt_lck);
+ 	if (list_empty(&znd->zltpool))
+@@ -6345,7 +6386,12 @@ static int _sync_dirty(struct zoned *znd, int bit_type, int sync, int drop)
+ 					  + msecs_to_jiffies(expg->hotness);
+ 
+ #if ENABLE_PG_FREE_VIA_LAZY
+-				lazy_pool_add(znd, expg, IS_DROPPED);
++
++				if (!test_bit(IS_LAZY, &expg->flags)) {
++					set_bit(IS_LAZY, &expg->flags);
++					list_add(&expg->lazy, &droplist);
++				}
++				set_bit(IS_DROPPED, &expg->flags);
+ 				deref_pg(expg);
+ 				zlt[expg->index] = expg; /* so undrop works */
+ 				if (getref_pg(expg) > 0)
+@@ -6359,6 +6405,7 @@ static int _sync_dirty(struct zoned *znd, int bit_type, int sync, int drop)
+ 					expg->data.addr = NULL;
+ 					ZDM_FREE(znd, pg, Z_C4K, PG_27);
+ 					znd->incore_count--;
++					removed++;
+ 				}
+ 				mutex_unlock(&expg->md_lock);
+ 
+@@ -6389,6 +6436,10 @@ writeback:
+ 	}
+ 
+ out:
++	*_drop = removed;
++	if (!list_empty(&droplist))
++		lazy_pool_splice(znd, &droplist);
++
+ 	if (wset)
+ 		ZDM_FREE(znd, wset, sizeof(*wset) * MAX_WSET, KM_19);
+ 
+@@ -6399,10 +6450,12 @@ out:
+  * sync_dirty() - Write all *dirty* ZLT blocks to disk (journal->SYNC->home)
+  * @znd: ZDM instance
+  * @bit_type: MAP blocks then CRC blocks.
++ * @sync: Write dirty blocks
++ * @drop: In # of pages to free. Out # freed.
+  *
+  * Return: 0 on success or -errno value
+  */
+-static int sync_dirty(struct zoned *znd, int bit_type, int sync, int drop)
++static int sync_dirty(struct zoned *znd, int bit_type, int sync, int *drop)
+ {
+ 	int err;
+ 
+@@ -6427,9 +6480,10 @@ static int sync_dirty(struct zoned *znd, int bit_type, int sync, int drop)
+  *
+  * Return: 0 on success or -errno value
+  */
+-static int sync_mapped_pages(struct zoned *znd, int sync, int drop)
++static int sync_mapped_pages(struct zoned *znd, int sync, int *drop)
+ {
+ 	int err;
++	int remove = 0;
+ 
+ 	err = sync_dirty(znd, IS_LUT, sync, drop);
+ 
+@@ -6437,7 +6491,7 @@ static int sync_mapped_pages(struct zoned *znd, int sync, int drop)
+ 	if (err < 0)
+ 		return err;
+ 
+-	err = sync_dirty(znd, IS_CRC, sync, 0);
++	err = sync_dirty(znd, IS_CRC, sync, &remove);
+ 
+ 	return err;
+ }
+-- 
+2.7.0
+

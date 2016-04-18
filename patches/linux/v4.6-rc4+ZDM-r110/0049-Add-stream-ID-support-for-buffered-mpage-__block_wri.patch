@@ -1,0 +1,60 @@
+From 7664fcb9afa09a13ae9a051ce702fb06797f3445 Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Tue, 5 Apr 2016 12:39:26 +0700
+Subject: [PATCH 49/93] Add stream ID support for buffered
+ mpage/__block_write_full_page()
+
+Pass on the inode stream ID to the bio allocation.
+
+Signed-off-by: Jens Axboe <axboe@fb.com>
+
+Merge on top of Mike Christie's separate operations from
+flags in the bio/request structs
+
+Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
+---
+ fs/buffer.c | 8 ++++++--
+ fs/mpage.c  | 1 +
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/fs/buffer.c b/fs/buffer.c
+index 68c8f27..82eaaf8 100644
+--- a/fs/buffer.c
++++ b/fs/buffer.c
+@@ -1786,7 +1786,9 @@ static int __block_write_full_page(struct inode *inode, struct page *page,
+ 	do {
+ 		struct buffer_head *next = bh->b_this_page;
+ 		if (buffer_async_write(bh)) {
+-			submit_bh_wbc(REQ_OP_WRITE, write_flags, bh, 0, wbc);
++			submit_bh_wbc(REQ_OP_WRITE, write_flags, bh,
++				      streamid_to_flags(inode_streamid(inode)),
++				      wbc);
+ 			nr_underway++;
+ 		}
+ 		bh = next;
+@@ -1840,7 +1842,9 @@ recover:
+ 		struct buffer_head *next = bh->b_this_page;
+ 		if (buffer_async_write(bh)) {
+ 			clear_buffer_dirty(bh);
+-			submit_bh_wbc(REQ_OP_WRITE, write_flags, bh, 0, wbc);
++			submit_bh_wbc(REQ_OP_WRITE, write_flags, bh,
++				      streamid_to_flags(inode_streamid(inode)),
++				      wbc);
+ 			nr_underway++;
+ 		}
+ 		bh = next;
+diff --git a/fs/mpage.c b/fs/mpage.c
+index 89f58f1..b4bcbfa 100644
+--- a/fs/mpage.c
++++ b/fs/mpage.c
+@@ -284,6 +284,7 @@ alloc_new:
+ 				min_t(int, nr_pages, BIO_MAX_PAGES), gfp);
+ 		if (bio == NULL)
+ 			goto confused;
++		bio_set_streamid(bio, inode_streamid(inode));
+ 	}
+ 
+ 	length = first_hole << blkbits;
+-- 
+2.8.0.rc3
+

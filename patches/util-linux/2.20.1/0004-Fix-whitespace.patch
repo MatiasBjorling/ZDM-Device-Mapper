@@ -1,0 +1,25 @@
+From bc26ee8fee6dced54c49eb0799854c139a15e429 Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun.tancheff@seagate.com>
+Date: Wed, 23 Mar 2016 02:52:17 -0500
+Subject: [PATCH 4/5] Fix whitespace
+
+---
+ sys-utils/blkreport.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/sys-utils/blkreport.c b/sys-utils/blkreport.c
+index 3f852b2..dd3d773 100644
+--- a/sys-utils/blkreport.c
++++ b/sys-utils/blkreport.c
+@@ -350,7 +350,7 @@ static void print_zones(struct bdev_zone_report * info, uint32_t size)
+ 		}
+ 		fprintf(stdout,
+ 			"  start: %9lx, len %7lx, wptr %8lx"
+-                        " reset:%u non-seq:%u, zcond:%2u(%s) [type: %u(%s)]\n",
++			" reset:%u non-seq:%u, zcond:%2u(%s) [type: %u(%s)]\n",
+ 		start, len, wp - start, flags & 0x01, (flags & 0x02) >> 1,
+ 		cond, zone_condition_str(cond), type, type_text[type]);
+ 	}
+-- 
+2.8.0.rc3
+

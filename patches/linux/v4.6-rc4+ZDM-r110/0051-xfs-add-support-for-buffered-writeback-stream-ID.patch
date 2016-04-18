@@ -1,0 +1,31 @@
+From c3d6f672908ca427a2235d2189dd907adcc4f751 Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Mon, 18 Apr 2016 03:59:36 -0500
+Subject: [PATCH 51/93] xfs: add support for buffered writeback stream ID
+
+Cc: Dave Chinner <dchinner@redhat.com>
+Signed-off-by: Jens Axboe <axboe@fb.com>
+
+Merge on top of Mike Christie's separate operations from
+flags in the bio/request structs
+
+Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
+---
+ fs/xfs/xfs_aops.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/fs/xfs/xfs_aops.c b/fs/xfs/xfs_aops.c
+index 5865114..16f61f5 100644
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@ -396,6 +396,7 @@ xfs_submit_ioend_bio(
+ 	bio->bi_op = REQ_OP_WRITE;
+ 	if (wbc->sync_mode == WB_SYNC_ALL)
+ 		bio->bi_rw = WRITE_SYNC;
++        bio_set_streamid(bio, ioend->io_inode->i_streamid);
+ 	submit_bio(bio);
+ }
+ 
+-- 
+2.8.0.rc3
+

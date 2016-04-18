@@ -203,7 +203,7 @@ static int blk_zoned_report_ioctl(struct block_device *bdev, fmode_t mode,
 	gfp_t gfp = GFP_KERNEL;
 	struct bdev_zone_report_io *zone_iodata = NULL;
 	int order = 0;
-	struct page * pgs = NULL;
+	struct page *pgs = NULL;
 	u32 alloc_size = PAGE_SIZE;
 	unsigned long bi_rw = 0;
 	u8 opt = 0;
@@ -269,7 +269,7 @@ report_zones_out:
 }
 
 static int blk_zoned_action_ioctl(struct block_device *bdev, fmode_t mode,
-				  unsigned cmd, unsigned long arg)
+				  unsigned int cmd, unsigned long arg)
 {
 	unsigned long bi_rw = 0;
 
@@ -686,7 +686,7 @@ int blkdev_ioctl(struct block_device *bdev, fmode_t mode, unsigned cmd,
 		if (!arg)
 			return -EINVAL;
 		bdi = blk_get_backing_dev_info(bdev);
-		return put_long(arg, (bdi->ra_pages * PAGE_CACHE_SIZE) / 512);
+		return put_long(arg, (bdi->ra_pages * PAGE_SIZE) / 512);
 	case BLKROGET:
 		return put_int(arg, bdev_read_only(bdev) != 0);
 	case BLKBSZGET: /* get block device soft block size (cf. BLKSSZGET) */
@@ -714,7 +714,7 @@ int blkdev_ioctl(struct block_device *bdev, fmode_t mode, unsigned cmd,
 		if(!capable(CAP_SYS_ADMIN))
 			return -EACCES;
 		bdi = blk_get_backing_dev_info(bdev);
-		bdi->ra_pages = (arg * 512) / PAGE_CACHE_SIZE;
+		bdi->ra_pages = (arg * 512) / PAGE_SIZE;
 		return 0;
 	case BLKBSZSET:
 		return blkdev_bszset(bdev, mode, argp);

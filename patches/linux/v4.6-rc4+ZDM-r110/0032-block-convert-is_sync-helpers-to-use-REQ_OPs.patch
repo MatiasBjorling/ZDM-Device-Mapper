@@ -1,0 +1,127 @@
+From fc6fe86787d24ee85e6ab6708573133a82a498c9 Mon Sep 17 00:00:00 2001
+From: Mike Christie <mchristi@redhat.com>
+Date: Tue, 12 Apr 2016 21:47:26 -0500
+Subject: [PATCH 32/93] block: convert is_sync helpers to use REQ_OPs.
+
+This patch converts the is_sync helpers to use separate variables
+for the operation and flags.
+
+Signed-off-by: Mike Christie <mchristi@redhat.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-core.c       | 6 +++---
+ block/blk-mq.c         | 8 ++++----
+ block/cfq-iosched.c    | 2 +-
+ include/linux/blkdev.h | 6 +++---
+ 4 files changed, 11 insertions(+), 11 deletions(-)
+
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 4aff3b5..436dc9c 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -962,7 +962,7 @@ static void __freed_request(struct request_list *rl, int sync)
+ static void freed_request(struct request_list *rl, int op, unsigned int flags)
+ {
+ 	struct request_queue *q = rl->q;
+-	int sync = rw_is_sync(op | flags);
++	int sync = rw_is_sync(op, flags);
+ 
+ 	q->nr_rqs[sync]--;
+ 	rl->count[sync]--;
+@@ -1075,7 +1075,7 @@ static struct request *__get_request(struct request_list *rl, int op,
+ 	struct elevator_type *et = q->elevator->type;
+ 	struct io_context *ioc = rq_ioc(bio);
+ 	struct io_cq *icq = NULL;
+-	const bool is_sync = rw_is_sync(op | op_flags) != 0;
++	const bool is_sync = rw_is_sync(op, op_flags) != 0;
+ 	int may_queue;
+ 
+ 	if (unlikely(blk_queue_dying(q)))
+@@ -1246,7 +1246,7 @@ static struct request *get_request(struct request_queue *q, int op,
+ 				   int op_flags, struct bio *bio,
+ 				   gfp_t gfp_mask)
+ {
+-	const bool is_sync = rw_is_sync(op | op_flags) != 0;
++	const bool is_sync = rw_is_sync(op, op_flags) != 0;
+ 	DEFINE_WAIT(wait);
+ 	struct request_list *rl;
+ 	struct request *rq;
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 4843c0b..64d61be 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -206,7 +206,7 @@ static void blk_mq_rq_ctx_init(struct request_queue *q, struct blk_mq_ctx *ctx,
+ 	rq->end_io_data = NULL;
+ 	rq->next_rq = NULL;
+ 
+-	ctx->rq_dispatched[rw_is_sync(op | op_flags)]++;
++	ctx->rq_dispatched[rw_is_sync(op, op_flags)]++;
+ }
+ 
+ static struct request *
+@@ -1181,7 +1181,7 @@ static struct request *blk_mq_map_request(struct request_queue *q,
+ 	ctx = blk_mq_get_ctx(q);
+ 	hctx = q->mq_ops->map_queue(q, ctx->cpu);
+ 
+-	if (rw_is_sync(bio->bi_op | bio->bi_rw))
++	if (rw_is_sync(bio->bi_op, bio->bi_rw))
+ 		op_flags |= REQ_SYNC;
+ 
+ 	trace_block_getrq(q, bio, op);
+@@ -1249,7 +1249,7 @@ static int blk_mq_direct_issue_request(struct request *rq, blk_qc_t *cookie)
+  */
+ static blk_qc_t blk_mq_make_request(struct request_queue *q, struct bio *bio)
+ {
+-	const int is_sync = rw_is_sync(bio->bi_op | bio->bi_rw);
++	const int is_sync = rw_is_sync(bio->bi_op, bio->bi_rw);
+ 	const int is_flush_fua = bio->bi_rw & (REQ_FLUSH | REQ_FUA);
+ 	struct blk_map_ctx data;
+ 	struct request *rq;
+@@ -1346,7 +1346,7 @@ done:
+  */
+ static blk_qc_t blk_sq_make_request(struct request_queue *q, struct bio *bio)
+ {
+-	const int is_sync = rw_is_sync(bio->bi_op | bio->bi_rw);
++	const int is_sync = rw_is_sync(bio->bi_op, bio->bi_rw);
+ 	const int is_flush_fua = bio->bi_rw & (REQ_FLUSH | REQ_FUA);
+ 	struct blk_plug *plug;
+ 	unsigned int request_count = 0;
+diff --git a/block/cfq-iosched.c b/block/cfq-iosched.c
+index 0dfa2dd..2fd5bcf 100644
+--- a/block/cfq-iosched.c
++++ b/block/cfq-iosched.c
+@@ -4311,7 +4311,7 @@ static int cfq_may_queue(struct request_queue *q, int op, int op_flags)
+ 	if (!cic)
+ 		return ELV_MQUEUE_MAY;
+ 
+-	cfqq = cic_to_cfqq(cic, rw_is_sync(op | op_flags));
++	cfqq = cic_to_cfqq(cic, rw_is_sync(op, op_flags));
+ 	if (cfqq) {
+ 		cfq_init_prio_data(cfqq, cic);
+ 
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 2523fba..045b51e 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -616,14 +616,14 @@ static inline unsigned int blk_queue_cluster(struct request_queue *q)
+ /*
+  * We regard a request as sync, if either a read or a sync write
+  */
+-static inline bool rw_is_sync(unsigned int rw_flags)
++static inline bool rw_is_sync(int op, unsigned int rw_flags)
+ {
+-	return !(rw_flags & REQ_WRITE) || (rw_flags & REQ_SYNC);
++	return op == REQ_OP_READ || (rw_flags & REQ_SYNC);
+ }
+ 
+ static inline bool rq_is_sync(struct request *rq)
+ {
+-	return rw_is_sync(rq->cmd_flags);
++	return rw_is_sync(rq->op, rq->cmd_flags);
+ }
+ 
+ static inline bool blk_rl_full(struct request_list *rl, bool sync)
+-- 
+2.8.0.rc3
+

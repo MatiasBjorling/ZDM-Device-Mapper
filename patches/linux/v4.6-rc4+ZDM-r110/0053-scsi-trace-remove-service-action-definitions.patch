@@ -1,0 +1,33 @@
+From 1eaab75821140c8a9417e73e293f6819304ba950 Mon Sep 17 00:00:00 2001
+From: Hannes Reinecke <hare@suse.de>
+Date: Thu, 24 Mar 2016 15:21:18 +0100
+Subject: [PATCH 53/93] scsi-trace: remove service action definitions
+
+scsi_opcode_name() is displaying the opcode, not the service
+action.
+
+Reviewed-by: Ewan D. Milne <emilne@redhat.com>
+Signed-off-by: Hannes Reinecke <hare@suse.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+---
+ include/trace/events/scsi.h | 4 ----
+ 1 file changed, 4 deletions(-)
+
+diff --git a/include/trace/events/scsi.h b/include/trace/events/scsi.h
+index 079bd10..5c0d91f 100644
+--- a/include/trace/events/scsi.h
++++ b/include/trace/events/scsi.h
+@@ -95,10 +95,6 @@
+ 		scsi_opcode_name(VERIFY_16),			\
+ 		scsi_opcode_name(WRITE_SAME_16),		\
+ 		scsi_opcode_name(SERVICE_ACTION_IN_16),		\
+-		scsi_opcode_name(SAI_READ_CAPACITY_16),		\
+-		scsi_opcode_name(SAI_GET_LBA_STATUS),		\
+-		scsi_opcode_name(MI_REPORT_TARGET_PGS),		\
+-		scsi_opcode_name(MO_SET_TARGET_PGS),		\
+ 		scsi_opcode_name(READ_32),			\
+ 		scsi_opcode_name(WRITE_32),			\
+ 		scsi_opcode_name(WRITE_SAME_32),		\
+-- 
+2.8.0.rc3
+

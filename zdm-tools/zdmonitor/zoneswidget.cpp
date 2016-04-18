@@ -321,6 +321,7 @@ int ZonesWidget::updateFakeDemoView()
     return err;
 }
 
+#if 0
 /*
  *  Get data from /proc entries *OR* from ioctl calls (pre 4.4 kernel)
  */
@@ -393,6 +394,7 @@ int ZonesWidget::getLiveDeviceDataIoctl()
     }
     return err;
 }
+#endif // Removed at 4.4
 
 struct zone_value_entry
 {
@@ -500,7 +502,7 @@ int ZonesWidget::updateLiveDeviceView()
 
     if (m_fd != -1)
     {
-        err = getLiveDeviceDataIoctl();
+        err = -1; // getLiveDeviceDataIoctl();
     }
     else
     {

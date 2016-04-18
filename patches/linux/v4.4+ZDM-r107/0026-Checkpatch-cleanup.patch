@@ -1,0 +1,135 @@
+From 25033324d9327dd83fdd01aa8cd2e9f4e6df5077 Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Wed, 9 Mar 2016 16:48:10 -0600
+Subject: [PATCH 26/29] Checkpatch cleanup.
+
+---
+ drivers/md/dm-zoned.c |  3 ++-
+ drivers/md/libzoned.c | 23 +++++++++++------------
+ drivers/md/raid5.c    |  5 +++--
+ lib/idr.c             |  3 ++-
+ 4 files changed, 18 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/md/dm-zoned.c b/drivers/md/dm-zoned.c
+index ac8da0c..2a13e0b 100644
+--- a/drivers/md/dm-zoned.c
++++ b/drivers/md/dm-zoned.c
+@@ -423,7 +423,8 @@ static inline u32 get_wp_from_descriptor(struct zoned *znd, void *dentry_in)
+  * @gzoff: Zone entry in page.
+  * @lost: Number of blocks 'lost'.
+  */
+-static inline void _dec_wp_avail_by_lost(struct meta_pg *wpg, u32 gzoff, u32 lost)
++static inline
++void _dec_wp_avail_by_lost(struct meta_pg *wpg, u32 gzoff, u32 lost)
+ {
+ 	wpg->zf_est[gzoff] = cpu_to_le32(le32_to_cpu(wpg->zf_est[gzoff])+lost);
+ }
+diff --git a/drivers/md/libzoned.c b/drivers/md/libzoned.c
+index 51f61fa..18621f7 100644
+--- a/drivers/md/libzoned.c
++++ b/drivers/md/libzoned.c
+@@ -3054,12 +3054,9 @@ static int manage_lazy_activity(struct zoned *znd)
+ 			 * Delete page
+ 			 */
+ 			if (!test_bit(IN_ZLT, &expg->flags) &&
+-			     test_bit(IS_DROPPED, &expg->flags)) {
+-				u32 msecs = MEM_PURGE_MSECS;
+-
+-				if (is_expired_msecs(expg->age, msecs)) {
+-					want_flush |= pg_delete(znd, expg);
+-				}
++			     test_bit(IS_DROPPED, &expg->flags) &&
++			     is_expired_msecs(expg->age, MEM_PURGE_MSECS)) {
++				want_flush |= pg_delete(znd, expg);
+ 			}
+ #endif
+ 		}
+@@ -3372,7 +3369,8 @@ static int mc_update(struct zoned *znd, struct map_cache *mcache, int at,
+  * @type: List (type) to be adding to (MAP or DISCARD)
+  * @gfp: Allocation (kmalloc) flags
+  */
+-static int _mapped_list(struct zoned *znd, u64 dm_s, u64 lba, int type, gfp_t gfp)
++static
++int _mapped_list(struct zoned *znd, u64 dm_s, u64 lba, int type, gfp_t gfp)
+ {
+ 	struct map_cache *mcache = NULL;
+ 	struct map_cache *mc_add = NULL;
+@@ -3660,7 +3658,7 @@ static int z_mapped_sync(struct zoned *znd)
+ 				goto out;
+ 			clear_bit(IS_DIRTY, &wpg->flags);
+ 
+-                        Z_DBG(znd, "%d# -- WP: %04x | ZF: %04x",
++			Z_DBG(znd, "%d# -- WP: %04x | ZF: %04x",
+ 			      idx, znd->bmkeys->wp_crc[idx],
+ 				   znd->bmkeys->zf_crc[idx]);
+ 		}
+@@ -4150,7 +4148,7 @@ static int z_mapped_init(struct zoned *znd)
+ 	if (lba == sblba)
+ 		lba++;
+ 
+-        /* read in CRC pgs */
++	/* read in CRC pgs */
+ 	rc = read_block(ti, DM_IO_VMA, znd->md_crcs, lba, 2, wq);
+ 	if (rc)
+ 		goto out;
+@@ -4192,7 +4190,7 @@ static int z_mapped_init(struct zoned *znd)
+ 	znd->discard_count = 0;
+ 	for (idx = 0; idx < znd->gz_count; idx++) {
+ 		struct meta_pg *wpg = &znd->wp[idx];
+-                __le16 crc_wp;
++		__le16 crc_wp;
+ 		__le16 crc_zf;
+ 
+ 		rc = read_block(ti, DM_IO_KMEM, wpg->wp_alloc, lba, 1, wq);
+@@ -5285,7 +5283,8 @@ static void update_stale_ratio(struct zoned *znd, u32 zone)
+  * @delay: Delay queue metric
+  * @gfp: Allocation scheme.
+  */
+-static int z_zone_compact_queue(struct zoned *znd, u32 z_gc, int delay, gfp_t gfp)
++static
++int z_zone_compact_queue(struct zoned *znd, u32 z_gc, int delay, gfp_t gfp)
+ {
+ 	unsigned long flags;
+ 	int do_queue = 0;
+@@ -6482,7 +6481,7 @@ static int _sync_dirty(struct zoned *znd, int bit_type, int sync, int *_drop)
+ 					ZDM_FREE(znd, pg, Z_C4K, PG_27);
+ 					znd->incore_count--;
+ 
+-                                        if (!test_bit(IS_FLUSH, &expg->flags))
++					if (!test_bit(IS_FLUSH, &expg->flags))
+ 						want_flush++;
+ 				}
+ 				mutex_unlock(&expg->md_lock);
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 5c93f2e..30f3261 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -7006,8 +7006,9 @@ static int run(struct mddev *mddev)
+ 
+ 			if (!bdev_discard_raid_safe(rdev->bdev)) {
+ 				if (discard_supported) {
+-pr_info("md/raid456: discard support disabled !RAID SAFE.\n");
+-pr_info("Set raid5_trim on ZDM.\n");
++					pr_info("md/raid456: No discard: %s.\n",
++						"!RAID SAFE");
++					pr_info("Set raid5_trim on ZDM.\n");
+ 				}
+ 				discard_supported = false;
+ 			}
+diff --git a/lib/idr.c b/lib/idr.c
+index 106aca6..860ff66 100644
+--- a/lib/idr.c
++++ b/lib/idr.c
+@@ -1057,7 +1057,8 @@ EXPORT_SYMBOL(__ida_remove);
+ void ida_remove(struct ida *ida, int id)
+ {
+ 	if (__ida_remove(ida, id))
+-		WARN(1, "ida_remove called for id=%d which is not allocated.\n", id);
++		WARN(1, "ida_remove called for id=%d which is not allocated.\n",
++			id);
+ }
+ EXPORT_SYMBOL(ida_remove);
+ 
+-- 
+2.7.0
+

@@ -1,0 +1,1475 @@
+From e340f80781f60c4355fdb38fb8d916d488fe822e Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Mon, 18 Apr 2016 03:04:00 -0500
+Subject: [PATCH 42/93] block, drivers, fs: rename REQ_FLUSH to REQ_PREFLUSH
+
+To avoid confusion between REQ_OP_FLUSH, which is handled by
+request_fn drivers, and upper layers requesting the block layer
+perform a flush sequence along with possibly a WRITE, this patch
+renames REQ_FLUSH to REQ_PREFLUSH.
+
+Signed-off-by: Mike Christie <mchristi@redhat.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Hannes Reinecke <hare@suse.com>
+
+Modified for v4.6-rc6
+Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
+---
+ Documentation/block/writeback_cache_control.txt | 22 ++++-----
+ Documentation/device-mapper/log-writes.txt      | 10 ++--
+ block/blk-core.c                                | 12 ++---
+ block/blk-flush.c                               | 20 ++++----
+ block/blk-mq.c                                  |  4 +-
+ block/blk-settings.c                            | 10 ++--
+ drivers/block/drbd/drbd_actlog.c                |  4 +-
+ drivers/block/drbd/drbd_main.c                  |  4 +-
+ drivers/block/drbd/drbd_protocol.h              |  2 +-
+ drivers/block/drbd/drbd_receiver.c              |  2 +-
+ drivers/block/drbd/drbd_req.c                   |  2 +-
+ drivers/block/loop.c                            |  6 +--
+ drivers/block/nbd.c                             | 10 ++--
+ drivers/block/osdblk.c                          |  2 +-
+ drivers/block/ps3disk.c                         |  2 +-
+ drivers/block/skd_main.c                        |  2 +-
+ drivers/block/virtio_blk.c                      |  2 +-
+ drivers/ide/ide-disk.c                          |  2 +-
+ drivers/md/bcache/journal.c                     |  2 +-
+ drivers/md/bcache/request.c                     |  8 ++--
+ drivers/md/bcache/super.c                       |  2 +-
+ drivers/md/dm-cache-target.c                    | 12 ++---
+ drivers/md/dm-crypt.c                           |  7 +--
+ drivers/md/dm-era-target.c                      |  4 +-
+ drivers/md/dm-io.c                              |  2 +-
+ drivers/md/dm-log-writes.c                      |  2 +-
+ drivers/md/dm-raid1.c                           |  5 +-
+ drivers/md/dm-region-hash.c                     |  4 +-
+ drivers/md/dm-snap.c                            |  6 +--
+ drivers/md/dm-stripe.c                          |  2 +-
+ drivers/md/dm-table.c                           |  4 +-
+ drivers/md/dm-thin.c                            |  8 ++--
+ drivers/md/dm.c                                 | 12 ++---
+ drivers/md/linear.c                             |  2 +-
+ drivers/md/md.c                                 |  4 +-
+ drivers/md/md.h                                 |  2 +-
+ drivers/md/multipath.c                          |  2 +-
+ drivers/md/raid0.c                              |  2 +-
+ drivers/md/raid1.c                              |  3 +-
+ drivers/md/raid10.c                             |  2 +-
+ drivers/md/raid5-cache.c                        |  2 +-
+ drivers/md/raid5.c                              |  2 +-
+ drivers/mmc/card/block.c                        |  2 +-
+ drivers/mtd/mtd_blkdevs.c                       |  2 +-
+ drivers/nvme/host/core.c                        |  2 +-
+ drivers/nvme/host/pci.c                         |  2 +-
+ drivers/scsi/sd.c                               | 62 ++++++++++++-------------
+ drivers/target/target_core_iblock.c             |  4 +-
+ fs/btrfs/check-integrity.c                      |  8 ++--
+ fs/jbd2/journal.c                               |  2 +-
+ fs/xfs/xfs_buf.c                                |  2 +-
+ include/linux/blk_types.h                       |  8 ++--
+ include/linux/fs.h                              |  4 +-
+ include/trace/events/f2fs.h                     |  2 +-
+ kernel/trace/blktrace.c                         |  5 +-
+ 55 files changed, 164 insertions(+), 160 deletions(-)
+
+diff --git a/Documentation/block/writeback_cache_control.txt b/Documentation/block/writeback_cache_control.txt
+index ea5550f..ec005d1 100644
+--- a/Documentation/block/writeback_cache_control.txt
++++ b/Documentation/block/writeback_cache_control.txt
+@@ -20,11 +20,11 @@ a forced cache flush, and the Force Unit Access (FUA) flag for requests.
+ Explicit cache flushes
+ ----------------------
+ 
+-The REQ_FLUSH flag can be OR ed into the r/w flags of a bio submitted from
++The REQ_PREFLUSH flag can be OR ed into the r/w flags of a bio submitted from
+ the filesystem and will make sure the volatile cache of the storage device
+ has been flushed before the actual I/O operation is started.  This explicitly
+ guarantees that previously completed write requests are on non-volatile
+-storage before the flagged bio starts. In addition the REQ_FLUSH flag can be
++storage before the flagged bio starts. In addition the REQ_PREFLUSH flag can be
+ set on an otherwise empty bio structure, which causes only an explicit cache
+ flush without any dependent I/O.  It is recommend to use
+ the blkdev_issue_flush() helper for a pure cache flush.
+@@ -41,21 +41,21 @@ signaled after the data has been committed to non-volatile storage.
+ Implementation details for filesystems
+ --------------------------------------
+ 
+-Filesystems can simply set the REQ_FLUSH and REQ_FUA bits and do not have to
++Filesystems can simply set the REQ_PREFLUSH and REQ_FUA bits and do not have to
+ worry if the underlying devices need any explicit cache flushing and how
+-the Forced Unit Access is implemented.  The REQ_FLUSH and REQ_FUA flags
++the Forced Unit Access is implemented.  The REQ_PREFLUSH and REQ_FUA flags
+ may both be set on a single bio.
+ 
+ 
+ Implementation details for make_request_fn based block drivers
+ --------------------------------------------------------------
+ 
+-These drivers will always see the REQ_FLUSH and REQ_FUA bits as they sit
++These drivers will always see the REQ_PREFLUSH and REQ_FUA bits as they sit
+ directly below the submit_bio interface.  For remapping drivers the REQ_FUA
+ bits need to be propagated to underlying devices, and a global flush needs
+-to be implemented for bios with the REQ_FLUSH bit set.  For real device
+-drivers that do not have a volatile cache the REQ_FLUSH and REQ_FUA bits
+-on non-empty bios can simply be ignored, and REQ_FLUSH requests without
++to be implemented for bios with the REQ_PREFLUSH bit set.  For real device
++drivers that do not have a volatile cache the REQ_PREFLUSH and REQ_FUA bits
++on non-empty bios can simply be ignored, and REQ_PREFLUSH requests without
+ data can be completed successfully without doing any work.  Drivers for
+ devices with volatile caches need to implement the support for these
+ flags themselves without any help from the block layer.
+@@ -65,8 +65,8 @@ Implementation details for request_fn based block drivers
+ --------------------------------------------------------------
+ 
+ For devices that do not support volatile write caches there is no driver
+-support required, the block layer completes empty REQ_FLUSH requests before
+-entering the driver and strips off the REQ_FLUSH and REQ_FUA bits from
++support required, the block layer completes empty REQ_PREFLUSH requests before
++entering the driver and strips off the REQ_PREFLUSH and REQ_FUA bits from
+ requests that have a payload.  For devices with volatile write caches the
+ driver needs to tell the block layer that it supports flushing caches by
+ doing:
+@@ -74,7 +74,7 @@ doing:
+ 	blk_queue_flush(sdkp->disk->queue, REQ_FLUSH);
+ 
+ and handle empty REQ_OP_FLUSH requests in its prep_fn/request_fn.  Note that
+-REQ_FLUSH requests with a payload are automatically turned into a sequence
++REQ_PREFLUSH requests with a payload are automatically turned into a sequence
+ of an empty REQ_OP_FLUSH request followed by the actual write by the block
+ layer.  For devices that also support the FUA bit the block layer needs
+ to be told to pass through the REQ_FUA bit using:
+diff --git a/Documentation/device-mapper/log-writes.txt b/Documentation/device-mapper/log-writes.txt
+index c10f30c..f4ebcba 100644
+--- a/Documentation/device-mapper/log-writes.txt
++++ b/Documentation/device-mapper/log-writes.txt
+@@ -14,14 +14,14 @@ Log Ordering
+ 
+ We log things in order of completion once we are sure the write is no longer in
+ cache.  This means that normal WRITE requests are not actually logged until the
+-next REQ_FLUSH request.  This is to make it easier for userspace to replay the
+-log in a way that correlates to what is on disk and not what is in cache, to
+-make it easier to detect improper waiting/flushing.
++next REQ_PREFLUSH request.  This is to make it easier for userspace to replay
++the log in a way that correlates to what is on disk and not what is in cache,
++to make it easier to detect improper waiting/flushing.
+ 
+ This works by attaching all WRITE requests to a list once the write completes.
+-Once we see a REQ_FLUSH request we splice this list onto the request and once
++Once we see a REQ_PREFLUSH request we splice this list onto the request and once
+ the FLUSH request completes we log all of the WRITEs and then the FLUSH.  Only
+-completed WRITEs, at the time the REQ_FLUSH is issued, are added in order to
++completed WRITEs, at the time the REQ_PREFLUSH is issued, are added in order to
+ simulate the worst case scenario with regard to power failures.  Consider the
+ following example (W means write, C means complete):
+ 
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 09b1cbc..30c22ec 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -1029,7 +1029,7 @@ static bool blk_rq_should_init_elevator(struct bio *bio)
+ 	 * Flush requests do not use the elevator so skip initialization.
+ 	 * This allows a request to share the flush and elevator data.
+ 	 */
+-	if (bio->bi_rw & (REQ_FLUSH | REQ_FUA))
++	if (bio->bi_rw & (REQ_PREFLUSH | REQ_FUA))
+ 		return false;
+ 
+ 	return true;
+@@ -1736,7 +1736,7 @@ static blk_qc_t blk_queue_bio(struct request_queue *q, struct bio *bio)
+ 		return BLK_QC_T_NONE;
+ 	}
+ 
+-	if (bio->bi_rw & (REQ_FLUSH | REQ_FUA)) {
++	if (bio->bi_rw & (REQ_PREFLUSH | REQ_FUA)) {
+ 		spin_lock_irq(q->queue_lock);
+ 		where = ELEVATOR_INSERT_FLUSH;
+ 		goto get_rq;
+@@ -1968,8 +1968,8 @@ generic_make_request_checks(struct bio *bio)
+ 	 * drivers without flush support don't have to worry
+ 	 * about them.
+ 	 */
+-	if ((bio->bi_rw & (REQ_FLUSH | REQ_FUA)) && !q->flush_flags) {
+-		bio->bi_rw &= ~(REQ_FLUSH | REQ_FUA);
++	if ((bio->bi_rw & (REQ_PREFLUSH | REQ_FUA)) && !q->flush_flags) {
++		bio->bi_rw &= ~(REQ_PREFLUSH | REQ_FUA);
+ 		if (!nr_sectors) {
+ 			err = 0;
+ 			goto end_io;
+@@ -2216,7 +2216,7 @@ int blk_insert_cloned_request(struct request_queue *q, struct request *rq)
+ 	 */
+ 	BUG_ON(blk_queued_rq(rq));
+ 
+-	if (rq->cmd_flags & (REQ_FLUSH|REQ_FUA))
++	if (rq->cmd_flags & (REQ_PREFLUSH | REQ_FUA))
+ 		where = ELEVATOR_INSERT_FLUSH;
+ 
+ 	add_acct_request(q, rq, where);
+@@ -3310,7 +3310,7 @@ void blk_flush_plug_list(struct blk_plug *plug, bool from_schedule)
+ 		/*
+ 		 * rq is already accounted, so use raw insert
+ 		 */
+-		if (rq->cmd_flags & (REQ_FLUSH | REQ_FUA))
++		if (rq->cmd_flags & (REQ_PREFLUSH | REQ_FUA))
+ 			__elv_add_request(q, rq, ELEVATOR_INSERT_FLUSH);
+ 		else
+ 			__elv_add_request(q, rq, ELEVATOR_INSERT_SORT_MERGE);
+diff --git a/block/blk-flush.c b/block/blk-flush.c
+index af0c805..344965e 100644
+--- a/block/blk-flush.c
++++ b/block/blk-flush.c
+@@ -10,8 +10,8 @@
+  * optional steps - PREFLUSH, DATA and POSTFLUSH - according to the request
+  * properties and hardware capability.
+  *
+- * If a request doesn't have data, only REQ_FLUSH makes sense, which
+- * indicates a simple flush request.  If there is data, REQ_FLUSH indicates
++ * If a request doesn't have data, only REQ_PREFLUSH makes sense, which
++ * indicates a simple flush request.  If there is data, REQ_PREFLUSH indicates
+  * that the device cache should be flushed before the data is executed, and
+  * REQ_FUA means that the data must be on non-volatile media on request
+  * completion.
+@@ -20,11 +20,11 @@
+  * difference.  The requests are either completed immediately if there's no
+  * data or executed as normal requests otherwise.
+  *
+- * If the device has writeback cache and supports FUA, REQ_FLUSH is
++ * If the device has writeback cache and supports FUA, REQ_PREFLUSH is
+  * translated to PREFLUSH but REQ_FUA is passed down directly with DATA.
+  *
+- * If the device has writeback cache and doesn't support FUA, REQ_FLUSH is
+- * translated to PREFLUSH and REQ_FUA to POSTFLUSH.
++ * If the device has writeback cache and doesn't support FUA, REQ_PREFLUSH
++ * is translated to PREFLUSH and REQ_FUA to POSTFLUSH.
+  *
+  * The actual execution of flush is double buffered.  Whenever a request
+  * needs to execute PRE or POSTFLUSH, it queues at
+@@ -95,15 +95,15 @@ enum {
+ static bool blk_kick_flush(struct request_queue *q,
+ 			   struct blk_flush_queue *fq);
+ 
+-static unsigned int blk_flush_policy(unsigned int fflags, struct request *rq)
++static unsigned int blk_flush_policy(unsigned long fflags, struct request *rq)
+ {
+ 	unsigned int policy = 0;
+ 
+ 	if (blk_rq_sectors(rq))
+ 		policy |= REQ_FSEQ_DATA;
+ 
+-	if (fflags & REQ_FLUSH) {
+-		if (rq->cmd_flags & REQ_FLUSH)
++	if (fflags & REQ_PREFLUSH) {
++		if (rq->cmd_flags & REQ_PREFLUSH)
+ 			policy |= REQ_FSEQ_PREFLUSH;
+ 		if (!(fflags & REQ_FUA) && (rq->cmd_flags & REQ_FUA))
+ 			policy |= REQ_FSEQ_POSTFLUSH;
+@@ -391,9 +391,9 @@ void blk_insert_flush(struct request *rq)
+ 
+ 	/*
+ 	 * @policy now records what operations need to be done.  Adjust
+-	 * REQ_FLUSH and FUA for the driver.
++	 * REQ_PREFLUSH and FUA for the driver.
+ 	 */
+-	rq->cmd_flags &= ~REQ_FLUSH;
++	rq->cmd_flags &= ~REQ_PREFLUSH;
+ 	if (!(fflags & REQ_FUA))
+ 		rq->cmd_flags &= ~REQ_FUA;
+ 
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 840f57a..6b0c98d 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -1249,7 +1249,7 @@ static int blk_mq_direct_issue_request(struct request *rq, blk_qc_t *cookie)
+ static blk_qc_t blk_mq_make_request(struct request_queue *q, struct bio *bio)
+ {
+ 	const int is_sync = rw_is_sync(bio->bi_op, bio->bi_rw);
+-	const int is_flush_fua = bio->bi_rw & (REQ_FLUSH | REQ_FUA);
++	const int is_flush_fua = bio->bi_rw & (REQ_PREFLUSH | REQ_FUA);
+ 	struct blk_map_ctx data;
+ 	struct request *rq;
+ 	unsigned int request_count = 0;
+@@ -1346,7 +1346,7 @@ done:
+ static blk_qc_t blk_sq_make_request(struct request_queue *q, struct bio *bio)
+ {
+ 	const int is_sync = rw_is_sync(bio->bi_op, bio->bi_rw);
+-	const int is_flush_fua = bio->bi_rw & (REQ_FLUSH | REQ_FUA);
++	const int is_flush_fua = bio->bi_rw & (REQ_PREFLUSH | REQ_FUA);
+ 	struct blk_plug *plug;
+ 	unsigned int request_count = 0;
+ 	struct blk_map_ctx data;
+diff --git a/block/blk-settings.c b/block/blk-settings.c
+index 331e4ee..b3e55f9 100644
+--- a/block/blk-settings.c
++++ b/block/blk-settings.c
+@@ -823,20 +823,20 @@ EXPORT_SYMBOL(blk_queue_update_dma_alignment);
+ /**
+  * blk_queue_flush - configure queue's cache flush capability
+  * @q:		the request queue for the device
+- * @flush:	0, REQ_FLUSH or REQ_FLUSH | REQ_FUA
++ * @flush:	0, REQ_PREFLUSH or REQ_PREFLUSH | REQ_FUA
+  *
+  * Tell block layer cache flush capability of @q.  If it supports
+- * flushing, REQ_FLUSH should be set.  If it supports bypassing
++ * flushing, REQ_PREFLUSH should be set.  If it supports bypassing
+  * write cache for individual writes, REQ_FUA should be set.
+  */
+ void blk_queue_flush(struct request_queue *q, unsigned int flush)
+ {
+-	WARN_ON_ONCE(flush & ~(REQ_FLUSH | REQ_FUA));
++	WARN_ON_ONCE(flush & ~(REQ_PREFLUSH | REQ_FUA));
+ 
+-	if (WARN_ON_ONCE(!(flush & REQ_FLUSH) && (flush & REQ_FUA)))
++	if (WARN_ON_ONCE(!(flush & REQ_PREFLUSH) && (flush & REQ_FUA)))
+ 		flush &= ~REQ_FUA;
+ 
+-	q->flush_flags = flush & (REQ_FLUSH | REQ_FUA);
++	q->flush_flags = flush & (REQ_PREFLUSH | REQ_FUA);
+ }
+ EXPORT_SYMBOL_GPL(blk_queue_flush);
+ 
+diff --git a/drivers/block/drbd/drbd_actlog.c b/drivers/block/drbd/drbd_actlog.c
+index 2fa8534..b12ff76 100644
+--- a/drivers/block/drbd/drbd_actlog.c
++++ b/drivers/block/drbd/drbd_actlog.c
+@@ -148,7 +148,7 @@ static int _drbd_md_sync_page_io(struct drbd_device *device,
+ 	device->md_io.error = -ENODEV;
+ 
+ 	if ((op == REQ_OP_WRITE) && !test_bit(MD_NO_FUA, &device->flags))
+-		op_flags |= REQ_FUA | REQ_FLUSH;
++		op_flags |= REQ_FUA | REQ_PREFLUSH;
+ 	op_flags |= REQ_SYNC | REQ_NOIDLE;
+ 
+ 	bio = bio_alloc_drbd(GFP_NOIO);
+@@ -848,7 +848,7 @@ int __drbd_change_sync(struct drbd_device *device, sector_t sector, int size,
+ 	unsigned long count = 0;
+ 	sector_t esector, nr_sectors;
+ 
+-	/* This would be an empty REQ_FLUSH, be silent. */
++	/* This would be an empty REQ_PREFLUSH, be silent. */
+ 	if ((mode == SET_OUT_OF_SYNC) && size == 0)
+ 		return 0;
+ 
+diff --git a/drivers/block/drbd/drbd_main.c b/drivers/block/drbd/drbd_main.c
+index 3a93fd2..54ac4ee 100644
+--- a/drivers/block/drbd/drbd_main.c
++++ b/drivers/block/drbd/drbd_main.c
+@@ -1609,7 +1609,7 @@ static u32 bio_flags_to_wire(struct drbd_connection *connection,
+ 	if (connection->agreed_pro_version >= 95)
+ 		return  (bio->bi_rw & REQ_SYNC ? DP_RW_SYNC : 0) |
+ 			(bio->bi_rw & REQ_FUA ? DP_FUA : 0) |
+-			(bio->bi_rw & REQ_FLUSH ? DP_FLUSH : 0) |
++			(bio->bi_rw & REQ_PREFLUSH ? DP_FLUSH : 0) |
+ 			(bio->bi_op == REQ_OP_DISCARD ? DP_DISCARD : 0);
+ 	else
+ 		return bio->bi_rw & REQ_SYNC ? DP_RW_SYNC : 0;
+@@ -2762,7 +2762,7 @@ enum drbd_ret_code drbd_create_device(struct drbd_config_context *adm_ctx, unsig
+ 	q->backing_dev_info.congested_data = device;
+ 
+ 	blk_queue_make_request(q, drbd_make_request);
+-	blk_queue_flush(q, REQ_FLUSH | REQ_FUA);
++	blk_queue_flush(q, REQ_PREFLUSH | REQ_FUA);
+ 	/* Setting the max_hw_sectors to an odd value of 8kibyte here
+ 	   This triggers a max_bio_size message upon first attach or connect */
+ 	blk_queue_max_hw_sectors(q, DRBD_MAX_BIO_SIZE_SAFE >> 8);
+diff --git a/drivers/block/drbd/drbd_protocol.h b/drivers/block/drbd/drbd_protocol.h
+index ef92453..129f8c7 100644
+--- a/drivers/block/drbd/drbd_protocol.h
++++ b/drivers/block/drbd/drbd_protocol.h
+@@ -112,7 +112,7 @@ struct p_header100 {
+ #define DP_MAY_SET_IN_SYNC    4
+ #define DP_UNPLUG             8 /* not used anymore   */
+ #define DP_FUA               16 /* equals REQ_FUA     */
+-#define DP_FLUSH             32 /* equals REQ_FLUSH   */
++#define DP_FLUSH             32 /* equals REQ_PREFLUSH   */
+ #define DP_DISCARD           64 /* equals REQ_DISCARD */
+ #define DP_SEND_RECEIVE_ACK 128 /* This is a proto B write request */
+ #define DP_SEND_WRITE_ACK   256 /* This is a proto C write request */
+diff --git a/drivers/block/drbd/drbd_receiver.c b/drivers/block/drbd/drbd_receiver.c
+index a0b95da..4303731 100644
+--- a/drivers/block/drbd/drbd_receiver.c
++++ b/drivers/block/drbd/drbd_receiver.c
+@@ -2159,7 +2159,7 @@ static unsigned long wire_flags_to_bio_flags(u32 dpf)
+ {
+ 	return  (dpf & DP_RW_SYNC ? REQ_SYNC : 0) |
+ 		(dpf & DP_FUA ? REQ_FUA : 0) |
+-		(dpf & DP_FLUSH ? REQ_FLUSH : 0);
++		(dpf & DP_FLUSH ? REQ_PREFLUSH : 0);
+ }
+ 
+ static unsigned long wire_flags_to_bio_op(u32 dpf)
+diff --git a/drivers/block/drbd/drbd_req.c b/drivers/block/drbd/drbd_req.c
+index 2255dcf..eef6e95 100644
+--- a/drivers/block/drbd/drbd_req.c
++++ b/drivers/block/drbd/drbd_req.c
+@@ -1132,7 +1132,7 @@ static int drbd_process_write_request(struct drbd_request *req)
+ 	 * replicating, in which case there is no point. */
+ 	if (unlikely(req->i.size == 0)) {
+ 		/* The only size==0 bios we expect are empty flushes. */
+-		D_ASSERT(device, req->master_bio->bi_rw & REQ_FLUSH);
++		D_ASSERT(device, req->master_bio->bi_rw & REQ_PREFLUSH);
+ 		if (remote)
+ 			_req_mod(req, QUEUE_AS_DRBD_BARRIER);
+ 		return remote;
+diff --git a/drivers/block/loop.c b/drivers/block/loop.c
+index be507b7..229b473 100644
+--- a/drivers/block/loop.c
++++ b/drivers/block/loop.c
+@@ -124,13 +124,13 @@ static int xor_init(struct loop_device *lo, const struct loop_info64 *info)
+ 
+ static struct loop_func_table none_funcs = {
+ 	.number = LO_CRYPT_NONE,
+-}; 
++};
+ 
+ static struct loop_func_table xor_funcs = {
+ 	.number = LO_CRYPT_XOR,
+ 	.transfer = transfer_xor,
+ 	.init = xor_init
+-}; 
++};
+ 
+ /* xfer_funcs[0] is special - its release function is never called */
+ static struct loop_func_table *xfer_funcs[MAX_LO_CRYPT] = {
+@@ -943,7 +943,7 @@ static int loop_set_fd(struct loop_device *lo, fmode_t mode,
+ 	mapping_set_gfp_mask(mapping, lo->old_gfp_mask & ~(__GFP_IO|__GFP_FS));
+ 
+ 	if (!(lo_flags & LO_FLAGS_READ_ONLY) && file->f_op->fsync)
+-		blk_queue_flush(lo->lo_queue, REQ_FLUSH);
++		blk_queue_flush(lo->lo_queue, REQ_PREFLUSH);
+ 
+ 	loop_update_dio(lo);
+ 	set_capacity(lo->lo_disk, size);
+diff --git a/drivers/block/nbd.c b/drivers/block/nbd.c
+index 0845f27..a5daf7e 100644
+--- a/drivers/block/nbd.c
++++ b/drivers/block/nbd.c
+@@ -3,7 +3,7 @@
+  *
+  * Note that you can not swap over this thing, yet. Seems to work but
+  * deadlocks sometimes - you can not swap over TCP in general.
+- * 
++ *
+  * Copyright 1997-2000, 2008 Pavel Machek <pavel@ucw.cz>
+  * Parts copyright 2001 Steven Whitehouse <steve@chygwyn.com>
+  *
+@@ -611,7 +611,7 @@ static void nbd_request_handler(struct request_queue *q)
+ 		__releases(q->queue_lock) __acquires(q->queue_lock)
+ {
+ 	struct request *req;
+-	
++
+ 	while ((req = blk_fetch_request(q)) != NULL) {
+ 		struct nbd_device *nbd;
+ 
+@@ -693,7 +693,7 @@ static void nbd_parse_flags(struct nbd_device *nbd, struct block_device *bdev)
+ 	if (nbd->flags & NBD_FLAG_SEND_TRIM)
+ 		queue_flag_set_unlocked(QUEUE_FLAG_DISCARD, nbd->disk->queue);
+ 	if (nbd->flags & NBD_FLAG_SEND_FLUSH)
+-		blk_queue_flush(nbd->disk->queue, REQ_FLUSH);
++		blk_queue_flush(nbd->disk->queue, REQ_PREFLUSH);
+ 	else
+ 		blk_queue_flush(nbd->disk->queue, 0);
+ }
+@@ -729,7 +729,7 @@ static int __nbd_ioctl(struct block_device *bdev, struct nbd_device *nbd,
+ 		nbd_send_req(nbd, &sreq);
+ 		return 0;
+ 	}
+- 
++
+ 	case NBD_CLEAR_SOCK:
+ 		sock_shutdown(nbd);
+ 		nbd_clear_que(nbd);
+@@ -992,7 +992,7 @@ static void nbd_dbg_close(void)
+ #endif
+ 
+ /*
+- * And here should be modules and kernel interface 
++ * And here should be modules and kernel interface
+  *  (Just smiley confuses emacs :-)
+  */
+ 
+diff --git a/drivers/block/osdblk.c b/drivers/block/osdblk.c
+index 3f8a0a0..63d7046 100644
+--- a/drivers/block/osdblk.c
++++ b/drivers/block/osdblk.c
+@@ -437,7 +437,7 @@ static int osdblk_init_disk(struct osdblk_device *osdev)
+ 	blk_queue_stack_limits(q, osd_request_queue(osdev->osd));
+ 
+ 	blk_queue_prep_rq(q, blk_queue_start_tag);
+-	blk_queue_flush(q, REQ_FLUSH);
++	blk_queue_flush(q, REQ_PREFLUSH);
+ 
+ 	disk->queue = q;
+ 
+diff --git a/drivers/block/ps3disk.c b/drivers/block/ps3disk.c
+index 95c524b..c10e2ea 100644
+--- a/drivers/block/ps3disk.c
++++ b/drivers/block/ps3disk.c
+@@ -468,7 +468,7 @@ static int ps3disk_probe(struct ps3_system_bus_device *_dev)
+ 	blk_queue_dma_alignment(queue, dev->blk_size-1);
+ 	blk_queue_logical_block_size(queue, dev->blk_size);
+ 
+-	blk_queue_flush(queue, REQ_FLUSH);
++	blk_queue_flush(queue, REQ_PREFLUSH);
+ 
+ 	blk_queue_max_segments(queue, -1);
+ 	blk_queue_max_segment_size(queue, dev->bounce_size);
+diff --git a/drivers/block/skd_main.c b/drivers/block/skd_main.c
+index a15cc2e..836d344 100644
+--- a/drivers/block/skd_main.c
++++ b/drivers/block/skd_main.c
+@@ -4409,7 +4409,7 @@ static int skd_cons_disk(struct skd_device *skdev)
+ 	disk->queue = q;
+ 	q->queuedata = skdev;
+ 
+-	blk_queue_flush(q, REQ_FLUSH | REQ_FUA);
++	blk_queue_flush(q, REQ_PREFLUSH | REQ_FUA);
+ 	blk_queue_max_segments(q, skdev->sgs_per_request);
+ 	blk_queue_max_hw_sectors(q, SKD_N_MAX_SECTORS);
+ 
+diff --git a/drivers/block/virtio_blk.c b/drivers/block/virtio_blk.c
+index 7b73b33..03c41df 100644
+--- a/drivers/block/virtio_blk.c
++++ b/drivers/block/virtio_blk.c
+@@ -494,7 +494,7 @@ static void virtblk_update_cache_mode(struct virtio_device *vdev)
+ 	struct virtio_blk *vblk = vdev->priv;
+ 
+ 	if (writeback)
+-		blk_queue_flush(vblk->disk->queue, REQ_FLUSH);
++		blk_queue_flush(vblk->disk->queue, REQ_PREFLUSH);
+ 	else
+ 		blk_queue_flush(vblk->disk->queue, 0);
+ 
+diff --git a/drivers/ide/ide-disk.c b/drivers/ide/ide-disk.c
+index 6474ed3..86d6f1d 100644
+--- a/drivers/ide/ide-disk.c
++++ b/drivers/ide/ide-disk.c
+@@ -546,7 +546,7 @@ static void update_flush(ide_drive_t *drive)
+ 		       drive->name, barrier ? "" : "not ");
+ 
+ 		if (barrier) {
+-			flush = REQ_FLUSH;
++			flush = REQ_PREFLUSH;
+ 			blk_queue_prep_rq(drive->queue, idedisk_prep_fn);
+ 		}
+ 	}
+diff --git a/drivers/md/bcache/journal.c b/drivers/md/bcache/journal.c
+index 68fa0f0..6e0a330 100644
+--- a/drivers/md/bcache/journal.c
++++ b/drivers/md/bcache/journal.c
+@@ -627,7 +627,7 @@ static void journal_write_unlocked(struct closure *cl)
+ 		bio->bi_iter.bi_sector	= PTR_OFFSET(k, i);
+ 		bio->bi_bdev	= ca->bdev;
+ 		bio->bi_op	= REQ_OP_WRITE;
+-		bio->bi_rw	= REQ_SYNC|REQ_META|REQ_FLUSH|REQ_FUA;
++		bio->bi_rw	= REQ_SYNC|REQ_META|REQ_PREFLUSH|REQ_FUA;
+ 		bio->bi_iter.bi_size = sectors << 9;
+ 
+ 		bio->bi_end_io	= journal_write_endio;
+diff --git a/drivers/md/bcache/request.c b/drivers/md/bcache/request.c
+index be8cd63f..3947114 100644
+--- a/drivers/md/bcache/request.c
++++ b/drivers/md/bcache/request.c
+@@ -205,10 +205,10 @@ static void bch_data_insert_start(struct closure *cl)
+ 		return bch_data_invalidate(cl);
+ 
+ 	/*
+-	 * Journal writes are marked REQ_FLUSH; if the original write was a
++	 * Journal writes are marked REQ_PREFLUSH; if the original write was a
+ 	 * flush, it'll wait on the journal write.
+ 	 */
+-	bio->bi_rw &= ~(REQ_FLUSH|REQ_FUA);
++	bio->bi_rw &= ~(REQ_PREFLUSH|REQ_FUA);
+ 
+ 	do {
+ 		unsigned i;
+@@ -668,7 +668,7 @@ static inline struct search *search_alloc(struct bio *bio,
+ 	s->iop.write_prio	= 0;
+ 	s->iop.error		= 0;
+ 	s->iop.flags		= 0;
+-	s->iop.flush_journal	= (bio->bi_rw & (REQ_FLUSH|REQ_FUA)) != 0;
++	s->iop.flush_journal	= (bio->bi_rw & (REQ_PREFLUSH|REQ_FUA)) != 0;
+ 	s->iop.wq		= bcache_wq;
+ 
+ 	return s;
+@@ -920,7 +920,7 @@ static void cached_dev_write(struct cached_dev *dc, struct search *s)
+ 		bch_writeback_add(dc);
+ 		s->iop.bio = bio;
+ 
+-		if (bio->bi_rw & REQ_FLUSH) {
++		if (bio->bi_rw & REQ_PREFLUSH) {
+ 			/* Also need to send a flush to the backing device */
+ 			struct bio *flush = bio_alloc_bioset(GFP_NOIO, 0,
+ 							     dc->disk.bio_split);
+diff --git a/drivers/md/bcache/super.c b/drivers/md/bcache/super.c
+index 25e4b5d..9258eb0 100644
+--- a/drivers/md/bcache/super.c
++++ b/drivers/md/bcache/super.c
+@@ -820,7 +820,7 @@ static int bcache_device_init(struct bcache_device *d, unsigned block_size,
+ 	clear_bit(QUEUE_FLAG_ADD_RANDOM, &d->disk->queue->queue_flags);
+ 	set_bit(QUEUE_FLAG_DISCARD,	&d->disk->queue->queue_flags);
+ 
+-	blk_queue_flush(q, REQ_FLUSH|REQ_FUA);
++	blk_queue_flush(q, REQ_PREFLUSH|REQ_FUA);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/md/dm-cache-target.c b/drivers/md/dm-cache-target.c
+index 838f784..af753a6 100644
+--- a/drivers/md/dm-cache-target.c
++++ b/drivers/md/dm-cache-target.c
+@@ -788,7 +788,7 @@ static void check_if_tick_bio_needed(struct cache *cache, struct bio *bio)
+ 
+ 	spin_lock_irqsave(&cache->lock, flags);
+ 	if (cache->need_tick_bio &&
+-	    !(bio->bi_rw & (REQ_FUA | REQ_FLUSH)) &&
++	    !(bio->bi_rw & (REQ_FUA | REQ_PREFLUSH)) &&
+ 	    bio->bi_op != REQ_OP_DISCARD) {
+ 		pb->tick = true;
+ 		cache->need_tick_bio = false;
+@@ -830,7 +830,7 @@ static dm_oblock_t get_bio_block(struct cache *cache, struct bio *bio)
+ 
+ static int bio_triggers_commit(struct cache *cache, struct bio *bio)
+ {
+-	return bio->bi_rw & (REQ_FLUSH | REQ_FUA);
++	return bio->bi_rw & (REQ_PREFLUSH | REQ_FUA);
+ }
+ 
+ /*
+@@ -1069,7 +1069,7 @@ static void dec_io_migrations(struct cache *cache)
+ static bool discard_or_flush(struct bio *bio)
+ {
+ 	return bio->bi_op == REQ_OP_DISCARD ||
+-	       bio->bi_rw & (REQ_FLUSH | REQ_FUA);
++	       bio->bi_rw & (REQ_PREFLUSH | REQ_FUA);
+ }
+ 
+ static void __cell_defer(struct cache *cache, struct dm_bio_prison_cell *cell)
+@@ -1614,8 +1614,8 @@ static void process_flush_bio(struct cache *cache, struct bio *bio)
+ 		remap_to_cache(cache, bio, 0);
+ 
+ 	/*
+-	 * REQ_FLUSH is not directed at any particular block so we don't
+-	 * need to inc_ds().  REQ_FUA's are split into a write + REQ_FLUSH
++	 * REQ_PREFLUSH is not directed at any particular block so we don't
++	 * need to inc_ds().  REQ_FUA's are split into a write + REQ_PREFLUSH
+ 	 * by dm-core.
+ 	 */
+ 	issue(cache, bio);
+@@ -1980,7 +1980,7 @@ static void process_deferred_bios(struct cache *cache)
+ 
+ 		bio = bio_list_pop(&bios);
+ 
+-		if (bio->bi_rw & REQ_FLUSH)
++		if (bio->bi_rw & REQ_PREFLUSH)
+ 			process_flush_bio(cache, bio);
+ 		else if (bio->bi_op == REQ_OP_DISCARD)
+ 			process_discard_bio(cache, &structs, bio);
+diff --git a/drivers/md/dm-crypt.c b/drivers/md/dm-crypt.c
+index 3a4ddad..9481dbc 100644
+--- a/drivers/md/dm-crypt.c
++++ b/drivers/md/dm-crypt.c
+@@ -1912,11 +1912,12 @@ static int crypt_map(struct dm_target *ti, struct bio *bio)
+ 	struct crypt_config *cc = ti->private;
+ 
+ 	/*
+-	 * If bio is REQ_FLUSH or REQ_DISCARD, just bypass crypt queues.
+-	 * - for REQ_FLUSH device-mapper core ensures that no IO is in-flight
++	 * If bio is REQ_PREFLUSH or REQ_DISCARD, just bypass crypt queues.
++	 * - for REQ_PREFLUSH device-mapper core ensures that no IO is in-flight
+ 	 * - for REQ_DISCARD caller must use flush if IO ordering matters
+ 	 */
+-	if (unlikely(bio->bi_rw & REQ_FLUSH || bio->bi_op == REQ_OP_DISCARD)) {
++	if (unlikely(bio->bi_rw & REQ_PREFLUSH ||
++	    bio->bi_op == REQ_OP_DISCARD)) {
+ 		bio->bi_bdev = cc->dev->bdev;
+ 		if (bio_sectors(bio))
+ 			bio->bi_iter.bi_sector = cc->start +
+diff --git a/drivers/md/dm-era-target.c b/drivers/md/dm-era-target.c
+index 665bf32..2faf49d8 100644
+--- a/drivers/md/dm-era-target.c
++++ b/drivers/md/dm-era-target.c
+@@ -1540,9 +1540,9 @@ static int era_map(struct dm_target *ti, struct bio *bio)
+ 	remap_to_origin(era, bio);
+ 
+ 	/*
+-	 * REQ_FLUSH bios carry no data, so we're not interested in them.
++	 * REQ_PREFLUSH bios carry no data, so we're not interested in them.
+ 	 */
+-	if (!(bio->bi_rw & REQ_FLUSH) &&
++	if (!(bio->bi_rw & REQ_PREFLUSH) &&
+ 	    (bio_data_dir(bio) == WRITE) &&
+ 	    !metadata_current_marked(era->md, block)) {
+ 		defer_bio(era, bio);
+diff --git a/drivers/md/dm-io.c b/drivers/md/dm-io.c
+index 0f723ca..f96ba41 100644
+--- a/drivers/md/dm-io.c
++++ b/drivers/md/dm-io.c
+@@ -381,7 +381,7 @@ static void dispatch_io(int op, int op_flags, unsigned int num_regions,
+ 	 */
+ 	for (i = 0; i < num_regions; i++) {
+ 		*dp = old_pages;
+-		if (where[i].count || (op_flags & REQ_FLUSH))
++		if (where[i].count || (op_flags & REQ_PREFLUSH))
+ 			do_region(op, op_flags, i, where + i, dp, io);
+ 	}
+ 
+diff --git a/drivers/md/dm-log-writes.c b/drivers/md/dm-log-writes.c
+index e991405..73793bd 100644
+--- a/drivers/md/dm-log-writes.c
++++ b/drivers/md/dm-log-writes.c
+@@ -555,7 +555,7 @@ static int log_writes_map(struct dm_target *ti, struct bio *bio)
+ 	struct bio_vec bv;
+ 	size_t alloc_size;
+ 	int i = 0;
+-	bool flush_bio = (bio->bi_rw & REQ_FLUSH);
++	bool flush_bio = (bio->bi_rw & REQ_PREFLUSH);
+ 	bool fua_bio = (bio->bi_rw & REQ_FUA);
+ 	bool discard_bio = (bio->bi_op == REQ_OP_DISCARD);
+ 
+diff --git a/drivers/md/dm-raid1.c b/drivers/md/dm-raid1.c
+index c4d23da..bd1ba80 100644
+--- a/drivers/md/dm-raid1.c
++++ b/drivers/md/dm-raid1.c
+@@ -704,7 +704,7 @@ static void do_writes(struct mirror_set *ms, struct bio_list *writes)
+ 	bio_list_init(&requeue);
+ 
+ 	while ((bio = bio_list_pop(writes))) {
+-		if ((bio->bi_rw & REQ_FLUSH) ||
++		if ((bio->bi_rw & REQ_PREFLUSH) ||
+ 		    (bio->bi_op == REQ_OP_DISCARD)) {
+ 			bio_list_add(&sync, bio);
+ 			continue;
+@@ -1253,7 +1253,8 @@ static int mirror_end_io(struct dm_target *ti, struct bio *bio, int error)
+ 	 * We need to dec pending if this was a write.
+ 	 */
+ 	if (rw == WRITE) {
+-		if (!(bio->bi_rw & REQ_FLUSH) && bio->bi_op != REQ_OP_DISCARD)
++		if (!(bio->bi_rw & REQ_PREFLUSH) &&
++		    bio->bi_op != REQ_OP_DISCARD)
+ 			dm_rh_dec(ms->rh, bio_record->write_region);
+ 		return error;
+ 	}
+diff --git a/drivers/md/dm-region-hash.c b/drivers/md/dm-region-hash.c
+index ce4af57..d257428 100644
+--- a/drivers/md/dm-region-hash.c
++++ b/drivers/md/dm-region-hash.c
+@@ -398,7 +398,7 @@ void dm_rh_mark_nosync(struct dm_region_hash *rh, struct bio *bio)
+ 	region_t region = dm_rh_bio_to_region(rh, bio);
+ 	int recovering = 0;
+ 
+-	if (bio->bi_rw & REQ_FLUSH) {
++	if (bio->bi_rw & REQ_PREFLUSH) {
+ 		rh->flush_failure = 1;
+ 		return;
+ 	}
+@@ -526,7 +526,7 @@ void dm_rh_inc_pending(struct dm_region_hash *rh, struct bio_list *bios)
+ 	struct bio *bio;
+ 
+ 	for (bio = bios->head; bio; bio = bio->bi_next) {
+-		if (bio->bi_rw & REQ_FLUSH || bio->bi_op == REQ_OP_DISCARD)
++		if (bio->bi_rw & REQ_PREFLUSH || bio->bi_op == REQ_OP_DISCARD)
+ 			continue;
+ 		rh_inc(rh, dm_rh_bio_to_region(rh, bio));
+ 	}
+diff --git a/drivers/md/dm-snap.c b/drivers/md/dm-snap.c
+index 70bb0e8..69ab1ff 100644
+--- a/drivers/md/dm-snap.c
++++ b/drivers/md/dm-snap.c
+@@ -1680,7 +1680,7 @@ static int snapshot_map(struct dm_target *ti, struct bio *bio)
+ 
+ 	init_tracked_chunk(bio);
+ 
+-	if (bio->bi_rw & REQ_FLUSH) {
++	if (bio->bi_rw & REQ_PREFLUSH) {
+ 		bio->bi_bdev = s->cow->bdev;
+ 		return DM_MAPIO_REMAPPED;
+ 	}
+@@ -1799,7 +1799,7 @@ static int snapshot_merge_map(struct dm_target *ti, struct bio *bio)
+ 
+ 	init_tracked_chunk(bio);
+ 
+-	if (bio->bi_rw & REQ_FLUSH) {
++	if (bio->bi_rw & REQ_PREFLUSH) {
+ 		if (!dm_bio_get_target_bio_nr(bio))
+ 			bio->bi_bdev = s->origin->bdev;
+ 		else
+@@ -2285,7 +2285,7 @@ static int origin_map(struct dm_target *ti, struct bio *bio)
+ 
+ 	bio->bi_bdev = o->dev->bdev;
+ 
+-	if (unlikely(bio->bi_rw & REQ_FLUSH))
++	if (unlikely(bio->bi_rw & REQ_PREFLUSH))
+ 		return DM_MAPIO_REMAPPED;
+ 
+ 	if (bio_rw(bio) != WRITE)
+diff --git a/drivers/md/dm-stripe.c b/drivers/md/dm-stripe.c
+index 12b1630..e6f330c 100644
+--- a/drivers/md/dm-stripe.c
++++ b/drivers/md/dm-stripe.c
+@@ -286,7 +286,7 @@ static int stripe_map(struct dm_target *ti, struct bio *bio)
+ 	uint32_t stripe;
+ 	unsigned target_bio_nr;
+ 
+-	if (bio->bi_rw & REQ_FLUSH) {
++	if (bio->bi_rw & REQ_PREFLUSH) {
+ 		target_bio_nr = dm_bio_get_target_bio_nr(bio);
+ 		BUG_ON(target_bio_nr >= sc->stripes);
+ 		bio->bi_bdev = sc->stripe[target_bio_nr].dev->bdev;
+diff --git a/drivers/md/dm-table.c b/drivers/md/dm-table.c
+index f9e8f0b..99b31e4 100644
+--- a/drivers/md/dm-table.c
++++ b/drivers/md/dm-table.c
+@@ -1518,8 +1518,8 @@ void dm_table_set_restrictions(struct dm_table *t, struct request_queue *q,
+ 	else
+ 		queue_flag_set_unlocked(QUEUE_FLAG_DISCARD, q);
+ 
+-	if (dm_table_supports_flush(t, REQ_FLUSH)) {
+-		flush |= REQ_FLUSH;
++	if (dm_table_supports_flush(t, REQ_PREFLUSH)) {
++		flush |= REQ_PREFLUSH;
+ 		if (dm_table_supports_flush(t, REQ_FUA))
+ 			flush |= REQ_FUA;
+ 	}
+diff --git a/drivers/md/dm-thin.c b/drivers/md/dm-thin.c
+index 9d48139..e20b268 100644
+--- a/drivers/md/dm-thin.c
++++ b/drivers/md/dm-thin.c
+@@ -707,7 +707,7 @@ static void remap_to_origin(struct thin_c *tc, struct bio *bio)
+ 
+ static int bio_triggers_commit(struct thin_c *tc, struct bio *bio)
+ {
+-	return (bio->bi_rw & (REQ_FLUSH | REQ_FUA)) &&
++	return (bio->bi_rw & (REQ_PREFLUSH | REQ_FUA)) &&
+ 		dm_thin_changed_this_transaction(tc->td);
+ }
+ 
+@@ -878,7 +878,7 @@ static void __inc_remap_and_issue_cell(void *context,
+ 	struct bio *bio;
+ 
+ 	while ((bio = bio_list_pop(&cell->bios))) {
+-		if (bio->bi_rw & (REQ_FLUSH | REQ_FUA) ||
++		if (bio->bi_rw & (REQ_PREFLUSH | REQ_FUA) ||
+ 		    bio->bi_op == REQ_OP_DISCARD)
+ 			bio_list_add(&info->defer_bios, bio);
+ 		else {
+@@ -1657,7 +1657,7 @@ static void __remap_and_issue_shared_cell(void *context,
+ 
+ 	while ((bio = bio_list_pop(&cell->bios))) {
+ 		if ((bio_data_dir(bio) == WRITE) ||
+-		    (bio->bi_rw & (REQ_FLUSH | REQ_FUA) ||
++		    (bio->bi_rw & (REQ_PREFLUSH | REQ_FUA) ||
+ 		     bio->bi_op == REQ_OP_DISCARD))
+ 			bio_list_add(&info->defer_bios, bio);
+ 		else {
+@@ -2572,7 +2572,7 @@ static int thin_bio_map(struct dm_target *ti, struct bio *bio)
+ 		return DM_MAPIO_SUBMITTED;
+ 	}
+ 
+-	if (bio->bi_rw & (REQ_FLUSH | REQ_FUA) ||
++	if (bio->bi_rw & (REQ_PREFLUSH | REQ_FUA) ||
+ 	    bio->bi_op == REQ_OP_DISCARD) {
+ 		thin_defer_bio_with_throttle(tc, bio);
+ 		return DM_MAPIO_SUBMITTED;
+diff --git a/drivers/md/dm.c b/drivers/md/dm.c
+index de25bf6..987b900 100644
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@ -1003,12 +1003,12 @@ static void dec_pending(struct dm_io *io, int error)
+ 		if (io_error == DM_ENDIO_REQUEUE)
+ 			return;
+ 
+-		if ((bio->bi_rw & REQ_FLUSH) && bio->bi_iter.bi_size) {
++		if ((bio->bi_rw & REQ_PREFLUSH) && bio->bi_iter.bi_size) {
+ 			/*
+ 			 * Preflush done for flush with data, reissue
+-			 * without REQ_FLUSH.
++			 * without REQ_PREFLUSH.
+ 			 */
+-			bio->bi_rw &= ~REQ_FLUSH;
++			bio->bi_rw &= ~REQ_PREFLUSH;
+ 			queue_io(md, bio);
+ 		} else {
+ 			/* done with normal IO or empty flush */
+@@ -1477,7 +1477,7 @@ EXPORT_SYMBOL_GPL(dm_set_target_max_io_len);
+ 
+ /*
+  * A target may call dm_accept_partial_bio only from the map routine.  It is
+- * allowed for all bio types except REQ_FLUSH.
++ * allowed for all bio types except REQ_PREFLUSH.
+  *
+  * dm_accept_partial_bio informs the dm that the target only wants to process
+  * additional n_sectors sectors of the bio and the rest of the data should be
+@@ -1507,7 +1507,7 @@ void dm_accept_partial_bio(struct bio *bio, unsigned n_sectors)
+ {
+ 	struct dm_target_io *tio = container_of(bio, struct dm_target_io, clone);
+ 	unsigned bi_size = bio->bi_iter.bi_size >> SECTOR_SHIFT;
+-	BUG_ON(bio->bi_rw & REQ_FLUSH);
++	BUG_ON(bio->bi_rw & REQ_PREFLUSH);
+ 	BUG_ON(bi_size > *tio->len_ptr);
+ 	BUG_ON(n_sectors > bi_size);
+ 	*tio->len_ptr -= bi_size - n_sectors;
+@@ -1797,7 +1797,7 @@ static void __split_and_process_bio(struct mapped_device *md,
+ 
+ 	start_io_acct(ci.io);
+ 
+-	if (bio->bi_rw & REQ_FLUSH) {
++	if (bio->bi_rw & REQ_PREFLUSH) {
+ 		ci.bio = &ci.md->flush_bio;
+ 		ci.sector_count = 0;
+ 		error = __send_empty_flush(&ci);
+diff --git a/drivers/md/linear.c b/drivers/md/linear.c
+index aad82c7..657053e 100644
+--- a/drivers/md/linear.c
++++ b/drivers/md/linear.c
+@@ -221,7 +221,7 @@ static void linear_make_request(struct mddev *mddev, struct bio *bio)
+ 	struct bio *split;
+ 	sector_t start_sector, end_sector, data_offset;
+ 
+-	if (unlikely(bio->bi_rw & REQ_FLUSH)) {
++	if (unlikely(bio->bi_rw & REQ_PREFLUSH)) {
+ 		md_flush_request(mddev, bio);
+ 		return;
+ 	}
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index 638f3d6..fffc389 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -413,7 +413,7 @@ static void md_submit_flush_data(struct work_struct *ws)
+ 		/* an empty barrier - all done */
+ 		bio_endio(bio);
+ 	else {
+-		bio->bi_rw &= ~REQ_FLUSH;
++		bio->bi_rw &= ~REQ_PREFLUSH;
+ 		mddev->pers->make_request(mddev, bio);
+ 	}
+ 
+@@ -5044,7 +5044,7 @@ static int md_alloc(dev_t dev, char *name)
+ 	disk->fops = &md_fops;
+ 	disk->private_data = mddev;
+ 	disk->queue = mddev->queue;
+-	blk_queue_flush(mddev->queue, REQ_FLUSH | REQ_FUA);
++	blk_queue_flush(mddev->queue, REQ_PREFLUSH | REQ_FUA);
+ 	/* Allow extended partitions.  This makes the
+ 	 * 'mdp' device redundant, but we can't really
+ 	 * remove it now.
+diff --git a/drivers/md/md.h b/drivers/md/md.h
+index 2e0918f..b4f3352 100644
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@ -424,7 +424,7 @@ struct mddev {
+ 
+ 	/* Generic flush handling.
+ 	 * The last to finish preflush schedules a worker to submit
+-	 * the rest of the request (without the REQ_FLUSH flag).
++	 * the rest of the request (without the REQ_PREFLUSH flag).
+ 	 */
+ 	struct bio *flush_bio;
+ 	atomic_t flush_pending;
+diff --git a/drivers/md/multipath.c b/drivers/md/multipath.c
+index dd483bb..72ea98e 100644
+--- a/drivers/md/multipath.c
++++ b/drivers/md/multipath.c
+@@ -111,7 +111,7 @@ static void multipath_make_request(struct mddev *mddev, struct bio * bio)
+ 	struct multipath_bh * mp_bh;
+ 	struct multipath_info *multipath;
+ 
+-	if (unlikely(bio->bi_rw & REQ_FLUSH)) {
++	if (unlikely(bio->bi_rw & REQ_PREFLUSH)) {
+ 		md_flush_request(mddev, bio);
+ 		return;
+ 	}
+diff --git a/drivers/md/raid0.c b/drivers/md/raid0.c
+index e0d1b8c..f95463d 100644
+--- a/drivers/md/raid0.c
++++ b/drivers/md/raid0.c
+@@ -458,7 +458,7 @@ static void raid0_make_request(struct mddev *mddev, struct bio *bio)
+ 	struct md_rdev *tmp_dev;
+ 	struct bio *split;
+ 
+-	if (unlikely(bio->bi_rw & REQ_FLUSH)) {
++	if (unlikely(bio->bi_rw & REQ_PREFLUSH)) {
+ 		md_flush_request(mddev, bio);
+ 		return;
+ 	}
+diff --git a/drivers/md/raid1.c b/drivers/md/raid1.c
+index c7abd2d..2a2c177 100644
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@ -1056,7 +1056,8 @@ static void raid1_make_request(struct mddev *mddev, struct bio * bio)
+ 	const int op = bio->bi_op;
+ 	const int rw = bio_data_dir(bio);
+ 	const unsigned long do_sync = (bio->bi_rw & REQ_SYNC);
+-	const unsigned long do_flush_fua = (bio->bi_rw & (REQ_FLUSH | REQ_FUA));
++	const unsigned long do_flush_fua = (bio->bi_rw &
++						(REQ_PREFLUSH | REQ_FUA));
+ 	const unsigned long do_sec = (bio->bi_rw & REQ_SECURE);
+ 	struct md_rdev *blocked_rdev;
+ 	struct blk_plug_cb *cb;
+diff --git a/drivers/md/raid10.c b/drivers/md/raid10.c
+index 63cd985..c5dc4e4 100644
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@ -1452,7 +1452,7 @@ static void raid10_make_request(struct mddev *mddev, struct bio *bio)
+ 
+ 	struct bio *split;
+ 
+-	if (unlikely(bio->bi_rw & REQ_FLUSH)) {
++	if (unlikely(bio->bi_rw & REQ_PREFLUSH)) {
+ 		md_flush_request(mddev, bio);
+ 		return;
+ 	}
+diff --git a/drivers/md/raid5-cache.c b/drivers/md/raid5-cache.c
+index da07670..144ddb0 100644
+--- a/drivers/md/raid5-cache.c
++++ b/drivers/md/raid5-cache.c
+@@ -536,7 +536,7 @@ int r5l_handle_flush_request(struct r5l_log *log, struct bio *bio)
+ 		bio_endio(bio);
+ 		return 0;
+ 	}
+-	bio->bi_rw &= ~REQ_FLUSH;
++	bio->bi_rw &= ~REQ_PREFLUSH;
+ 	return -EAGAIN;
+ }
+ 
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 7fb693f..ff7cb4e 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -5159,7 +5159,7 @@ static void raid5_make_request(struct mddev *mddev, struct bio * bi)
+ 	DEFINE_WAIT(w);
+ 	bool do_prepare;
+ 
+-	if (unlikely(bi->bi_rw & REQ_FLUSH)) {
++	if (unlikely(bi->bi_rw & REQ_PREFLUSH)) {
+ 		int ret = r5l_handle_flush_request(conf->log, bi);
+ 
+ 		if (ret == 0)
+diff --git a/drivers/mmc/card/block.c b/drivers/mmc/card/block.c
+index 2a849af..b9adcfa 100644
+--- a/drivers/mmc/card/block.c
++++ b/drivers/mmc/card/block.c
+@@ -2269,7 +2269,7 @@ static struct mmc_blk_data *mmc_blk_alloc_req(struct mmc_card *card,
+ 	    ((card->ext_csd.rel_param & EXT_CSD_WR_REL_PARAM_EN) ||
+ 	     card->ext_csd.rel_sectors)) {
+ 		md->flags |= MMC_BLK_REL_WR;
+-		blk_queue_flush(md->queue.queue, REQ_FLUSH | REQ_FUA);
++		blk_queue_flush(md->queue.queue, REQ_PREFLUSH | REQ_FUA);
+ 	}
+ 
+ 	if (mmc_card_mmc(card) &&
+diff --git a/drivers/mtd/mtd_blkdevs.c b/drivers/mtd/mtd_blkdevs.c
+index 67da1cd..f0d4aa4 100644
+--- a/drivers/mtd/mtd_blkdevs.c
++++ b/drivers/mtd/mtd_blkdevs.c
+@@ -409,7 +409,7 @@ int add_mtd_blktrans_dev(struct mtd_blktrans_dev *new)
+ 		goto error3;
+ 
+ 	if (tr->flush)
+-		blk_queue_flush(new->rq, REQ_FLUSH);
++		blk_queue_flush(new->rq, REQ_PREFLUSH);
+ 
+ 	new->rq->queuedata = new;
+ 	blk_queue_logical_block_size(new->rq, tr->blksize);
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index 643f457..31ca5cc 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -904,7 +904,7 @@ static void nvme_set_queue_limits(struct nvme_ctrl *ctrl,
+ 	if (ctrl->stripe_size)
+ 		blk_queue_chunk_sectors(q, ctrl->stripe_size >> 9);
+ 	if (ctrl->vwc & NVME_CTRL_VWC_PRESENT)
+-		blk_queue_flush(q, REQ_FLUSH | REQ_FUA);
++		blk_queue_flush(q, REQ_PREFLUSH | REQ_FUA);
+ 	blk_queue_virt_boundary(q, ctrl->page_size - 1);
+ }
+ 
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index fcf73fb..fa16cc2 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -661,7 +661,7 @@ static int nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 	} else {
+ 		if (req->cmd_type == REQ_TYPE_DRV_PRIV)
+ 			memcpy(&cmnd, req->cmd, sizeof(cmnd));
+-		else if (req->cmd_flags & REQ_FLUSH)
++		else if (req->cmd_flags & REQ_PREFLUSH)
+ 			nvme_setup_flush(ns, &cmnd);
+ 		else
+ 			nvme_setup_rw(ns, req, &cmnd);
+diff --git a/drivers/scsi/sd.c b/drivers/scsi/sd.c
+index 967cb1d..bd556f0 100644
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -7,20 +7,20 @@
+  *              Subsequent revisions: Eric Youngdale
+  *	Modification history:
+  *       - Drew Eckhardt <drew@colorado.edu> original
+- *       - Eric Youngdale <eric@andante.org> add scatter-gather, multiple 
++ *       - Eric Youngdale <eric@andante.org> add scatter-gather, multiple
+  *         outstanding request, and other enhancements.
+  *         Support loadable low-level scsi drivers.
+- *       - Jirka Hanika <geo@ff.cuni.cz> support more scsi disks using 
++ *       - Jirka Hanika <geo@ff.cuni.cz> support more scsi disks using
+  *         eight major numbers.
+  *       - Richard Gooch <rgooch@atnf.csiro.au> support devfs.
+- *	 - Torben Mathiasen <tmm@image.dk> Resource allocation fixes in 
++ *	 - Torben Mathiasen <tmm@image.dk> Resource allocation fixes in
+  *	   sd_init and cleanups.
+  *	 - Alex Davis <letmein@erols.com> Fix problem where partition info
+- *	   not being read in sd_open. Fix problem where removable media 
++ *	   not being read in sd_open. Fix problem where removable media
+  *	   could be ejected after sd_open.
+  *	 - Douglas Gilbert <dgilbert@interlog.com> cleanup for lk 2.5.x
+- *	 - Badari Pulavarty <pbadari@us.ibm.com>, Matthew Wilcox 
+- *	   <willy@debian.org>, Kurt Garloff <garloff@suse.de>: 
++ *	 - Badari Pulavarty <pbadari@us.ibm.com>, Matthew Wilcox
++ *	   <willy@debian.org>, Kurt Garloff <garloff@suse.de>:
+  *	   Support 32k/1M disks.
+  *
+  *	Logging policy (needs CONFIG_SCSI_LOGGING defined):
+@@ -29,7 +29,7 @@
+  *	 - entering sd_ioctl: SCSI_LOG_IOCTL level 1
+  *	 - entering other commands: SCSI_LOG_HLQUEUE level 3
+  *	Note: when the logging level is set by the user, it must be greater
+- *	than the level indicated above to trigger output.	
++ *	than the level indicated above to trigger output.
+  */
+ 
+ #include <linux/module.h>
+@@ -140,7 +140,7 @@ static void sd_set_flush_flag(struct scsi_disk *sdkp)
+ 	unsigned flush = 0;
+ 
+ 	if (sdkp->WCE) {
+-		flush |= REQ_FLUSH;
++		flush |= REQ_PREFLUSH;
+ 		if (sdkp->DPOFUA)
+ 			flush |= REQ_FUA;
+ 	}
+@@ -539,16 +539,16 @@ static struct kobject *sd_default_probe(dev_t devt, int *partno, void *data)
+ 
+ /*
+  * Device no to disk mapping:
+- * 
++ *
+  *       major         disc2     disc  p1
+  *   |............|.............|....|....| <- dev_t
+  *    31        20 19          8 7  4 3  0
+- * 
++ *
+  * Inside a major, we have 16k disks, however mapped non-
+  * contiguously. The first 16 disks are for major0, the next
+- * ones with major1, ... Disk 256 is for major0 again, disk 272 
+- * for major1, ... 
+- * As we stay compatible with our numbering scheme, we can reuse 
++ * ones with major1, ... Disk 256 is for major0 again, disk 272
++ * for major1, ...
++ * As we stay compatible with our numbering scheme, we can reuse
+  * the well-know SCSI majors 8, 65--71, 136--143.
+  */
+ static int sd_major(int major_idx)
+@@ -935,7 +935,7 @@ static int sd_setup_read_write_cmnd(struct scsi_cmnd *SCpnt)
+ 
+ 	if (sdp->changed) {
+ 		/*
+-		 * quietly refuse to do anything to a changed disc until 
++		 * quietly refuse to do anything to a changed disc until
+ 		 * the changed bit has been reset
+ 		 */
+ 		/* printk("SCSI disk has been changed or is not present. Prohibiting further I/O.\n"); */
+@@ -1172,7 +1172,7 @@ static void sd_uninit_command(struct scsi_cmnd *SCpnt)
+  *	@inode: only i_rdev member may be used
+  *	@filp: only f_mode and f_flags may be used
+  *
+- *	Returns 0 if successful. Returns a negated errno value in case 
++ *	Returns 0 if successful. Returns a negated errno value in case
+  *	of error.
+  *
+  *	Note: This can be called from a user context (e.g. fsck(1) )
+@@ -1240,7 +1240,7 @@ static int sd_open(struct block_device *bdev, fmode_t mode)
+ 
+ error_out:
+ 	scsi_disk_put(sdkp);
+-	return retval;	
++	return retval;
+ }
+ 
+ /**
+@@ -1249,7 +1249,7 @@ error_out:
+  *	@inode: only i_rdev member may be used
+  *	@filp: only f_mode and f_flags may be used
+  *
+- *	Returns 0. 
++ *	Returns 0.
+  *
+  *	Note: may block (uninterruptible) if error recovery is underway
+  *	on this disk.
+@@ -1323,7 +1323,7 @@ static int sd_ioctl(struct block_device *bdev, fmode_t mode,
+ 	struct scsi_device *sdp = sdkp->device;
+ 	void __user *p = (void __user *)arg;
+ 	int error;
+-    
++
+ 	SCSI_LOG_IOCTL(1, sd_printk(KERN_INFO, sdkp, "sd_ioctl: disk=%s, "
+ 				    "cmd=0x%x\n", disk->disk_name, cmd));
+ 
+@@ -1533,9 +1533,9 @@ static void sd_rescan(struct device *dev)
+ 
+ 
+ #ifdef CONFIG_COMPAT
+-/* 
+- * This gets directly called from VFS. When the ioctl 
+- * is not recognized we go back to the other translation paths. 
++/*
++ * This gets directly called from VFS. When the ioctl
++ * is not recognized we go back to the other translation paths.
+  */
+ static int sd_compat_ioctl(struct block_device *bdev, fmode_t mode,
+ 			   unsigned int cmd, unsigned long arg)
+@@ -1547,12 +1547,12 @@ static int sd_compat_ioctl(struct block_device *bdev, fmode_t mode,
+ 			(mode & FMODE_NDELAY) != 0);
+ 	if (error)
+ 		return error;
+-	       
+-	/* 
++
++	/*
+ 	 * Let the static ioctl translation table take care of it.
+ 	 */
+ 	if (!sdev->host->hostt->compat_ioctl)
+-		return -ENOIOCTLCMD; 
++		return -ENOIOCTLCMD;
+ 	return sdev->host->hostt->compat_ioctl(sdev, cmd, (void __user *)arg);
+ }
+ #endif
+@@ -1894,7 +1894,7 @@ sd_spinup_disk(struct scsi_disk *sdkp)
+ 			if (the_result)
+ 				sense_valid = scsi_sense_valid(&sshdr);
+ 			retries++;
+-		} while (retries < 3 && 
++		} while (retries < 3 &&
+ 			 (!scsi_status_is_good(the_result) ||
+ 			  ((driver_byte(the_result) & DRIVER_SENSE) &&
+ 			  sense_valid && sshdr.sense_key == UNIT_ATTENTION)));
+@@ -1967,7 +1967,7 @@ sd_spinup_disk(struct scsi_disk *sdkp)
+ 			}
+ 			break;
+ 		}
+-				
++
+ 	} while (spintime && time_before_eq(jiffies, spintime_expire));
+ 
+ 	if (spintime) {
+@@ -3015,13 +3015,13 @@ static void sd_probe_async(void *data, async_cookie_t cookie)
+  *	for each scsi device (not just disks) present.
+  *	@dev: pointer to device object
+  *
+- *	Returns 0 if successful (or not interested in this scsi device 
++ *	Returns 0 if successful (or not interested in this scsi device
+  *	(e.g. scanner)); 1 when there is an error.
+  *
+  *	Note: this function is invoked from the scsi mid-level.
+- *	This function sets up the mapping between a given 
+- *	<host,channel,id,lun> (found in sdp) and new device name 
+- *	(e.g. /dev/sda). More precisely it is the block device major 
++ *	This function sets up the mapping between a given
++ *	<host,channel,id,lun> (found in sdp) and new device name
++ *	(e.g. /dev/sda). More precisely it is the block device major
+  *	and minor number that is chosen here.
+  *
+  *	Assume sd_probe is not re-entrant (for time being)
+@@ -3167,7 +3167,7 @@ static void scsi_disk_release(struct device *dev)
+ {
+ 	struct scsi_disk *sdkp = to_scsi_disk(dev);
+ 	struct gendisk *disk = sdkp->disk;
+-	
++
+ 	spin_lock(&sd_index_lock);
+ 	ida_remove(&sd_index_ida, sdkp->index);
+ 	spin_unlock(&sd_index_lock);
+diff --git a/drivers/target/target_core_iblock.c b/drivers/target/target_core_iblock.c
+index a3f8987..4aeb3b9 100644
+--- a/drivers/target/target_core_iblock.c
++++ b/drivers/target/target_core_iblock.c
+@@ -695,7 +695,7 @@ iblock_execute_rw(struct se_cmd *cmd, struct scatterlist *sgl, u32 sgl_nents,
+ 		if (q->flush_flags & REQ_FUA) {
+ 			if (cmd->se_cmd_flags & SCF_FUA)
+ 				op_flags = WRITE_FUA;
+-			else if (!(q->flush_flags & REQ_FLUSH))
++			else if (!(q->flush_flags & REQ_PREFLUSH))
+ 				op_flags = WRITE_FUA;
+ 		}
+ 	} else {
+@@ -838,7 +838,7 @@ static bool iblock_get_write_cache(struct se_device *dev)
+ 	struct block_device *bd = ib_dev->ibd_bd;
+ 	struct request_queue *q = bdev_get_queue(bd);
+ 
+-	return q->flush_flags & REQ_FLUSH;
++	return q->flush_flags & REQ_PREFLUSH;
+ }
+ 
+ static const struct target_backend_ops iblock_ops = {
+diff --git a/fs/btrfs/check-integrity.c b/fs/btrfs/check-integrity.c
+index 921a858..c1915f8 100644
+--- a/fs/btrfs/check-integrity.c
++++ b/fs/btrfs/check-integrity.c
+@@ -2207,7 +2207,7 @@ static void btrfsic_bio_end_io(struct bio *bp)
+ 			       block->dev_bytenr, block->mirror_num);
+ 		next_block = block->next_in_same_bio;
+ 		block->iodone_w_error = iodone_w_error;
+-		if (block->submit_bio_bh_rw & REQ_FLUSH) {
++		if (block->submit_bio_bh_rw & REQ_PREFLUSH) {
+ 			dev_state->last_flush_gen++;
+ 			if ((dev_state->state->print_mask &
+ 			     BTRFSIC_PRINT_MASK_END_IO_BIO_BH))
+@@ -2243,7 +2243,7 @@ static void btrfsic_bh_end_io(struct buffer_head *bh, int uptodate)
+ 		       block->dev_bytenr, block->mirror_num);
+ 
+ 	block->iodone_w_error = iodone_w_error;
+-	if (block->submit_bio_bh_rw & REQ_FLUSH) {
++	if (block->submit_bio_bh_rw & REQ_PREFLUSH) {
+ 		dev_state->last_flush_gen++;
+ 		if ((dev_state->state->print_mask &
+ 		     BTRFSIC_PRINT_MASK_END_IO_BIO_BH))
+@@ -2884,7 +2884,7 @@ int btrfsic_submit_bh(int op, int op_flags, struct buffer_head *bh)
+ 		btrfsic_process_written_block(dev_state, dev_bytenr,
+ 					      &bh->b_data, 1, NULL,
+ 					      NULL, bh, op_flags);
+-	} else if (NULL != dev_state && (op_flags & REQ_FLUSH)) {
++	} else if (NULL != dev_state && (op_flags & REQ_PREFLUSH)) {
+ 		if (dev_state->state->print_mask &
+ 		    BTRFSIC_PRINT_MASK_SUBMIT_BIO_BH)
+ 			printk(KERN_INFO
+@@ -2982,7 +2982,7 @@ static void __btrfsic_submit_bio(struct bio *bio)
+ 			kunmap(bio->bi_io_vec[i].bv_page);
+ 		}
+ 		kfree(mapped_datav);
+-	} else if (NULL != dev_state && (bio->bi_rw & REQ_FLUSH)) {
++	} else if (NULL != dev_state && (bio->bi_rw & REQ_PREFLUSH)) {
+ 		if (dev_state->state->print_mask &
+ 		    BTRFSIC_PRINT_MASK_SUBMIT_BIO_BH)
+ 			printk(KERN_INFO
+diff --git a/fs/jbd2/journal.c b/fs/jbd2/journal.c
+index 3675b8e..b5d568d 100644
+--- a/fs/jbd2/journal.c
++++ b/fs/jbd2/journal.c
+@@ -1353,7 +1353,7 @@ static int jbd2_write_superblock(journal_t *journal, int write_flags)
+ 
+ 	trace_jbd2_write_superblock(journal, write_flags);
+ 	if (!(journal->j_flags & JBD2_BARRIER))
+-		write_flags &= ~(REQ_FUA | REQ_FLUSH);
++		write_flags &= ~(REQ_FUA | REQ_PREFLUSH);
+ 	lock_buffer(bh);
+ 	if (buffer_write_io_error(bh)) {
+ 		/*
+diff --git a/fs/xfs/xfs_buf.c b/fs/xfs/xfs_buf.c
+index 917774e..0caffba 100644
+--- a/fs/xfs/xfs_buf.c
++++ b/fs/xfs/xfs_buf.c
+@@ -1242,7 +1242,7 @@ _xfs_buf_ioapply(
+ 		if (bp->b_flags & XBF_FUA)
+ 			op_flags |= REQ_FUA;
+ 		if (bp->b_flags & XBF_FLUSH)
+-			op_flags |= REQ_FLUSH;
++			op_flags |= REQ_PREFLUSH;
+ 
+ 		/*
+ 		 * Run the write verifier callback function if it exists. If
+diff --git a/include/linux/blk_types.h b/include/linux/blk_types.h
+index f9e53ca..2b6583a 100644
+--- a/include/linux/blk_types.h
++++ b/include/linux/blk_types.h
+@@ -158,7 +158,7 @@ enum rq_flag_bits {
+ 	__REQ_NOIDLE,		/* don't anticipate more IO after this one */
+ 	__REQ_INTEGRITY,	/* I/O includes block integrity payload */
+ 	__REQ_FUA,		/* forced unit access */
+-	__REQ_FLUSH,		/* request for cache flush */
++	__REQ_PREFLUSH,		/* request for cache flush */
+ 
+ 	/* bio only flags */
+ 	__REQ_RAHEAD,		/* read ahead, can fail anytime */
+@@ -202,12 +202,12 @@ enum rq_flag_bits {
+ 	(REQ_FAILFAST_DEV | REQ_FAILFAST_TRANSPORT | REQ_FAILFAST_DRIVER)
+ #define REQ_COMMON_MASK \
+ 	(REQ_FAILFAST_MASK | REQ_SYNC | REQ_META | REQ_PRIO | REQ_NOIDLE | \
+-	 REQ_FLUSH | REQ_FUA | REQ_SECURE | REQ_INTEGRITY)
++	 REQ_PREFLUSH | REQ_FUA | REQ_SECURE | REQ_INTEGRITY)
+ #define REQ_CLONE_MASK		REQ_COMMON_MASK
+ 
+ /* This mask is used for both bio and request merge checking */
+ #define REQ_NOMERGE_FLAGS \
+-	(REQ_NOMERGE | REQ_STARTED | REQ_SOFTBARRIER | REQ_FLUSH | REQ_FUA | REQ_FLUSH_SEQ)
++	(REQ_NOMERGE | REQ_STARTED | REQ_SOFTBARRIER | REQ_PREFLUSH | REQ_FUA | REQ_FLUSH_SEQ)
+ 
+ #define REQ_RAHEAD		(1ULL << __REQ_RAHEAD)
+ #define REQ_THROTTLED		(1ULL << __REQ_THROTTLED)
+@@ -225,7 +225,7 @@ enum rq_flag_bits {
+ #define REQ_PREEMPT		(1ULL << __REQ_PREEMPT)
+ #define REQ_ALLOCED		(1ULL << __REQ_ALLOCED)
+ #define REQ_COPY_USER		(1ULL << __REQ_COPY_USER)
+-#define REQ_FLUSH		(1ULL << __REQ_FLUSH)
++#define REQ_PREFLUSH		(1ULL << __REQ_PREFLUSH)
+ #define REQ_FLUSH_SEQ		(1ULL << __REQ_FLUSH_SEQ)
+ #define REQ_IO_STAT		(1ULL << __REQ_IO_STAT)
+ #define REQ_MIXED_MERGE		(1ULL << __REQ_MIXED_MERGE)
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 7237a63..d63aa62 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -205,9 +205,9 @@ typedef void (dax_iodone_t)(struct buffer_head *bh_map, int uptodate);
+ #define READ_SYNC		REQ_SYNC
+ #define WRITE_SYNC		(REQ_SYNC | REQ_NOIDLE)
+ #define WRITE_ODIRECT		REQ_SYNC
+-#define WRITE_FLUSH		(REQ_SYNC | REQ_NOIDLE | REQ_FLUSH)
++#define WRITE_FLUSH		(REQ_SYNC | REQ_NOIDLE | REQ_PREFLUSH)
+ #define WRITE_FUA		(REQ_SYNC | REQ_NOIDLE | REQ_FUA)
+-#define WRITE_FLUSH_FUA		(REQ_SYNC | REQ_NOIDLE | REQ_FLUSH | REQ_FUA)
++#define WRITE_FLUSH_FUA		(REQ_SYNC | REQ_NOIDLE | REQ_PREFLUSH | REQ_FUA)
+ 
+ /*
+  * Attribute flags.  These should be or-ed together to figure out what
+diff --git a/include/trace/events/f2fs.h b/include/trace/events/f2fs.h
+index 20f708e..1e5ab0c 100644
+--- a/include/trace/events/f2fs.h
++++ b/include/trace/events/f2fs.h
+@@ -33,7 +33,7 @@ TRACE_DEFINE_ENUM(SSR);
+ TRACE_DEFINE_ENUM(__REQ_RAHEAD);
+ TRACE_DEFINE_ENUM(__REQ_SYNC);
+ TRACE_DEFINE_ENUM(__REQ_NOIDLE);
+-TRACE_DEFINE_ENUM(__REQ_FLUSH);
++TRACE_DEFINE_ENUM(__REQ_PREFLUSH);
+ TRACE_DEFINE_ENUM(__REQ_FUA);
+ TRACE_DEFINE_ENUM(__REQ_PRIO);
+ TRACE_DEFINE_ENUM(__REQ_META);
+diff --git a/kernel/trace/blktrace.c b/kernel/trace/blktrace.c
+index 192d714..bcdd3d3 100644
+--- a/kernel/trace/blktrace.c
++++ b/kernel/trace/blktrace.c
+@@ -189,6 +189,7 @@ static const u32 ddir_act[2] = { BLK_TC_ACT(BLK_TC_READ),
+ 				 BLK_TC_ACT(BLK_TC_WRITE) };
+ 
+ #define BLK_TC_RAHEAD		BLK_TC_AHEAD
++#define BLK_TC_PREFLUSH		BLK_TC_FLUSH
+ 
+ /* The ilog2() calls fall out because they're constant */
+ #define MASK_TC_BIT(rw, __name) ((rw & REQ_ ## __name) << \
+@@ -219,7 +220,7 @@ static void __blk_add_trace(struct blk_trace *bt, sector_t sector, int bytes,
+ 	what |= MASK_TC_BIT(op_flags, SYNC);
+ 	what |= MASK_TC_BIT(op_flags, RAHEAD);
+ 	what |= MASK_TC_BIT(op_flags, META);
+-	what |= MASK_TC_BIT(op_flags, FLUSH);
++	what |= MASK_TC_BIT(op_flags, PREFLUSH);
+ 	what |= MASK_TC_BIT(op_flags, FUA);
+ 	if (op == REQ_OP_DISCARD)
+ 		what |= BLK_TC_ACT(BLK_TC_DISCARD);
+@@ -1777,7 +1778,7 @@ void blk_fill_rwbs(char *rwbs, int op, u32 rw, int bytes)
+ {
+ 	int i = 0;
+ 
+-	if (rw & REQ_FLUSH ||
++	if (rw & REQ_PREFLUSH ||
+ 	    op == REQ_OP_FLUSH)
+ 		rwbs[i++] = 'F';
+ 
+-- 
+2.8.0.rc3
+

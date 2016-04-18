@@ -1,0 +1,24 @@
+From 7b9ffd8e9ba6d8e45d5dc9a9cba14808b8c51ef8 Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Mon, 7 Mar 2016 21:02:30 -0600
+Subject: [PATCH 20/29] Allow override of backing raid_discard_safe?
+
+---
+ block/blk-settings.c | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/block/blk-settings.c b/block/blk-settings.c
+index 4050323..1adda24 100644
+--- a/block/blk-settings.c
++++ b/block/blk-settings.c
+@@ -571,7 +571,6 @@ int blk_stack_limits(struct queue_limits *t, struct queue_limits *b,
+ 
+ 	t->cluster &= b->cluster;
+ 	t->discard_zeroes_data &= b->discard_zeroes_data;
+-	t->raid_discard_safe &= b->raid_discard_safe;
+ 
+ 	/* Physical block size a multiple of the logical block size? */
+ 	if (t->physical_block_size & (t->logical_block_size - 1)) {
+-- 
+2.7.0
+

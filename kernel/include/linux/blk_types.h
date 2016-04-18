@@ -48,9 +48,10 @@ struct bio {
 	struct block_device	*bi_bdev;
 	unsigned int		bi_flags;	/* status, command, etc */
 	int			bi_error;
-	unsigned long		bi_rw;		/* bottom bits READ/WRITE,
-						 * top bits priority
-						 */
+	unsigned int		bi_rw;		/* rq_flag_bits */
+	unsigned short		bi_ioprio;
+	u8			bi_op;		/* REQ_OP */
+
 
 	struct bvec_iter	bi_iter;
 
@@ -173,7 +174,6 @@ static inline bool bio_streamid_valid(struct bio *bio)
  */
 enum rq_flag_bits {
 	/* common flags */
-	__REQ_WRITE,		/* not set, read. set, write */
 	__REQ_FAILFAST_DEV,	/* no driver retries of device errors */
 	__REQ_FAILFAST_TRANSPORT, /* no driver retries of transport errors */
 	__REQ_FAILFAST_DRIVER,	/* no driver retries of driver errors */
@@ -181,14 +181,12 @@ enum rq_flag_bits {
 	__REQ_SYNC,		/* request is sync (sync write or read) */
 	__REQ_META,		/* metadata io request */
 	__REQ_PRIO,		/* boost priority in cfq */
-	__REQ_DISCARD,		/* request to discard sectors */
-	__REQ_SECURE,		/* secure discard (used with __REQ_DISCARD) */
-	__REQ_WRITE_SAME,	/* write same block many times */
+	__REQ_SECURE,		/* secure discard (used with REQ_OP_DISCARD) */
 
 	__REQ_NOIDLE,		/* don't anticipate more IO after this one */
 	__REQ_INTEGRITY,	/* I/O includes block integrity payload */
 	__REQ_FUA,		/* forced unit access */
-	__REQ_FLUSH,		/* request for cache flush */
+	__REQ_PREFLUSH,		/* request for cache flush */
 
 	__REQ_REPORT_ZONES,	/* Zoned device: Report Zones */
 	__REQ_OPEN_ZONE,	/* Zoned device: Open Zone */
@@ -223,36 +221,33 @@ enum rq_flag_bits {
 	__REQ_NR_BITS,		/* stops here */
 };
 
-#define REQ_WRITE		(1ULL << __REQ_WRITE)
 #define REQ_FAILFAST_DEV	(1ULL << __REQ_FAILFAST_DEV)
 #define REQ_FAILFAST_TRANSPORT	(1ULL << __REQ_FAILFAST_TRANSPORT)
 #define REQ_FAILFAST_DRIVER	(1ULL << __REQ_FAILFAST_DRIVER)
 #define REQ_SYNC		(1ULL << __REQ_SYNC)
 #define REQ_META		(1ULL << __REQ_META)
 #define REQ_PRIO		(1ULL << __REQ_PRIO)
-#define REQ_DISCARD		(1ULL << __REQ_DISCARD)
-#define REQ_WRITE_SAME		(1ULL << __REQ_WRITE_SAME)
 #define REQ_NOIDLE		(1ULL << __REQ_NOIDLE)
 #define REQ_INTEGRITY		(1ULL << __REQ_INTEGRITY)
 
+#define REQ_REPORT_ZONES	(1ULL << __REQ_REPORT_ZONES)
+#define REQ_OPEN_ZONE		(1ULL << __REQ_OPEN_ZONE)
+#define REQ_CLOSE_ZONE		(1ULL << __REQ_CLOSE_ZONE)
+#define REQ_RESET_ZONE		(REQ_REPORT_ZONES)
 #define REQ_ZONED_CMDS \
-	(REQ_OPEN_ZONE | REQ_CLOSE_ZONE | REQ_RESET_ZONE)
-#define REQ_ZONED_FLAGS		(REQ_ZONED_CMDS|REQ_REPORT_ZONES)
+	(REQ_OPEN_ZONE | REQ_CLOSE_ZONE | REQ_RESET_ZONE | REQ_REPORT_ZONES)
+
 #define REQ_FAILFAST_MASK \
 	(REQ_FAILFAST_DEV | REQ_FAILFAST_TRANSPORT | REQ_FAILFAST_DRIVER)
 #define REQ_COMMON_MASK \
-	(REQ_WRITE | REQ_FAILFAST_MASK | REQ_SYNC | REQ_META | REQ_PRIO | \
-	 REQ_DISCARD | REQ_WRITE_SAME | REQ_NOIDLE | REQ_FLUSH | REQ_FUA | \
-	 REQ_SECURE | REQ_INTEGRITY | \
-	 REQ_REPORT_ZONES | REQ_ZONED_CMDS)
+	(REQ_FAILFAST_MASK | REQ_SYNC | REQ_META | REQ_PRIO | REQ_NOIDLE | \
+	 REQ_PREFLUSH | REQ_FUA | REQ_SECURE | REQ_INTEGRITY | REQ_ZONED_CMDS)
 #define REQ_CLONE_MASK		REQ_COMMON_MASK
-#define BIO_NO_ADVANCE_ITER_MASK \
-	(REQ_DISCARD | REQ_WRITE_SAME | REQ_ZONED_CMDS)
 
 /* This mask is used for both bio and request merge checking */
 #define REQ_NOMERGE_FLAGS \
-	(REQ_NOMERGE | REQ_STARTED | REQ_SOFTBARRIER | \
-	 REQ_FLUSH | REQ_FUA | REQ_FLUSH_SEQ | REQ_ZONED_CMDS)
+	(REQ_NOMERGE | REQ_STARTED | REQ_SOFTBARRIER | REQ_PREFLUSH | \
+	 REQ_FUA | REQ_FLUSH_SEQ | REQ_ZONED_CMDS)
 
 #define REQ_RAHEAD		(1ULL << __REQ_RAHEAD)
 #define REQ_THROTTLED		(1ULL << __REQ_THROTTLED)
@@ -270,7 +265,7 @@ enum rq_flag_bits {
 #define REQ_PREEMPT		(1ULL << __REQ_PREEMPT)
 #define REQ_ALLOCED		(1ULL << __REQ_ALLOCED)
 #define REQ_COPY_USER		(1ULL << __REQ_COPY_USER)
-#define REQ_FLUSH		(1ULL << __REQ_FLUSH)
+#define REQ_PREFLUSH		(1ULL << __REQ_PREFLUSH)
 #define REQ_FLUSH_SEQ		(1ULL << __REQ_FLUSH_SEQ)
 #define REQ_IO_STAT		(1ULL << __REQ_IO_STAT)
 #define REQ_MIXED_MERGE		(1ULL << __REQ_MIXED_MERGE)
@@ -279,10 +274,13 @@ enum rq_flag_bits {
 #define REQ_HASHED		(1ULL << __REQ_HASHED)
 #define REQ_MQ_INFLIGHT		(1ULL << __REQ_MQ_INFLIGHT)
 
-#define REQ_REPORT_ZONES	(1ULL << __REQ_REPORT_ZONES)
-#define REQ_OPEN_ZONE		(1ULL << __REQ_OPEN_ZONE)
-#define REQ_CLOSE_ZONE		(1ULL << __REQ_CLOSE_ZONE)
-#define REQ_RESET_ZONE		(REQ_REPORT_ZONES)
+enum req_op {
+	REQ_OP_READ,
+	REQ_OP_WRITE,
+	REQ_OP_DISCARD,		/* request to discard sectors */
+	REQ_OP_WRITE_SAME,	/* write same block many times */
+	REQ_OP_FLUSH,		/* request for cache flush */
+};
 
 
 typedef unsigned int blk_qc_t;

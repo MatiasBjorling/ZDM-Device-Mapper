@@ -90,7 +90,9 @@ protected:
     int openProcWpEntry(QString zdmDevice);
     int openProcUsedEntry(QString zdmDevice);
     int openProcStatusEntry(QString zdmDevice);
+#if 0    
     int getLiveDeviceDataIoctl();
+#endif    
     int getLiveDeviceDataProcFs();
 
 private:

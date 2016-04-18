@@ -15,12 +15,6 @@
 #ifndef _ZDMIOCTL_H_
 #define _ZDMIOCTL_H_
 
-// request an info dump from ZDM:
-#define ZDM_IOC_MZCOUNT          0x5a4e0001
-#define ZDM_IOC_WPS              0x5a4e0002
-#define ZDM_IOC_FREE             0x5a4e0003
-#define ZDM_IOC_STATUS           0x5a4e0004
-
 #define PROC_WP			"wp.bin"
 #define PROC_FREE		"free.bin"
 #define PROC_DATA		"data.bin"
@@ -68,6 +62,7 @@ struct zdm_ioc_status {
 	uint64_t b_discard;
 	uint64_t m_zones;
 	uint32_t mc_entries;
+	uint32_t jrnl_entries;
 	uint32_t dc_entries;
 	uint64_t mlut_blocks;
 	uint64_t crc_blocks;

@@ -67,7 +67,8 @@ extern struct ata_queued_cmd *ata_qc_new_init(struct ata_device *dev, int tag);
 extern int ata_build_rw_tf(struct ata_taskfile *tf, struct ata_device *dev,
 			   u64 block, u32 n_block, unsigned int tf_flags,
 			   unsigned int tag);
-extern u64 ata_tf_read_block(struct ata_taskfile *tf, struct ata_device *dev);
+extern u64 ata_tf_read_block(const struct ata_taskfile *tf,
+			     struct ata_device *dev);
 extern unsigned ata_exec_internal(struct ata_device *dev,
 				  struct ata_taskfile *tf, const u8 *cdb,
 				  int dma_dir, void *buf, unsigned int buflen,
@@ -137,6 +138,11 @@ extern int ata_scsi_add_hosts(struct ata_host *host,
 			      struct scsi_host_template *sht);
 extern void ata_scsi_scan_host(struct ata_port *ap, int sync);
 extern int ata_scsi_offline_dev(struct ata_device *dev);
+extern void ata_scsi_set_sense(struct ata_device *dev,
+			       struct scsi_cmnd *cmd, u8 sk, u8 asc, u8 ascq);
+extern void ata_scsi_set_sense_information(struct ata_device *dev,
+					   struct scsi_cmnd *cmd,
+					   const struct ata_taskfile *tf);
 extern void ata_scsi_media_change_notify(struct ata_device *dev);
 extern void ata_scsi_hotplug(struct work_struct *work);
 extern void ata_schedule_scsi_eh(struct Scsi_Host *shost);
@@ -163,8 +169,9 @@ extern void ata_eh_about_to_do(struct ata_link *link, struct ata_device *dev,
 			       unsigned int action);
 extern void ata_eh_done(struct ata_link *link, struct ata_device *dev,
 			unsigned int action);
-extern unsigned int ata_read_log_page(struct ata_device *dev, u8 log,
-				      u8 page, void *buf, unsigned int sectors);
+extern unsigned int ata_read_log_page(struct ata_device *dev, u8 log, u8 page,
+				      void *buf, unsigned int sectors,
+				      bool fpdma);
 extern void ata_eh_autopsy(struct ata_port *ap);
 const char *ata_get_cmd_descript(u8 command);
 extern void ata_eh_report(struct ata_port *ap);

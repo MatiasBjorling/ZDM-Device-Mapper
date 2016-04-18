@@ -296,13 +296,19 @@ void bio_reset(struct bio *bio)
 }
 EXPORT_SYMBOL(bio_reset);
 
-static void bio_chain_endio(struct bio *bio)
+static struct bio *__bio_chain_endio(struct bio *bio)
 {
 	struct bio *parent = bio->bi_private;
 
-	parent->bi_error = bio->bi_error;
-	bio_endio(parent);
+	if (!parent->bi_error)
+		parent->bi_error = bio->bi_error;
 	bio_put(bio);
+	return parent;
+}
+
+static void bio_chain_endio(struct bio *bio)
+{
+	bio_endio(__bio_chain_endio(bio));
 }
 
 /*
@@ -581,6 +587,7 @@ void __bio_clone_fast(struct bio *bio, struct bio *bio_src)
 	 */
 	bio->bi_bdev = bio_src->bi_bdev;
 	bio_set_flag(bio, BIO_CLONED);
+	bio->bi_op = bio_src->bi_op;
 	bio->bi_rw = bio_src->bi_rw;
 	bio->bi_iter = bio_src->bi_iter;
 	bio->bi_io_vec = bio_src->bi_io_vec;
@@ -664,14 +671,15 @@ struct bio *bio_clone_bioset(struct bio *bio_src, gfp_t gfp_mask,
 		return NULL;
 
 	bio->bi_bdev		= bio_src->bi_bdev;
+	bio->bi_op		= bio_src->bi_op;
 	bio->bi_rw		= bio_src->bi_rw;
 	bio->bi_iter.bi_sector	= bio_src->bi_iter.bi_sector;
 	bio->bi_iter.bi_size	= bio_src->bi_iter.bi_size;
 
-	if (bio->bi_rw & REQ_DISCARD)
+	if (bio->bi_op == REQ_OP_DISCARD)
 		goto integrity_clone;
 
-	if (bio->bi_rw & REQ_WRITE_SAME) {
+	if (bio->bi_op == REQ_OP_WRITE_SAME) {
 		bio->bi_io_vec[bio->bi_vcnt++] = bio_src->bi_io_vec[0];
 		goto integrity_clone;
 	}
@@ -861,21 +869,20 @@ static void submit_bio_wait_endio(struct bio *bio)
 
 /**
  * submit_bio_wait - submit a bio, and wait until it completes
- * @rw: whether to %READ or %WRITE, or maybe to %READA (read ahead)
  * @bio: The &struct bio which describes the I/O
  *
  * Simple wrapper around submit_bio(). Returns 0 on success, or the error from
  * bio_endio() on failure.
  */
-int submit_bio_wait(int rw, struct bio *bio)
+int submit_bio_wait(struct bio *bio)
 {
 	struct submit_bio_ret ret;
 
-	rw |= REQ_SYNC;
 	init_completion(&ret.event);
 	bio->bi_private = &ret;
 	bio->bi_end_io = submit_bio_wait_endio;
-	submit_bio(rw, bio);
+	bio->bi_rw |= REQ_SYNC;
+	submit_bio(bio);
 	wait_for_completion_io(&ret.event);
 
 	return ret.error;
@@ -1174,7 +1181,7 @@ struct bio *bio_copy_user_iov(struct request_queue *q,
 		goto out_bmd;
 
 	if (iter->type & WRITE)
-		bio->bi_rw |= REQ_WRITE;
+		bio->bi_op = REQ_OP_WRITE;
 
 	ret = 0;
 
@@ -1335,7 +1342,7 @@ struct bio *bio_map_user_iov(struct request_queue *q,
 		 * release the pages we didn't map into the bio, if any
 		 */
 		while (j < page_limit)
-			page_cache_release(pages[j++]);
+			put_page(pages[j++]);
 	}
 
 	kfree(pages);
@@ -1344,7 +1351,7 @@ struct bio *bio_map_user_iov(struct request_queue *q,
 	 * set data direction, and check if mapped pages need bouncing
 	 */
 	if (iter->type & WRITE)
-		bio->bi_rw |= REQ_WRITE;
+		bio->bi_op = REQ_OP_WRITE;
 
 	bio_set_flag(bio, BIO_USER_MAPPED);
 
@@ -1361,7 +1368,7 @@ struct bio *bio_map_user_iov(struct request_queue *q,
 	for (j = 0; j < nr_pages; j++) {
 		if (!pages[j])
 			break;
-		page_cache_release(pages[j]);
+		put_page(pages[j]);
 	}
  out:
 	kfree(pages);
@@ -1381,7 +1388,7 @@ static void __bio_unmap_user(struct bio *bio)
 		if (bio_data_dir(bio) == READ)
 			set_page_dirty_lock(bvec->bv_page);
 
-		page_cache_release(bvec->bv_page);
+		put_page(bvec->bv_page);
 	}
 
 	bio_put(bio);
@@ -1537,7 +1544,7 @@ struct bio *bio_copy_kern(struct request_queue *q, void *data, unsigned int len,
 		bio->bi_private = data;
 	} else {
 		bio->bi_end_io = bio_copy_kern_endio;
-		bio->bi_rw |= REQ_WRITE;
+		bio->bi_op = REQ_OP_WRITE;
 	}
 
 	return bio;
@@ -1611,8 +1618,8 @@ static void bio_release_pages(struct bio *bio)
  * the BIO and the offending pages and re-dirty the pages in process context.
  *
  * It is expected that bio_check_pages_dirty() will wholly own the BIO from
- * here on.  It will run one page_cache_release() against each page and will
- * run one bio_put() against the BIO.
+ * here on.  It will run one put_page() against each page and will run one
+ * bio_put() against the BIO.
  */
 
 static void bio_dirty_fn(struct work_struct *work);
@@ -1654,7 +1661,7 @@ void bio_check_pages_dirty(struct bio *bio)
 		struct page *page = bvec->bv_page;
 
 		if (PageDirty(page) || PageCompound(page)) {
-			page_cache_release(page);
+			put_page(page);
 			bvec->bv_page = NULL;
 		} else {
 			nr_clean_pages++;
@@ -1733,59 +1740,6 @@ static inline bool bio_remaining_done(struct bio *bio)
 	return false;
 }
 
-static DEFINE_PER_CPU(struct bio **, bio_end_queue) = { NULL };
-
-static struct bio *unwind_bio_endio(struct bio *bio)
-{
-	struct bio ***bio_end_queue_ptr;
-	struct bio *bio_queue;
-	struct bio *chain_bio = NULL;
-	int error = bio->bi_error;
-	unsigned long flags;
-
-	local_irq_save(flags);
-	bio_end_queue_ptr = this_cpu_ptr(&bio_end_queue);
-
-	if (*bio_end_queue_ptr) {
-		**bio_end_queue_ptr = bio;
-		*bio_end_queue_ptr = &bio->bi_next;
-		bio->bi_next = NULL;
-	} else {
-		bio_queue = NULL;
-		*bio_end_queue_ptr = &bio_queue;
-
-next_bio:
-		if (bio->bi_end_io == bio_chain_endio) {
-			struct bio *parent = bio->bi_private;
-
-			bio_put(bio);
-			chain_bio = parent;
-			goto out;
-		}
-
-		if (bio->bi_end_io) {
-			if (!bio->bi_error)
-				bio->bi_error = error;
-			bio->bi_end_io(bio);
-		}
-
-		if (bio_queue) {
-			bio = bio_queue;
-			bio_queue = bio->bi_next;
-			if (!bio_queue)
-				*bio_end_queue_ptr = &bio_queue;
-			goto next_bio;
-		}
-		*bio_end_queue_ptr = NULL;
-	}
-
-out:
-
-	local_irq_restore(flags);
-
-	return chain_bio;
-}
-
 /**
  * bio_endio - end I/O on a bio
  * @bio:	bio
@@ -1797,27 +1751,25 @@ out:
  **/
 void bio_endio(struct bio *bio)
 {
-	while (bio) {
-		if (unlikely(!bio_remaining_done(bio)))
-			break;
+again:
+	if (!bio_remaining_done(bio))
+		return;
 
-		/*
-		 * Need to have a real endio function for chained bios,
-		 * otherwise various corner cases will break (like stacking
-		 * block devices that save/restore bi_end_io) - however, we want
-		 * to avoid unbounded recursion and blowing the stack. Tail call
-		 * optimization would handle this, but compiling with frame
-		 * pointers also disables gcc's sibling call optimization.
-		 */
-		if (bio->bi_end_io == bio_chain_endio) {
-			struct bio *parent = bio->bi_private;
-			parent->bi_error = bio->bi_error;
-			bio_put(bio);
-			bio = parent;
-		} else {
-			bio = unwind_bio_endio(bio);
-		}
+	/*
+	 * Need to have a real endio function for chained bios, otherwise
+	 * various corner cases will break (like stacking block devices that
+	 * save/restore bi_end_io) - however, we want to avoid unbounded
+	 * recursion and blowing the stack. Tail call optimization would
+	 * handle this, but compiling with frame pointers also disables
+	 * gcc's sibling call optimization.
+	 */
+	if (bio->bi_end_io == bio_chain_endio) {
+		bio = __bio_chain_endio(bio);
+		goto again;
 	}
+
+	if (bio->bi_end_io)
+		bio->bi_end_io(bio);
 }
 EXPORT_SYMBOL(bio_endio);
 
@@ -1847,7 +1799,7 @@ struct bio *bio_split(struct bio *bio, int sectors,
 	 * Discards need a mutable bio_vec to accommodate the payload
 	 * required by the DSM TRIM and UNMAP commands.
 	 */
-	if (bio->bi_rw & REQ_DISCARD)
+	if (bio->bi_op == REQ_OP_DISCARD)
 		split = bio_clone_bioset(bio, gfp, bs);
 	else
 		split = bio_clone_fast(bio, gfp, bs);

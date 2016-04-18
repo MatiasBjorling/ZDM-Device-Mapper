@@ -1,0 +1,248 @@
+From 4748cc85e313152c54d35fcb041aa7749ea8edee Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun.tancheff@seagate.com>
+Date: Mon, 7 Mar 2016 23:43:00 -0600
+Subject: [PATCH 22/29] Use a work queue to issue BLK ZONE commands.
+
+---
+ drivers/md/dm-zoned.c | 124 +++++++++++++++++++++++++++-----------------------
+ drivers/md/dm-zoned.h |   2 +
+ drivers/md/libzoned.c |  15 +++++-
+ 3 files changed, 82 insertions(+), 59 deletions(-)
+
+diff --git a/drivers/md/dm-zoned.c b/drivers/md/dm-zoned.c
+index 44d9763..b189662 100644
+--- a/drivers/md/dm-zoned.c
++++ b/drivers/md/dm-zoned.c
+@@ -181,13 +181,37 @@ static int is_non_wp_zone(struct zoned *znd, u64 z_id)
+ }
+ 
+ /**
+- * dmz_reset_wp() - Reset write pointer for zone z_id.
++ */
++struct zone_action {
++	struct work_struct work;
++	struct zoned *znd;
++	u64 s_addr;
++	unsigned long bi_rw;
++	int wp_err;
++};
++
++/**
++ * do_zone_action_work() - Issue a 'zone action' to the backing device.
++ * @work: Work to do.
++ */
++static void do_zone_action_work(struct work_struct *work)
++{
++	struct zone_action *za = container_of(work, struct zone_action, work);
++
++	za->wp_err = blkdev_issue_zone_action(za->znd->dev->bdev,
++					      za->bi_rw, za->s_addr,
++					      GFP_KERNEL);
++}
++
++/**
++ * dmz_zone_action() - Issue a 'zone action' to the backing device (via worker).
+  * @znd: ZDM Instance
+- * @z_id: Zone # to reset.
++ * @z_id: Zone # to open.
++ * @rw: One of REQ_OPEN_ZONE, REQ_CLOSE_ZONE, or REQ_DISCARD.
+  *
+  * Return: 0 on success, otherwise error.
+  */
+-static int dmz_reset_wp(struct zoned *znd, u64 z_id)
++static int dmz_zone_action(struct zoned *znd, u64 z_id, unsigned long rw)
+ {
+ 	int wp_err = 0;
+ 
+@@ -195,18 +219,30 @@ static int dmz_reset_wp(struct zoned *znd, u64 z_id)
+ 		return wp_err;
+ 
+ 	if (znd->bdev_is_zoned) {
+-		unsigned long bi_rw = REQ_DISCARD;
+ 		u64 z_offset = z_id + znd->zdstart;
+-		u64 s_addr = zone_to_sector(z_offset);
+-
++		struct zone_action za = {
++			.znd = znd,
++			.bi_rw = rw,
++			.s_addr = zone_to_sector(z_offset),
++			.wp_err = 0,
++		};
+ 		if (znd->ata_passthrough)
+-			bi_rw |= REQ_PRIO;
+-		wp_err = blkdev_issue_zone_action(znd->dev->bdev, bi_rw, s_addr,
+-						  GFP_KERNEL);
++			za.bi_rw |= REQ_PRIO;
++
++		/*
++		 * Issue the synchronous I/O from a different thread
++		 * to avoid generic_make_request recursion.
++		 */
++		INIT_WORK_ONSTACK(&za.work, do_zone_action_work);
++		queue_work(znd->zone_action_wq, &za.work);
++		flush_workqueue(znd->zone_action_wq);
++		destroy_work_on_stack(&za.work);
++		wp_err = za.wp_err;
+ 
+ 		if (wp_err) {
+-			Z_ERR(znd, "Reset WP: %" PRIx64 " [Z:%" PRIu64
+-			      "] -> %d failed.", s_addr, z_id, wp_err);
++			Z_ERR(znd, "Open Zone: LBA: %" PRIx64
++			      " [Z:%" PRIu64 "] -> %d failed.",
++			      za.s_addr, z_id, wp_err);
+ 			Z_ERR(znd, "ZAC/ZBC support disabled.");
+ 			znd->bdev_is_zoned = 0;
+ 			wp_err = -ENOTSUPP;
+@@ -215,6 +251,20 @@ static int dmz_reset_wp(struct zoned *znd, u64 z_id)
+ 	return wp_err;
+ }
+ 
++
++
++/**
++ * dmz_reset_wp() - Reset write pointer for zone z_id.
++ * @znd: ZDM Instance
++ * @z_id: Zone # to reset.
++ *
++ * Return: 0 on success, otherwise error.
++ */
++static int dmz_reset_wp(struct zoned *znd, u64 z_id)
++{
++	return dmz_zone_action(znd, z_id, REQ_DISCARD);
++}
++
+ /**
+  * dmz_open_zone() - Open zone for writing.
+  * @znd: ZDM Instance
+@@ -224,30 +274,11 @@ static int dmz_reset_wp(struct zoned *znd, u64 z_id)
+  */
+ static int dmz_open_zone(struct zoned *znd, u64 z_id)
+ {
+-	int wp_err = 0;
++	if (!znd->issue_open_zone)
++		return 0;
+ 
+-	if (is_non_wp_zone(znd, z_id))
+-		return wp_err;
++	return dmz_zone_action(znd, z_id, REQ_OPEN_ZONE);
+ 
+-	if (znd->issue_open_zone && znd->bdev_is_zoned) {
+-		unsigned long bi_rw = REQ_OPEN_ZONE;
+-		u64 z_offset = z_id + znd->zdstart;
+-		u64 s_addr = zone_to_sector(z_offset);
+-
+-		if (znd->ata_passthrough)
+-			bi_rw |= REQ_PRIO;
+-		wp_err = blkdev_issue_zone_action(znd->dev->bdev, bi_rw, s_addr,
+-						  GFP_KERNEL);
+-		if (wp_err) {
+-			Z_ERR(znd, "Open Zone: LBA: %" PRIx64
+-			      " [Z:%" PRIu64 "] -> %d failed.",
+-			      s_addr, z_id, wp_err);
+-			Z_ERR(znd, "ZAC/ZBC support disabled.");
+-			znd->bdev_is_zoned = 0;
+-			wp_err = -ENOTSUPP;
+-		}
+-	}
+-	return wp_err;
+ }
+ 
+ /**
+@@ -259,31 +290,10 @@ static int dmz_open_zone(struct zoned *znd, u64 z_id)
+  */
+ static int dmz_close_zone(struct zoned *znd, u64 z_id)
+ {
+-	int wp_err = 0;
+-
+-	if (znd->issue_close_zone && is_non_wp_zone(znd, z_id))
+-		return wp_err;
+-
+-	if (znd->bdev_is_zoned) {
+-		unsigned long bi_rw = REQ_CLOSE_ZONE;
+-		u64 z_offset = z_id + znd->zdstart;
+-		u64 s_addr = zone_to_sector(z_offset);
+-
+-		if (znd->ata_passthrough)
+-			bi_rw |= REQ_PRIO;
+-		wp_err = blkdev_issue_zone_action(znd->dev->bdev, bi_rw, s_addr,
+-						  GFP_KERNEL);
++	if (!znd->issue_close_zone)
++		return 0;
+ 
+-		if (wp_err) {
+-			Z_ERR(znd, "Close Zone: LBA: %" PRIx64
+-			      " [Z:%" PRIu64 "] -> %d failed.",
+-			      s_addr, z_id, wp_err);
+-			Z_ERR(znd, "ZAC/ZBC support disabled.");
+-			znd->bdev_is_zoned = 0;
+-			wp_err = -ENOTSUPP;
+-		}
+-	}
+-	return wp_err;
++	return dmz_zone_action(znd, z_id, REQ_CLOSE_ZONE);
+ }
+ 
+ /**
+diff --git a/drivers/md/dm-zoned.h b/drivers/md/dm-zoned.h
+index febb677..a4b19cb 100644
+--- a/drivers/md/dm-zoned.h
++++ b/drivers/md/dm-zoned.h
+@@ -524,6 +524,7 @@ struct stale_tracking {
+  * @gc_postmap:
+  * @io_client:
+  * @io_wq:
++ * @zone_action_wq:
+  * @timer:
+  * @bins:	Memory usage accounting/reporting.
+  * @bdev_name:
+@@ -633,6 +634,7 @@ struct zoned {
+ 	struct map_cache gc_postmap;
+ 	struct dm_io_client *io_client;
+ 	struct workqueue_struct *io_wq;
++	struct workqueue_struct *zone_action_wq;
+ 	struct timer_list timer;
+ 
+ 	u32 bins[40];
+diff --git a/drivers/md/libzoned.c b/drivers/md/libzoned.c
+index 2fcbee1..c7c961f 100644
+--- a/drivers/md/libzoned.c
++++ b/drivers/md/libzoned.c
+@@ -1152,6 +1152,10 @@ static void zoned_destroy(struct zoned *znd)
+ 		destroy_workqueue(znd->io_wq);
+ 		znd->io_wq = NULL;
+ 	}
++	if (znd->zone_action_wq) {
++		destroy_workqueue(znd->zone_action_wq);
++		znd->zone_action_wq = NULL;
++	}
+ 	if (znd->bg_wq) {
+ 		destroy_workqueue(znd->bg_wq);
+ 		znd->bg_wq = NULL;
+@@ -1480,7 +1484,7 @@ static int do_init_zoned(struct dm_target *ti, struct zoned *znd)
+ 
+ 	znd->meta_wq = create_singlethread_workqueue("znd_meta_wq");
+ 	if (!znd->meta_wq) {
+-		ti->error = "couldn't start header metadata update thread";
++		ti->error = "couldn't start metadata worker thread";
+ 		rcode = -ENOMEM;
+ 		goto out;
+ 	}
+@@ -1501,7 +1505,14 @@ static int do_init_zoned(struct dm_target *ti, struct zoned *znd)
+ 
+ 	znd->io_wq = create_singlethread_workqueue("kzoned_dm_io_wq");
+ 	if (!znd->io_wq) {
+-		ti->error = "couldn't start header metadata update thread";
++		ti->error = "couldn't start DM I/O thread";
++		rcode = -ENOMEM;
++		goto out;
++	}
++
++	znd->zone_action_wq = create_singlethread_workqueue("zone_act_wq");
++	if (!znd->zone_action_wq) {
++		ti->error = "couldn't start zone action worker";
+ 		rcode = -ENOMEM;
+ 		goto out;
+ 	}
+-- 
+2.7.0
+

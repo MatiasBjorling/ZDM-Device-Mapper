@@ -1,0 +1,206 @@
+From ef7f181da731e8eea59fa7046561bb0e67d79838 Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Wed, 9 Mar 2016 15:30:42 -0600
+Subject: [PATCH 24/29] Use overload stream_id to store report option.
+
+---
+ block/blk-lib.c              |  3 ++-
+ block/ioctl.c                |  2 +-
+ drivers/md/dm-zoned.c        | 10 ++++++----
+ drivers/md/libzoned.c        | 10 +++++-----
+ drivers/scsi/sd.c            |  9 +++++----
+ include/linux/blkzoned_api.h |  9 ++++-----
+ 6 files changed, 23 insertions(+), 20 deletions(-)
+
+diff --git a/block/blk-lib.c b/block/blk-lib.c
+index 73b4a0f..2496e34 100644
+--- a/block/blk-lib.c
++++ b/block/blk-lib.c
+@@ -345,7 +345,7 @@ static int bio_add_kmem_pages(struct bio *bio, void *buf, size_t bufsz)
+  *    Issue a zone report request for the sectors in question.
+  */
+ int blkdev_issue_zone_report(struct block_device *bdev,	unsigned long bi_rw,
+-			     sector_t sector, void *buf, size_t bufsz,
++			     sector_t sector, u8 opt, void *buf, size_t bufsz,
+ 			     gfp_t gfp_mask)
+ {
+ 	DECLARE_COMPLETION_ONSTACK(wait);
+@@ -379,6 +379,7 @@ int blkdev_issue_zone_report(struct block_device *bdev,	unsigned long bi_rw,
+ 	bio->bi_private = &bb;
+ 	bio->bi_vcnt = 0;
+ 	bio->bi_iter.bi_size = 0;
++	bio_set_streamid(bio, opt);
+ 
+ 	ret = bio_add_kmem_pages(bio, buf, bufsz);
+ 	if (ret)
+diff --git a/block/ioctl.c b/block/ioctl.c
+index fc25c7f..436f165 100644
+--- a/block/ioctl.c
++++ b/block/ioctl.c
+@@ -295,7 +295,7 @@ static int blk_zoned_report_ioctl(struct block_device *bdev, fmode_t mode,
+ 		bi_rw = REQ_PRIO;
+ 
+ 	error = blkdev_issue_zone_report(bdev, bi_rw,
+-			zone_iodata->data.in.zone_locator_lba,
++			zone_iodata->data.in.zone_locator_lba, opt,
+ 			zone_iodata, alloc_size, GFP_KERNEL);
+ 
+ 	if (error)
+diff --git a/drivers/md/dm-zoned.c b/drivers/md/dm-zoned.c
+index b189662..ac8da0c 100644
+--- a/drivers/md/dm-zoned.c
++++ b/drivers/md/dm-zoned.c
+@@ -251,8 +251,6 @@ static int dmz_zone_action(struct zoned *znd, u64 z_id, unsigned long rw)
+ 	return wp_err;
+ }
+ 
+-
+-
+ /**
+  * dmz_reset_wp() - Reset write pointer for zone z_id.
+  * @znd: ZDM Instance
+@@ -343,6 +341,7 @@ static int dmz_report_zones(struct zoned *znd, u64 z_id,
+ 	int wp_err = -ENOTSUPP;
+ 
+ 	if (znd->bdev_is_zoned) {
++		u8  opt = ZOPT_NON_SEQ_AND_RESET;
+ 		unsigned long bi_rw = 0;
+ 		u64 s_addr = (z_id + znd->zdstart) << 19;
+ 
+@@ -350,7 +349,8 @@ static int dmz_report_zones(struct zoned *znd, u64 z_id,
+ 			bi_rw = REQ_PRIO;
+ 
+ 		wp_err = blkdev_issue_zone_report(znd->dev->bdev, bi_rw, s_addr,
+-						  report, bufsz, GFP_KERNEL);
++						  opt, report, bufsz,
++						  GFP_KERNEL);
+ 
+ 		if (wp_err) {
+ 			Z_ERR(znd, "Report Zones: LBA: %" PRIx64
+@@ -1830,8 +1830,10 @@ static int zoned_bio(struct zoned *znd, struct bio *bio)
+ 			rcode = zoned_map_write(znd, bio, s_zdm);
+ 			if (rcode == DM_MAPIO_SUBMITTED) {
+ 				z_discard_partial(znd, blks, CRIT);
+-				if (znd->z_gc_free < 5)
++				if (znd->z_gc_free < 5) {
++					Z_DBG(znd, "Low Crit GC Immed.");
+ 					gc_immediate(znd, !wait, CRIT);
++				}
+ 			}
+ 		} else {
+ 			rcode = zm_read_bios(znd, bio, s_zdm);
+diff --git a/drivers/md/libzoned.c b/drivers/md/libzoned.c
+index c7c961f..51f61fa 100644
+--- a/drivers/md/libzoned.c
++++ b/drivers/md/libzoned.c
+@@ -5722,7 +5722,7 @@ static int gc_queue_with_delay(struct zoned *znd, int delay, gfp_t gfp)
+ 			gc_idle = 0;
+ 
+ 		/* Otherwise cherrypick *something* */
+-		for (iter = 0; iter < znd->stale.count; iter++)
++		for (iter = 0; gc_idle && (iter < znd->stale.count); iter++)
+ 			if (gc_idle && (bin != iter) &&
+ 			    gc_can_cherrypick(znd, iter, delay, gfp))
+ 				gc_idle = 0;
+@@ -5731,13 +5731,10 @@ static int gc_queue_with_delay(struct zoned *znd, int delay, gfp_t gfp)
+ 		if (gc_idle && gc_compact_check(znd, bin, delay, gfp))
+ 			gc_idle = 0;
+ 
+-#if 0
+ 		/* Otherwise compact *something* */
+-		for (iter = 0; iter < znd->stale.count; iter++)
++		for (iter = 0; gc_idle && (iter < znd->stale.count); iter++)
+ 			if (gc_idle && gc_compact_check(znd, iter, delay, gfp))
+ 				gc_idle = 0;
+-#endif
+-
+ 	}
+ 	return !gc_idle;
+ }
+@@ -5761,6 +5758,7 @@ static int gc_immediate(struct zoned *znd, int wait, gfp_t gfp)
+ 	 *       mutex hack should do as a temporary workaround.
+ 	 */
+ 	atomic_inc(&znd->gc_throttle);
++
+ 	if (atomic_read(&znd->gc_throttle) == 1) {
+ 		mutex_lock(&znd->gc_wait);
+ 	} else if (atomic_read(&znd->gc_throttle) > 1) {
+@@ -5992,6 +5990,7 @@ retry:
+ 		int can_retry = gc_immediate(znd, wait, gfp);
+ 		u32 mresv = znd->z_meta_resv & Z_WP_VALUE_MASK;
+ 
++		Z_DBG(znd, "GC: Need META.");
+ 		if (can_retry)
+ 			goto retry;
+ 
+@@ -6001,6 +6000,7 @@ retry:
+ 
+ out:
+ 	if (!found && (*nfound == 0)) {
++		Z_DBG(znd, "... alloc - out of space?");
+ 		if (gc_immediate(znd, wait, gfp))
+ 			goto retry;
+ 
+diff --git a/drivers/scsi/sd.c b/drivers/scsi/sd.c
+index aefd899..14805a8 100644
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -1170,6 +1170,7 @@ static int sd_setup_zoned_cmnd(struct scsi_cmnd *cmd)
+ {
+ 	struct request *rq = cmd->request;
+ 	struct scsi_device *sdp = cmd->device;
++	struct bio *bio = rq->bio;
+ 	sector_t sector = blk_rq_pos(rq);
+ 	struct gendisk *disk = rq->rq_disk;
+ 	unsigned int nr_bytes = blk_rq_bytes(rq);
+@@ -1191,8 +1192,8 @@ static int sd_setup_zoned_cmnd(struct scsi_cmnd *cmd)
+ 			if (nr_bytes < sizeof(struct bdev_zone_report))
+ 				goto out;
+ 
+-			src = kmap_atomic(rq->bio->bi_io_vec->bv_page);
+-			conv = src + rq->bio->bi_io_vec->bv_offset;
++			src = kmap_atomic(bio->bi_io_vec->bv_page);
++			conv = src + bio->bi_io_vec->bv_offset;
+ 			conv->descriptor_count = cpu_to_be32(1);
+ 			conv->same_field = ZS_ALL_SAME;
+ 			conv->maximum_lba = cpu_to_be64(disk->part0.nr_sects);
+@@ -1216,7 +1217,7 @@ static int sd_setup_zoned_cmnd(struct scsi_cmnd *cmd)
+ 			cmd->cmnd[1] = (0x6 << 1) | 1;
+ 			cmd->cmnd[2] = 0x0e;
+ 			cmd->cmnd[3] = ZBC_REPORT_OPT;
+-			cmd->cmnd[4] = ATA_SUBCMD_REP_ZONES;
++			cmd->cmnd[4] = bio_get_streamid(bio);
+ 			cmd->cmnd[5] = ((nr_bytes / 512) >> 8) & 0xff;
+ 			cmd->cmnd[6] = (nr_bytes / 512) & 0xff;
+ 
+@@ -1226,7 +1227,7 @@ static int sd_setup_zoned_cmnd(struct scsi_cmnd *cmd)
+ 			cmd->cmnd[14] = ATA_CMD_ZONE_MAN_IN;
+ 		} else {
+ 			cmd->cmnd[0] = ZBC_REPORT_ZONES;
+-			cmd->cmnd[1] = ZBC_REPORT_OPT;
++			cmd->cmnd[1] = bio_get_streamid(bio);
+ 			put_unaligned_be64(sector, &cmd->cmnd[2]);
+ 			put_unaligned_be32(nr_bytes, &cmd->cmnd[10]);
+ 			cmd->cmnd[14] = 0;
+diff --git a/include/linux/blkzoned_api.h b/include/linux/blkzoned_api.h
+index fbd05fa..246c3c2 100644
+--- a/include/linux/blkzoned_api.h
++++ b/include/linux/blkzoned_api.h
+@@ -16,10 +16,9 @@
+ 
+ #include <uapi/linux/blkzoned_api.h>
+ 
+-extern int blkdev_issue_zone_action(struct block_device *bdev,
+-		unsigned long bi_rw, sector_t sector, gfp_t gfp_mask);
+-extern int blkdev_issue_zone_report(struct block_device *bdev,
+-		unsigned long bi_rw, sector_t sector, void *buf, size_t bufsz,
+-		gfp_t gfp_mask);
++extern int blkdev_issue_zone_action(struct block_device *, unsigned long bi_rw,
++				    sector_t, gfp_t);
++extern int blkdev_issue_zone_report(struct block_device *, unsigned long bi_rw,
++				    sector_t, u8 opt, void *, size_t, gfp_t);
+ 
+ #endif /* _BLKZONED_API_H */
+-- 
+2.7.0
+

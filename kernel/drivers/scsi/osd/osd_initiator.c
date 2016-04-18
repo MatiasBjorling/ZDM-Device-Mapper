@@ -726,7 +726,7 @@ static int _osd_req_list_objects(struct osd_request *or,
 		return PTR_ERR(bio);
 	}
 
-	bio->bi_rw &= ~REQ_WRITE;
+	bio->bi_op = REQ_OP_READ;
 	or->in.bio = bio;
 	or->in.total_bytes = bio->bi_iter.bi_size;
 	return 0;
@@ -824,7 +824,7 @@ void osd_req_write(struct osd_request *or,
 {
 	_osd_req_encode_common(or, OSD_ACT_WRITE, obj, offset, len);
 	WARN_ON(or->out.bio || or->out.total_bytes);
-	WARN_ON(0 == (bio->bi_rw & REQ_WRITE));
+	WARN_ON(!op_is_write(bio->bi_op));
 	or->out.bio = bio;
 	or->out.total_bytes = len;
 }
@@ -839,7 +839,7 @@ int osd_req_write_kern(struct osd_request *or,
 	if (IS_ERR(bio))
 		return PTR_ERR(bio);
 
-	bio->bi_rw |= REQ_WRITE; /* FIXME: bio_set_dir() */
+	bio->bi_op = REQ_OP_WRITE;
 	osd_req_write(or, obj, offset, bio, len);
 	return 0;
 }
@@ -875,7 +875,7 @@ void osd_req_read(struct osd_request *or,
 {
 	_osd_req_encode_common(or, OSD_ACT_READ, obj, offset, len);
 	WARN_ON(or->in.bio || or->in.total_bytes);
-	WARN_ON(bio->bi_rw & REQ_WRITE);
+	WARN_ON(op_is_write(bio->bi_op));
 	or->in.bio = bio;
 	or->in.total_bytes = len;
 }
@@ -956,7 +956,7 @@ static int _osd_req_finalize_cdb_cont(struct osd_request *or, const u8 *cap_key)
 	if (IS_ERR(bio))
 		return PTR_ERR(bio);
 
-	bio->bi_rw |= REQ_WRITE;
+	bio->bi_op = REQ_OP_WRITE;
 
 	/* integrity check the continuation before the bio is linked
 	 * with the other data segments since the continuation
@@ -1077,7 +1077,7 @@ int osd_req_write_sg_kern(struct osd_request *or,
 	if (IS_ERR(bio))
 		return PTR_ERR(bio);
 
-	bio->bi_rw |= REQ_WRITE;
+	bio->bi_op = REQ_OP_WRITE;
 	osd_req_write_sg(or, obj, bio, sglist, numentries);
 
 	return 0;
@@ -2006,9 +2006,8 @@ EXPORT_SYMBOL(osd_sec_init_nosec_doall_caps);
  */
 void osd_set_caps(struct osd_cdb *cdb, const void *caps)
 {
-	bool is_ver1 = true;
 	/* NOTE: They start at same address */
-	memcpy(&cdb->v1.caps, caps, is_ver1 ? OSDv1_CAP_LEN : OSD_CAP_LEN);
+	memcpy(&cdb->v1.caps, caps, OSDv1_CAP_LEN);
 }
 
 bool osd_is_sec_alldata(struct osd_security_parameters *sec_parms __unused)

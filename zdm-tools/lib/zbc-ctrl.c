@@ -23,7 +23,32 @@
 #include <sys/ioctl.h>
 #include <linux/fs.h>
 
+#include <scsi/sg.h>
+#include <scsi/sg_cmds_basic.h>
+
 #include "zbc-ctrl.h"
+
+// typedef uint8_t u8;
+// typedef uint16_t u16;
+// typedef uint32_t u32;
+
+
+#define Z_VPD_INFO_BYTE 8
+
+static inline char * ha_or_dm_text(int is_ha)
+{
+	return is_ha  ? "Host AWARE"  : "Host or Drive Managed";
+}
+
+#define INQUIRY                         0x12
+#define INQUIRY_CMDLEN		        6
+#define ZAC_ATA_OPCODE_IDENTIFY         0xec
+
+#define ZAC_PASS_THROUGH16_OPCODE       0x85
+#define ZAC_PASS_THROUGH16_CDB_LEN      16
+
+#define SCSI_SENSE_BUFFERSIZE 	        96
+
 
 #ifndef offsetof
 #define offsetof(TYPE, MEMBER) ((size_t) &((TYPE *)0)->MEMBER)
@@ -81,61 +106,128 @@ static unsigned char r_opts[] = {
 #define Z_VPD_INFO_BYTE 8
 #define DATA_OFFSET (offsetof(struct zoned_inquiry, result))
 
-int zdm_is_ha_device(struct zoned_inquiry *inquire, int verbose)
+int zdm_is_ha_device(uint32_t flags, int verbose)
 {
 	int is_smr = 0;
 	int is_ha  = 0;
 
-	if (inquire->mx_resp_len > Z_VPD_INFO_BYTE) {
-		u8 flags = inquire->result[Z_VPD_INFO_BYTE] >> 4 & 0x03;
-
-		switch (flags) {
-			case 1:
-				is_ha = 1;
-				is_smr = 1;
-				break;
-			case 2:
-				is_smr = 1;
-				break;
-			default:
-				break;
-		}
+	switch (flags & 0xff) {
+		case 1:
+			is_ha = 1;
+			is_smr = 1;
+			break;
+		case 2:
+			is_smr = 1;
+			break;
+		default:
+			break;
 	}
+	
 	if (verbose) {
 		printf("HostAware:%d, SMR:%d\n", is_ha, is_smr );
 	}
 	return is_ha;
 }
 
-
-struct zoned_inquiry *zdm_device_inquiry(int fd, int do_ata)
+/*
+ * ata-16 passthrough byte 1:
+ *   multiple [bits 7:5]
+ *   protocol [bits 4:1]
+ *   ext      [bit    0]
+ */
+static inline u8 ata16byte1(u8 multiple, u8 protocol, u8 ext)
 {
-	int sz = 64;
-	int bytes = sz + DATA_OFFSET;
-	struct zoned_inquiry *inquire;
+	return ((multiple & 0x7) << 5) | ((protocol & 0xF) << 1) | (ext & 0x01);
+}
 
-	inquire = malloc(bytes);
-	if (inquire) {
-		int rc;
+static inline u16 zc_get_word(u8 *buf)
+{
+	u16 w = buf[1];
 
-		inquire->evpd        = 1;
-		inquire->pg_op       = 0xb1;
-		inquire->mx_resp_len = sz;
+	w <<= 8;
+	w |= buf[0];
+	return w;
+}
 
-		if (do_ata) {
-			inquire->evpd |= 0x80; // force ATA passthrough
-		}
 
-		rc = ioctl(fd, SCSI_IOCTL_INQUIRY, inquire);
-		if (rc == -1) {
-			free(inquire);
-			inquire = NULL;
-		}
+static int do_sg_io_inq(int fd, u8 *cdb, int cdb_sz, u8 *buf, int bufsz, u8 *sense, int s_sz)
+{
+        sg_io_hdr_t io_hdr;
+
+        memset(&io_hdr, 0, sizeof(io_hdr));
+        io_hdr.interface_id    = 'S';
+        io_hdr.timeout         = 20000;
+        io_hdr.flags           = 0; //SG_FLAG_DIRECT_IO;
+        io_hdr.cmd_len         = cdb_sz;
+        io_hdr.cmdp            = cdb;
+        io_hdr.dxfer_direction = SG_DXFER_FROM_DEV;
+        io_hdr.dxfer_len       = bufsz;
+        io_hdr.dxferp          = buf;
+        io_hdr.mx_sb_len       = s_sz;
+        io_hdr.sbp             = sense;
+
+        return ioctl(fd, SG_IO, &io_hdr);
+}
+
+
+int blk_zoned_inquiry(int fd, uint32_t *zflags)
+{
+	int ret;
+	uint8_t	buf[0xfc] = { 0 };
+
+	ret = sg_ll_inquiry(fd, 0, 1, 0xb1, buf, sizeof(buf), 0, 0);
+	if (!ret)
+		return -1;
+
+	*zflags = buf[Z_VPD_INFO_BYTE] >> 4 & 0x03;
+	return ret;
+}
+
+#define ATA_PROT_NCQ 4
+
+int blk_zoned_identify_ata(int fd, uint32_t *zflags)
+{
+	int ret;
+	u8 cmd[ZAC_PASS_THROUGH16_CDB_LEN] = { 0 };
+	u8 sense_buf[SCSI_SENSE_BUFFERSIZE] = { 0 };
+	u8 buf[512] = { 0 };
+	int flag = 0;
+
+	cmd[0] = ZAC_PASS_THROUGH16_OPCODE;
+	cmd[1] = ata16byte1(0, 4, 1);
+	cmd[2] = 0xe;
+	cmd[6] = 0x1;
+	cmd[8] = 0x1;
+	cmd[14] = ZAC_ATA_OPCODE_IDENTIFY;
+
+	ret = do_sg_io_inq(fd, cmd, sizeof(cmd), buf, sizeof(buf),
+			   sense_buf, sizeof(sense_buf));
+
+	if (ret != 0)
+		goto out;
+
+	flag = zc_get_word(&buf[138]);
+	if ((flag & 0x3) == 0x1)
+		*zflags = 1;
+	else
+		ret = -1;
+
+out:
+	return ret;
+}
+
+
+uint32_t zdm_device_inquiry(int fd, int do_ata)
+{
+	uint32_t zflags = 0;
+	if (do_ata) {
+		if (blk_zoned_identify_ata(fd, &zflags) == 0)
+			return zflags;
 	} else {
-		fprintf(stderr, "ERR: malloc %d bytes failed.\n\n", bytes );
+		if (blk_zoned_inquiry(fd, &zflags) == 0)
+			return zflags;
 	}
-
-	return inquire;
+	return ~0u;
 }
 
 int zdm_zone_command(int fd, int command, uint64_t lba, int do_ata)
@@ -159,22 +251,23 @@ int zdm_zone_command(int fd, int command, uint64_t lba, int do_ata)
 
 int zdm_zone_close(int fd, uint64_t lba, int do_ata)
 {
-	return zdm_zone_command(fd, SCSI_IOCTL_CLOSE_ZONE, lba, do_ata);
+	return zdm_zone_command(fd, BLKCLOSEZONE, lba, do_ata);
 }
 
 int zdm_zone_finish(int fd, uint64_t lba, int do_ata)
 {
-	return zdm_zone_command(fd, SCSI_IOCTL_FINISH_ZONE, lba, do_ata);
+	fprintf(stderr, "zdm_zone_finish: Not Implemented!!\n"); 
+	return zdm_zone_command(fd, BLKCLOSEZONE, lba, do_ata);
 }
 
 int zdm_zone_open(int fd, uint64_t lba, int do_ata)
 {
-	return zdm_zone_command(fd, SCSI_IOCTL_OPEN_ZONE, lba, do_ata);
+	return zdm_zone_command(fd, BLKOPENZONE, lba, do_ata);
 }
 
 int zdm_zone_reset_wp(int fd, uint64_t lba, int do_ata)
 {
-	return zdm_zone_command(fd, SCSI_IOCTL_RESET_WP, lba, do_ata);
+	return zdm_zone_command(fd, BLKRESETZONE, lba, do_ata);
 }
 
 
@@ -253,7 +346,7 @@ int zdm_report_zones(int fd, struct bdev_zone_report_io *zone_info,
 		     uint64_t size, uint8_t option, uint64_t lba, int do_ata)
 {
 	int rc;
-	uint32_t cmd = SCSI_IOCTL_REPORT_ZONES;
+	uint32_t cmd = BLKREPORT;
 
 	zone_info->data.in.report_option     = option;
 	zone_info->data.in.return_page_count = size;

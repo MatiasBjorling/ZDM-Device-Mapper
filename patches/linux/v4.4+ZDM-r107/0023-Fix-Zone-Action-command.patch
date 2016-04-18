@@ -1,0 +1,49 @@
+From 5ea880b0e4203975fceed2d3956078439b92968d Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun.tancheff@seagate.com>
+Date: Tue, 8 Mar 2016 00:58:06 -0600
+Subject: [PATCH 23/29] Fix Zone Action command.
+
+---
+ drivers/scsi/sd.c | 16 +++++++++++-----
+ 1 file changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/scsi/sd.c b/drivers/scsi/sd.c
+index 3914070..aefd899 100644
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -1243,9 +1243,8 @@ static int sd_setup_zoned_cmnd(struct scsi_cmnd *cmd)
+ 	if (!sdp->zabc)
+ 		goto out;
+ 
+-	ret = scsi_init_io(cmd);
+-	if (ret != BLKPREP_OK)
+-		goto out;
++	/* zone action requests don't perform I/O, zero the S/G table */
++	memset(&cmd->sdb, 0, sizeof(cmd->sdb));
+ 
+ 	if (sector == ~0ul) {
+ 		allbit = 1;
+@@ -1266,11 +1265,18 @@ static int sd_setup_zoned_cmnd(struct scsi_cmnd *cmd)
+ 		cmd->cmnd[14] = ATA_CMD_ZONE_MAN_OUT;
+ 	} else {
+ 		cmd->cmnd[0] = ZBC_ACTION;
+-		cmd->cmnd[1] = (rq->cmd_flags & REQ_OPEN_ZONE)
+-			     ? ZBC_SA_ZONE_OPEN : ZBC_SA_ZONE_CLOSE;
++		cmd->cmnd[1] = ZBC_SA_ZONE_OPEN;
++		if (rq->cmd_flags & REQ_CLOSE_ZONE)
++			cmd->cmnd[1] = ZBC_SA_ZONE_CLOSE;
++		if (rq->cmd_flags & REQ_DISCARD)
++			cmd->cmnd[1] = ZBC_SA_RESET_WP;
+ 		cmd->cmnd[14] = allbit;
+ 		put_unaligned_be64(sector, &cmd->cmnd[2]);
+ 	}
++	cmd->cmd_len = 16;
++	cmd->transfersize = 0;
++	cmd->underflow = 0;
++	cmd->allowed = SD_MAX_RETRIES;
+ 	cmd->sc_data_direction = DMA_NONE;
+ 	ret = BLKPREP_OK;
+  out:
+-- 
+2.7.0
+

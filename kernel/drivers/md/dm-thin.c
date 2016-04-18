@@ -235,6 +235,7 @@ struct pool {
 	struct pool_features pf;
 	bool low_water_triggered:1;	/* A dm event has been sent */
 	bool suspended:1;
+	bool out_of_data_space:1;
 
 	struct dm_bio_prison *prison;
 	struct dm_kcopyd_client *copier;
@@ -338,7 +339,7 @@ static int __blkdev_issue_discard_async(struct block_device *bdev, sector_t sect
 					struct bio *parent_bio)
 {
 	struct request_queue *q = bdev_get_queue(bdev);
-	int type = REQ_WRITE | REQ_DISCARD;
+	int op_flags = 0;
 	struct bio *bio;
 
 	if (!q || !nr_sects)
@@ -350,7 +351,7 @@ static int __blkdev_issue_discard_async(struct block_device *bdev, sector_t sect
 	if (flags & BLKDEV_DISCARD_SECURE) {
 		if (!blk_queue_secdiscard(q))
 			return -EOPNOTSUPP;
-		type |= REQ_SECURE;
+		op_flags |= REQ_SECURE;
 	}
 
 	/*
@@ -365,8 +366,10 @@ static int __blkdev_issue_discard_async(struct block_device *bdev, sector_t sect
 	bio->bi_iter.bi_sector = sector;
 	bio->bi_bdev = bdev;
 	bio->bi_iter.bi_size = nr_sects << 9;
+	bio->bi_op = REQ_OP_DISCARD;
+	bio->bi_rw = op_flags;
 
-	submit_bio(type, bio);
+	submit_bio(bio);
 
 	return 0;
 }
@@ -461,9 +464,16 @@ static void cell_error_with_code(struct pool *pool,
 	dm_bio_prison_free_cell(pool->prison, cell);
 }
 
+static int get_pool_io_error_code(struct pool *pool)
+{
+	return pool->out_of_data_space ? -ENOSPC : -EIO;
+}
+
 static void cell_error(struct pool *pool, struct dm_bio_prison_cell *cell)
 {
-	cell_error_with_code(pool, cell, -EIO);
+	int error = get_pool_io_error_code(pool);
+
+	cell_error_with_code(pool, cell, error);
 }
 
 static void cell_success(struct pool *pool, struct dm_bio_prison_cell *cell)
@@ -622,7 +632,9 @@ static void error_retry_list_with_code(struct pool *pool, int error)
 
 static void error_retry_list(struct pool *pool)
 {
-	return error_retry_list_with_code(pool, -EIO);
+	int error = get_pool_io_error_code(pool);
+
+	return error_retry_list_with_code(pool, error);
 }
 
 /*
@@ -695,7 +707,7 @@ static void remap_to_origin(struct thin_c *tc, struct bio *bio)
 
 static int bio_triggers_commit(struct thin_c *tc, struct bio *bio)
 {
-	return (bio->bi_rw & (REQ_FLUSH | REQ_FUA)) &&
+	return (bio->bi_rw & (REQ_PREFLUSH | REQ_FUA)) &&
 		dm_thin_changed_this_transaction(tc->td);
 }
 
@@ -703,7 +715,7 @@ static void inc_all_io_entry(struct pool *pool, struct bio *bio)
 {
 	struct dm_thin_endio_hook *h;
 
-	if (bio->bi_rw & REQ_DISCARD)
+	if (bio->bi_op == REQ_OP_DISCARD)
 		return;
 
 	h = dm_per_bio_data(bio, sizeof(struct dm_thin_endio_hook));
@@ -866,7 +878,8 @@ static void __inc_remap_and_issue_cell(void *context,
 	struct bio *bio;
 
 	while ((bio = bio_list_pop(&cell->bios))) {
-		if (bio->bi_rw & (REQ_DISCARD | REQ_FLUSH | REQ_FUA))
+		if (bio->bi_rw & (REQ_PREFLUSH | REQ_FUA) ||
+		    bio->bi_op == REQ_OP_DISCARD)
 			bio_list_add(&info->defer_bios, bio);
 		else {
 			inc_all_io_entry(info->tc->pool, bio);
@@ -1644,7 +1657,8 @@ static void __remap_and_issue_shared_cell(void *context,
 
 	while ((bio = bio_list_pop(&cell->bios))) {
 		if ((bio_data_dir(bio) == WRITE) ||
-		    (bio->bi_rw & (REQ_DISCARD | REQ_FLUSH | REQ_FUA)))
+		    (bio->bi_rw & (REQ_PREFLUSH | REQ_FUA) ||
+		     bio->bi_op == REQ_OP_DISCARD))
 			bio_list_add(&info->defer_bios, bio);
 		else {
 			struct dm_thin_endio_hook *h = dm_per_bio_data(bio, sizeof(struct dm_thin_endio_hook));;
@@ -2033,7 +2047,7 @@ static void process_thin_deferred_bios(struct thin_c *tc)
 			break;
 		}
 
-		if (bio->bi_rw & REQ_DISCARD)
+		if (bio->bi_op == REQ_OP_DISCARD)
 			pool->process_discard(tc, bio);
 		else
 			pool->process_bio(tc, bio);
@@ -2120,7 +2134,7 @@ static void process_thin_deferred_cells(struct thin_c *tc)
 				return;
 			}
 
-			if (cell->holder->bi_rw & REQ_DISCARD)
+			if (cell->holder->bi_op == REQ_OP_DISCARD)
 				pool->process_discard_cell(tc, cell);
 			else
 				pool->process_cell(tc, cell);
@@ -2419,6 +2433,7 @@ static void set_pool_mode(struct pool *pool, enum pool_mode new_mode)
 		 */
 		if (old_mode != new_mode)
 			notify_of_pool_mode_change_to_oods(pool);
+		pool->out_of_data_space = true;
 		pool->process_bio = process_bio_read_only;
 		pool->process_discard = process_discard_bio;
 		pool->process_cell = process_cell_read_only;
@@ -2432,6 +2447,7 @@ static void set_pool_mode(struct pool *pool, enum pool_mode new_mode)
 	case PM_WRITE:
 		if (old_mode != new_mode)
 			notify_of_pool_mode_change(pool, "write");
+		pool->out_of_data_space = false;
 		pool->pf.error_if_no_space = pt->requested_pf.error_if_no_space;
 		dm_pool_metadata_read_write(pool->pmd);
 		pool->process_bio = process_bio;
@@ -2556,7 +2572,8 @@ static int thin_bio_map(struct dm_target *ti, struct bio *bio)
 		return DM_MAPIO_SUBMITTED;
 	}
 
-	if (bio->bi_rw & (REQ_DISCARD | REQ_FLUSH | REQ_FUA)) {
+	if (bio->bi_rw & (REQ_PREFLUSH | REQ_FUA) ||
+	    bio->bi_op == REQ_OP_DISCARD) {
 		thin_defer_bio_with_throttle(tc, bio);
 		return DM_MAPIO_SUBMITTED;
 	}
@@ -2832,6 +2849,7 @@ static struct pool *pool_create(struct mapped_device *pool_md,
 	INIT_LIST_HEAD(&pool->active_thins);
 	pool->low_water_triggered = false;
 	pool->suspended = true;
+	pool->out_of_data_space = false;
 
 	pool->shared_read_ds = dm_deferred_set_create();
 	if (!pool->shared_read_ds) {
@@ -3886,7 +3904,7 @@ static struct target_type pool_target = {
 	.name = "thin-pool",
 	.features = DM_TARGET_SINGLETON | DM_TARGET_ALWAYS_WRITEABLE |
 		    DM_TARGET_IMMUTABLE,
-	.version = {1, 17, 0},
+	.version = {1, 18, 0},
 	.module = THIS_MODULE,
 	.ctr = pool_ctr,
 	.dtr = pool_dtr,
@@ -4037,7 +4055,7 @@ static int thin_ctr(struct dm_target *ti, unsigned argc, char **argv)
 
 	ti->num_flush_bios = 1;
 	ti->flush_supported = true;
-	ti->per_bio_data_size = sizeof(struct dm_thin_endio_hook);
+	ti->per_io_data_size = sizeof(struct dm_thin_endio_hook);
 
 	/* In case the pool supports discards, pass them on. */
 	ti->discard_zeroes_data_unsupported = true;
@@ -4260,7 +4278,7 @@ static void thin_io_hints(struct dm_target *ti, struct queue_limits *limits)
 
 static struct target_type thin_target = {
 	.name = "thin",
-	.version = {1, 17, 0},
+	.version = {1, 18, 0},
 	.module	= THIS_MODULE,
 	.ctr = thin_ctr,
 	.dtr = thin_dtr,

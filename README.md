@@ -36,8 +36,9 @@ provided the required amount of conventional space is available.
 
 ## Software Requirements
 
-  - Current Linux Kernel v4.1 to v.4.5 with ZDM patches
-  - Recommended: sg3utils (1.41 or later) or sd-tools.
+  - Current Linux Kernel v4.1 to v.4.6 with ZDM patches
+  - Recommended: sg3utils (1.41 or later).
+  - Recommended: util-linux with ZDM patches.
 
 ## Caveat Emptor - Warning
 
@@ -57,7 +58,7 @@ provided the required amount of conventional space is available.
   - 4k page or block size.
   - Host Aware zoned block device, possibly with conventional zones.
   - Host Managed zoned block device with conventional zones.
-  - Currently 256 MiB of RAM per drive is recommended.
+  - Currently 64 MiB of RAM per drive is recommended.
 
 ## Userspace utilities
   - zdm-tools: zdmadm, zdm-status, zdm-zones, zdmon and others ...
@@ -71,11 +72,11 @@ provided the required amount of conventional space is available.
 ```
 or
 ```
-      sd_reset_wp -1 /dev/sdX
+      blkzonecmd --reset --zone -1 /dev/sdX
 ```
 or
 ```
-      sd_reset_wp ata -1 /dev/sdX
+      blkzonecmd --ata --reset --zone -1 /dev/sdX
 ```
 
   - Partition the drive to start the partition at a WP boundary.
@@ -133,22 +134,21 @@ If not, please see http://www.gnu.org/licenses/.
     * 0.94.5 [ceph patch](/patches/ceph)
   - util-linux -- Added: blkreport, blkzonecmd
     * 2.20.1 [For Ubuntu 14.04](/patches/util-linux/2.20.1)
-    * 2.27.1 [For Debian sid development](/patches/util-linux/2.27.1) 
+    * 2.28-rc2 [For Debian sid development](/patches/util-linux/2.27-rc2)
   - util-linux-ng -- Missing: blkreport, blkzonecmd
     * 2.17.2 [For CentOS 6.7](/patches/util-linux-ng)
 
 ## ZDM Linux Kernel
 
   - Patches
-    * v4.2 [ZDM r108 patches for linux v4.2](/patches/linux/v4.2+ZDM-r108)
-    * v4.5 [ZDM r108 patches for linux v4.5](/patches/linux/v4.5+ZDM-r108)
+    * v4.6-rc4 [ZDM r110 patches for linux v4.6.0-rc4](/patches/linux/v4.6-rc4+ZDM-r110)
 
-## Observations and Known Issues in this release (#108)
+## Observations and Known Issues in this release (#110)
 
-  - Bug: Write back of metadata could cause inconsistency in case of sudden power loss between SYNC's
-     * Fix is planned for #109.
+  - Bug: Memory fault during GC lba re-ordering.
+     * Fix is planned for #111.
   - Bug: GC can deadlock when GC emergency reserves are depleted.
-     * Fix is planned for #109.
+     * Fix is planned for #111.
 
 ## Changes from Initial Release
 
@@ -205,10 +205,28 @@ If not, please see http://www.gnu.org/licenses/.
 
   - ZDM #106
     * Bug Fix: Change lazy-drop timeout back to 15s
-    
+
   - ZDM #107
     * Bug Fix: sync() NULL dereference bug fix
-    
+
   - ZDM #108
     * Bug Fix: Rework BIO flags, fix zone off-by-1 error when partition is not zone aligned.
-    
+
+  - ZDM #109
+    * Updated to v4.6-rc2
+    * Re based on  separate operations from flags in the bio/request structs https://lkml.kernel.org/r/1456343292-14535-1-git-send-email-mchristi@redhat.com
+    * Re based on libata: SATL update: https://lkml.kernel.org/r/1459763047-125551-1-git-send-email-hare@suse.de
+    * Re based on libata: ZAC support: https://lkml.kernel.org/r/1459763271-125856-1-git-send-email-hare@suse.de
+    * Re based on Update version of write stream ID patchset https://lkml.kernel.org/r/1457107853-8689-1-git-send-email-axboe@fb.com
+    * Forced GC now starts 2 zones earlier and will always attempt a GC even when only 1 block is known to be stale (due to the deferred discard the stale counting can be far out of date.
+    * Reduced memory used by arrays of map page pointers to a sparse array using a hash map. 8TB should now use ~12 MiB during first fill and ~25MiB during GC.
+    * Initial implementation of metadata journal to CoW metadata changes between sync / cache flush events.
+    * Changed ZDM superblock crc64 to crc32 as crc64 was removed from util-linux.
+    * util-linux updated and required (blkreport and blkzonecmd).
+    * zdm-tools updated to used blkreport and blkzonecmd IOCTLs as well as crc32 instead of crc64.
+
+  - ZDM #110
+    * Metadata journal write back is is expanded to include 2 journal passes before overwriting origin lba (every 3rd flush). This also includes a bug fix to force migration out of journal to free up journal space.
+    * Added Hannes caching device mapper (dm-zoned) to being quantitative comparison with ZDM (dm-zdm).
+    * Rename circus to accommodate both device mappers (dm-zoned -> dm-zdm then added dm-zoned).
+    * Re-Sync zdmadm tools to match name changes and refreshed libzdm code base.

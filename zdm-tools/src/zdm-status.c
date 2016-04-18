@@ -52,8 +52,8 @@
 
 
 #include "utypes.h"
+#include "libzdmwrap.h"
 #include "libzdm.h"
-#include "libzoned.h"
 
 typedef struct zdm_ioc_status zdm_ioc_status_t;
 typedef struct zdm_ioc_request zdm_ioc_request_t;
@@ -86,16 +86,17 @@ void print_status(struct zdm_ioc_status * status, int sram)
 
     }
 
-
     printf("   b_used       %'" PRIu64 "\n", status->b_used );
     printf("   b_available  %'" PRIu64 "\n", status->b_available );
     printf("   b_discard    %'" PRIu64 "\n", status->b_discard );
     printf("   m_zones      %'" PRIu64 "\n", status->m_zones );
-    printf("   mc_entries   %'" PRIu32 "\n", status->mc_entries );
-    printf("   dc_entries   %'" PRIu32 "\n", status->dc_entries );
+    printf("   mc_entries   %'" PRIu32 "\n", status->map_cache_entries );
+    printf("   dc_entries   %'" PRIu32 "\n", status->discard_cache_entries );
     printf("   mlut_blocks  %'" PRIu64 "\n", status->mlut_blocks );
     printf("   crc_blocks   %'" PRIu64 "\n", status->crc_blocks );
-
+    printf("   memstat      %'" PRIu64 "\n", status->memstat );
+    printf("   jrnl_pages   %'" PRIu32 "\n", status->journal_pages );
+    printf("   jrnl entries %'" PRIu32 "\n", status->journal_entries );
 }
 
 
