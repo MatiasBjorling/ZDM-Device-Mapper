@@ -203,7 +203,7 @@ static int blk_zoned_report_ioctl(struct block_device *bdev, fmode_t mode,
 	gfp_t gfp = GFP_KERNEL;
 	struct bdev_zone_report_io *zone_iodata = NULL;
 	int order = 0;
-	struct page *pgs = NULL;
+	struct page * pgs = NULL;
 	u32 alloc_size = PAGE_SIZE;
 	unsigned long bi_rw = 0;
 	u8 opt = 0;
@@ -269,7 +269,7 @@ report_zones_out:
 }
 
 static int blk_zoned_action_ioctl(struct block_device *bdev, fmode_t mode,
-				  unsigned int cmd, unsigned long arg)
+				  unsigned cmd, unsigned long arg)
 {
 	unsigned long bi_rw = 0;
 

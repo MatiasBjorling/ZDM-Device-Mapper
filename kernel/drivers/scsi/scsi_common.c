@@ -305,7 +305,7 @@ EXPORT_SYMBOL(scsi_set_sense_information);
  *
  * Return value:
  *	0 on success or EINVAL for invalid sense buffer length
- **/
+ */
 int scsi_set_sense_field_pointer(u8 *buf, int buf_len, u16 fp, u8 bp, bool cd)
 {
 	u8 *ucp, len;

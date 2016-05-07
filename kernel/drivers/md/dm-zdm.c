@@ -42,7 +42,7 @@
 #define PRIx32 "x"
 #define PRIu32 "u"
 
-#define BIOSET_RESV 4
+#define BIOSET_RESV 8
 
 /**
  * _zdisk() - Return a pretty ZDM name.
@@ -467,7 +467,7 @@ static int zoned_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	u64 first_data_zone = 0;
 	u64 mz_md_provision = MZ_METADATA_ZONES;
 
-	BUILD_BUG_ON(Z_C4K != (sizeof(struct map_sect_to_lba) * Z_UNSORTED));
+	BUILD_BUG_ON(Z_C4K != (sizeof(struct map_cache_data)));
 	BUILD_BUG_ON(Z_C4K != (sizeof(struct io_4k_block)));
 	BUILD_BUG_ON(Z_C4K != (sizeof(struct mz_superkey)));
 
@@ -478,7 +478,6 @@ static int zoned_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	znd->trim = 1;
-	znd->raid5_trim = 0;
 
 	if (argc < 1) {
 		ti->error = "Invalid argument count";
@@ -508,7 +507,7 @@ static int zoned_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 			znd->trim = 1;
 		if (!strcasecmp("nodiscard", argv[r]))
 			znd->trim = 0;
-		if (!strcasecmp("raid5_trim", argv[r]))
+		if (!strcasecmp("raid5-trim", argv[r]))
 			znd->raid5_trim = 1;
 
 		if (!strncasecmp("reserve=", argv[r], 8)) {
@@ -547,6 +546,7 @@ static int zoned_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	 * Set if this target needs to receive flushes regardless of
 	 * whether or not its underlying devices have support.
 	 */
+	ti->num_flush_bios = 1;
 	ti->flush_supported = true;
 
 	/*
@@ -663,8 +663,6 @@ static void zoned_dtr(struct dm_target *ti)
 	kthread_stop(znd->bio_kthread);
 	kfifo_free(&znd->bio_fifo);
 #endif
-	if (znd->bio_set)
-		bioset_free(znd->bio_set);
 	zdm_remove_proc_entries(znd);
 	zoned_destroy(znd);
 }
@@ -714,8 +712,7 @@ static int znd_async_io(struct zdm *znd,
 	};
 
 	struct dm_io_request io_req = {
-		.bi_op = bi_op,
-		.bi_op_flags = bi_flags,
+		.bi_rw = bi_op | bi_flags,
 		.mem.type = dtype,
 		.mem.offset = 0,
 		.mem.ptr.vma = data,
@@ -813,7 +810,7 @@ static int read_block(struct dm_target *ti, enum dm_io_mem_type dtype,
 		return rc;
 	}
 
-	rc = block_io(znd, dtype, data, block, nDMsect, REQ_OP_READ, 0, queue);
+	rc = block_io(znd, dtype, data, block, nDMsect, READ, 0, queue);
 	if (rc) {
 		Z_ERR(znd, "read error: %d -- R: %llx [%u dm sect] (Q:%d)",
 			rc, lba, nDMsect, queue);
@@ -844,7 +841,7 @@ static int writef_block(struct dm_target *ti, enum dm_io_mem_type dtype,
 	unsigned int nDMsect = count << Z_SHFT4K;
 	int rc;
 
-	rc = block_io(znd, dtype, data, block, nDMsect, REQ_OP_WRITE,
+	rc = block_io(znd, dtype, data, block, nDMsect, WRITE,
 		      op_flags, queue);
 	if (rc) {
 		Z_ERR(znd, "write error: %d W: %llx [%u dm sect] (Q:%d)",
@@ -1608,6 +1605,8 @@ out:
 	return rcode;
 }
 
+#define REQ_CHECKPOINT (REQ_FLUSH_SEQ | REQ_FLUSH | REQ_FUA)
+
 /**
  * zoned_bio() - Handle and incoming BIO.
  * @znd: ZDM Instance
@@ -1618,7 +1617,9 @@ static int zoned_bio(struct zdm *znd, struct bio *bio)
 	u64 s_zdm = (bio->bi_iter.bi_sector >> Z_SHFT4K) + znd->md_end;
 	int rcode = DM_MAPIO_SUBMITTED;
 	struct request_queue *q;
-	int force_sync_now = 0;
+	int flush_op = 0;
+	int do_end_bio = 0;
+	int op = -1;
 
 	/* map to backing device ... NOT dm-zdm device */
 	bio->bi_bdev = znd->dev->bdev;
@@ -1627,29 +1628,37 @@ static int zoned_bio(struct zdm *znd, struct bio *bio)
 	q->queue_flags |= QUEUE_FLAG_NOMERGES;
 
 	if (is_write && znd->meta_result) {
-		if (!(bio->bi_op & REQ_OP_DISCARD)) {
+		if (!(bio->bi_rw & REQ_DISCARD)) {
 			rcode = znd->meta_result;
 			Z_ERR(znd, "MAP ERR (meta): %d", rcode);
 			goto out;
 		}
 	}
 
-	/* check for REQ_FLUSH flag */
-	if (bio->bi_rw & (REQ_PREFLUSH | REQ_FUA)) {
-		bio->bi_rw &= ~(REQ_PREFLUSH | REQ_FUA);
-		set_bit(DO_FLUSH, &znd->flags);
-		force_sync_now = 1;
-	}
-	if (bio->bi_rw & REQ_SYNC) {
+	if (bio->bi_rw & REQ_FLUSH) {
 		set_bit(DO_SYNC, &znd->flags);
-		force_sync_now = 1;
+		set_bit(DO_FLUSH, &znd->flags);
+		flush_op = 1;
+	} else if (bio->bi_rw & REQ_CHECKPOINT) {
+		bio->bi_rw &= ~REQ_CHECKPOINT;
+		set_bit(DO_SYNC, &znd->flags);
+		set_bit(DO_FLUSH, &znd->flags);
+		flush_op = 1;
+	}
+
+	op = flush_op ? REQ_FLUSH : (is_write ? WRITE : READ);
+	if (op == REQ_FLUSH && op == znd->last_op &&
+	    bio->bi_iter.bi_size == 0) {
+		do_end_bio = 1;
+		goto out;
 	}
 
 	Z_DBG(znd, "%s: s:%"PRIx64" sz:%u -> %s", __func__, s_zdm,
-	      bio->bi_iter.bi_size, is_write ? "W" : "R");
+	      bio->bi_iter.bi_size,
+	      flush_op ? "F" : (is_write ? "W" : "R"));
 
 	if (bio->bi_iter.bi_size) {
-		if (bio->bi_op & REQ_OP_DISCARD) {
+		if (bio->bi_rw & REQ_DISCARD) {
 			rcode = zoned_map_discard(znd, bio, s_zdm);
 		} else if (is_write) {
 			const int wait = 1;
@@ -1665,6 +1674,8 @@ static int zoned_bio(struct zdm *znd, struct bio *bio)
 			rcode = zm_read_bios(znd, bio, s_zdm);
 		}
 		znd->age = jiffies;
+	} else {
+		do_end_bio = 1;
 	}
 
 	if (test_bit(DO_FLUSH, &znd->flags) ||
@@ -1678,10 +1689,16 @@ static int zoned_bio(struct zdm *znd, struct bio *bio)
 		}
 	}
 
-	if (force_sync_now && work_pending(&znd->meta_work))
+	if (flush_op && work_pending(&znd->meta_work))
 		flush_workqueue(znd->meta_wq);
 
 out:
+	if (do_end_bio)
+		bio_endio(bio);
+
+	znd->last_op = op;
+
+#if 0 /* DEBUG */
 	if (rcode == DM_MAPIO_REMAPPED || rcode == DM_MAPIO_SUBMITTED)
 		goto done;
 
@@ -1698,6 +1715,8 @@ out:
 		rcode = -EIO;
 	}
 done:
+#endif
+
 	return rcode;
 }
 
@@ -1731,6 +1750,19 @@ static void on_timeout_activity(struct zdm *znd, int delay)
 
 	if (test_bit(ZF_FREEZE, &znd->flags))
 		return;
+
+
+	if (is_expired_msecs(znd->flush_age, 30000)) {
+		Z_ERR(znd, "Periodic FLUSH");
+
+		set_bit(DO_SYNC, &znd->flags);
+		set_bit(DO_FLUSH, &znd->flags);
+		if (!test_bit(DO_METAWORK_QD, &znd->flags) &&
+		    !work_pending(&znd->meta_work)) {
+			set_bit(DO_METAWORK_QD, &znd->flags);
+			queue_work(znd->meta_wq, &znd->meta_work);
+		}
+	}
 
 	if (is_expired_msecs(znd->age, DISCARD_IDLE_MSECS))
 		max_tries = 20;

@@ -587,7 +587,6 @@ void __bio_clone_fast(struct bio *bio, struct bio *bio_src)
 	 */
 	bio->bi_bdev = bio_src->bi_bdev;
 	bio_set_flag(bio, BIO_CLONED);
-	bio->bi_op = bio_src->bi_op;
 	bio->bi_rw = bio_src->bi_rw;
 	bio->bi_iter = bio_src->bi_iter;
 	bio->bi_io_vec = bio_src->bi_io_vec;
@@ -671,15 +670,14 @@ struct bio *bio_clone_bioset(struct bio *bio_src, gfp_t gfp_mask,
 		return NULL;
 
 	bio->bi_bdev		= bio_src->bi_bdev;
-	bio->bi_op		= bio_src->bi_op;
 	bio->bi_rw		= bio_src->bi_rw;
 	bio->bi_iter.bi_sector	= bio_src->bi_iter.bi_sector;
 	bio->bi_iter.bi_size	= bio_src->bi_iter.bi_size;
 
-	if (bio->bi_op == REQ_OP_DISCARD)
+	if (bio->bi_rw & REQ_DISCARD)
 		goto integrity_clone;
 
-	if (bio->bi_op == REQ_OP_WRITE_SAME) {
+	if (bio->bi_rw & REQ_WRITE_SAME) {
 		bio->bi_io_vec[bio->bi_vcnt++] = bio_src->bi_io_vec[0];
 		goto integrity_clone;
 	}
@@ -869,20 +867,21 @@ static void submit_bio_wait_endio(struct bio *bio)
 
 /**
  * submit_bio_wait - submit a bio, and wait until it completes
+ * @rw: whether to %READ or %WRITE, or maybe to %READA (read ahead)
  * @bio: The &struct bio which describes the I/O
  *
  * Simple wrapper around submit_bio(). Returns 0 on success, or the error from
  * bio_endio() on failure.
  */
-int submit_bio_wait(struct bio *bio)
+int submit_bio_wait(int rw, struct bio *bio)
 {
 	struct submit_bio_ret ret;
 
+	rw |= REQ_SYNC;
 	init_completion(&ret.event);
 	bio->bi_private = &ret;
 	bio->bi_end_io = submit_bio_wait_endio;
-	bio->bi_rw |= REQ_SYNC;
-	submit_bio(bio);
+	submit_bio(rw, bio);
 	wait_for_completion_io(&ret.event);
 
 	return ret.error;
@@ -1181,7 +1180,7 @@ struct bio *bio_copy_user_iov(struct request_queue *q,
 		goto out_bmd;
 
 	if (iter->type & WRITE)
-		bio->bi_op = REQ_OP_WRITE;
+		bio->bi_rw |= REQ_WRITE;
 
 	ret = 0;
 
@@ -1351,7 +1350,7 @@ struct bio *bio_map_user_iov(struct request_queue *q,
 	 * set data direction, and check if mapped pages need bouncing
 	 */
 	if (iter->type & WRITE)
-		bio->bi_op = REQ_OP_WRITE;
+		bio->bi_rw |= REQ_WRITE;
 
 	bio_set_flag(bio, BIO_USER_MAPPED);
 
@@ -1544,7 +1543,7 @@ struct bio *bio_copy_kern(struct request_queue *q, void *data, unsigned int len,
 		bio->bi_private = data;
 	} else {
 		bio->bi_end_io = bio_copy_kern_endio;
-		bio->bi_op = REQ_OP_WRITE;
+		bio->bi_rw |= REQ_WRITE;
 	}
 
 	return bio;
@@ -1799,7 +1798,7 @@ struct bio *bio_split(struct bio *bio, int sectors,
 	 * Discards need a mutable bio_vec to accommodate the payload
 	 * required by the DSM TRIM and UNMAP commands.
 	 */
-	if (bio->bi_op == REQ_OP_DISCARD)
+	if (bio->bi_rw & REQ_DISCARD)
 		split = bio_clone_bioset(bio, gfp, bs);
 	else
 		split = bio_clone_fast(bio, gfp, bs);

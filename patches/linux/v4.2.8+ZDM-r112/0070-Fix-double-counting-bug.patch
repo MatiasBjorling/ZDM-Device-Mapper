@@ -1,0 +1,24 @@
+From 36198debf2b3e38ad9574cdaafafe6e15e73cc0b Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Fri, 6 May 2016 23:33:43 -0500
+Subject: [PATCH 70/71] Fix double counting bug.
+
+---
+ drivers/md/libzdm.c | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/drivers/md/libzdm.c b/drivers/md/libzdm.c
+index 0fbe4ee..051f248 100644
+--- a/drivers/md/libzdm.c
++++ b/drivers/md/libzdm.c
+@@ -7087,7 +7087,6 @@ static int md_journal_add_map(struct zdm *znd, u64 addr, u64 lba)
+ 			}
+ 			if (entry == next) {
+ 				jrnl->wb[entry] = cpu_to_le32((u32)addr);
+-					jrnl->in_use++;
+ 			}
+ 		}
+ 		spin_unlock(&jrnl->wb_alloc);
+-- 
+2.8.1
+

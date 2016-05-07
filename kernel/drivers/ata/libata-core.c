@@ -721,7 +721,7 @@ u64 ata_tf_read_block(const struct ata_taskfile *tf, struct ata_device *dev)
 		if (!sect) {
 			ata_dev_warn(dev,
 				     "device reported invalid CHS sector 0\n");
-			return (u64)-1;
+			return U64_MAX;
 		}
 
 		block = (cyl * dev->heads + head) * dev->sectors + sect - 1;
@@ -2088,7 +2088,7 @@ static void ata_dev_config_ncq_send_recv(struct ata_device *dev)
 	u16 log_pages;
 
 	err_mask = ata_read_log_page(dev, ATA_LOG_DIRECTORY,
-				     0, ap->sector_buf, 1, true);
+				     0, ap->sector_buf, 1);
 	if (err_mask) {
 		ata_dev_dbg(dev,
 			    "failed to get Log Directory Emask 0x%x\n",
@@ -2102,7 +2102,7 @@ static void ata_dev_config_ncq_send_recv(struct ata_device *dev)
 		return;
 	}
 	err_mask = ata_read_log_page(dev, ATA_LOG_NCQ_SEND_RECV,
-				     0, ap->sector_buf, 1, true);
+				     0, ap->sector_buf, 1);
 	if (err_mask) {
 		ata_dev_dbg(dev,
 			    "failed to get NCQ Send/Recv Log Emask 0x%x\n",
@@ -2129,7 +2129,7 @@ static void ata_dev_config_ncq_non_data(struct ata_device *dev)
 	u16 log_pages;
 
 	err_mask = ata_read_log_page(dev, ATA_LOG_DIRECTORY,
-				     0, ap->sector_buf, 1, true);
+				     0, ap->sector_buf, 1);
 	if (err_mask) {
 		ata_dev_dbg(dev,
 			    "failed to get Log Directory Emask 0x%x\n",
@@ -2143,7 +2143,7 @@ static void ata_dev_config_ncq_non_data(struct ata_device *dev)
 		return;
 	}
 	err_mask = ata_read_log_page(dev, ATA_LOG_NCQ_NON_DATA,
-				     0, ap->sector_buf, 1, true);
+				     0, ap->sector_buf, 1);
 	if (err_mask) {
 		ata_dev_dbg(dev,
 			    "failed to get NCQ Non-Data Log Emask 0x%x\n",
@@ -2232,12 +2232,12 @@ static void ata_dev_config_zac(struct ata_device *dev)
 	struct ata_port *ap = dev->link->ap;
 	unsigned int err_mask;
 	u8 *identify_buf = ap->sector_buf;
-	int log_index = ATA_LOG_SATA_ID_DEV_DATA * 2;
+	int log_index = ATA_LOG_SATA_ID_DEV_DATA * 2, i, found = 0;
 	u16 log_pages;
 
-	dev->zac_zones_optimal_open = (u32)-1;
-	dev->zac_zones_optimal_nonseq = (u32)-1;
-	dev->zac_zones_max_open = (u32)-1;
+	dev->zac_zones_optimal_open = U32_MAX;
+	dev->zac_zones_optimal_nonseq = U32_MAX;
+	dev->zac_zones_max_open = U32_MAX;
 
 	/*
 	 * Always set the 'ZAC' flag for Host-managed devices.
@@ -2254,10 +2254,11 @@ static void ata_dev_config_zac(struct ata_device *dev)
 		return;
 
 	/*
-	 * Read IDENTIFY DEVICE data log, page 9 (Zoned-device information)
+	 * Read Log Directory to figure out if IDENTIFY DEVICE log
+	 * is supported.
 	 */
 	err_mask = ata_read_log_page(dev, ATA_LOG_DIRECTORY,
-				     0, ap->sector_buf, 1, true);
+				     0, ap->sector_buf, 1);
 	if (err_mask) {
 		ata_dev_info(dev,
 			     "failed to get Log Directory Emask 0x%x\n",
@@ -2265,17 +2266,42 @@ static void ata_dev_config_zac(struct ata_device *dev)
 		return;
 	}
 	log_pages = get_unaligned_le16(&ap->sector_buf[log_index]);
-	if (log_pages <= ATA_LOG_ZONED_INFORMATION) {
+	if (log_pages == 0) {
 		ata_dev_warn(dev,
-			     "ATA Zoned Information Log not supported\n");
-		dev->zac_zones_optimal_open = U32_MAX;
-		dev->zac_zones_optimal_nonseq = U32_MAX;
-		dev->zac_zones_max_open = U32_MAX;
+			     "ATA Identify Device Log not supported\n");
 		return;
 	}
+	/*
+	 * Read IDENTIFY DEVICE data log, page 0, to figure out
+	 * if page 9 is supported.
+	 */
+	err_mask = ata_read_log_page(dev, ATA_LOG_SATA_ID_DEV_DATA, 0,
+				     identify_buf, 1);
+	if (err_mask) {
+		ata_dev_info(dev,
+			     "failed to get Device Identify Log Emask 0x%x\n",
+			     err_mask);
+		return;
+	}
+	log_pages = identify_buf[8];
+	for (i = 0; i < log_pages; i++) {
+		if (identify_buf[9 + i] == ATA_LOG_ZONED_INFORMATION) {
+			found++;
+			break;
+		}
+	}
+	if (!found) {
+		ata_dev_warn(dev,
+			     "ATA Zoned Information Log not supported\n");
+		return;
+	}
+
+	/*
+	 * Read IDENTIFY DEVICE data log, page 9 (Zoned-device information)
+	 */
 	err_mask = ata_read_log_page(dev, ATA_LOG_SATA_ID_DEV_DATA,
 				     ATA_LOG_ZONED_INFORMATION,
-				     identify_buf, 1, true);
+				     identify_buf, 1);
 	if (!err_mask) {
 		u64 zoned_cap, opt_open, opt_nonseq, max_open;
 
@@ -2504,7 +2530,8 @@ int ata_dev_configure(struct ata_device *dev)
 			err_mask = ata_read_log_page(dev,
 						     ATA_LOG_SATA_ID_DEV_DATA,
 						     ATA_LOG_SATA_SETTINGS,
-						     sata_setting, 1, true);
+						     sata_setting,
+						     1);
 			if (err_mask)
 				ata_dev_dbg(dev,
 					    "failed to get Identify Device Data, Emask 0x%x\n",

@@ -1136,7 +1136,6 @@ static void clone_init(struct dm_crypt_io *io, struct bio *clone)
 	clone->bi_private = io;
 	clone->bi_end_io  = crypt_endio;
 	clone->bi_bdev    = cc->dev->bdev;
-	clone->bi_op      = io->base_bio->bi_op;
 	clone->bi_rw      = io->base_bio->bi_rw;
 }
 
@@ -1912,12 +1911,11 @@ static int crypt_map(struct dm_target *ti, struct bio *bio)
 	struct crypt_config *cc = ti->private;
 
 	/*
-	 * If bio is REQ_PREFLUSH or REQ_DISCARD, just bypass crypt queues.
-	 * - for REQ_PREFLUSH device-mapper core ensures that no IO is in-flight
+	 * If bio is REQ_FLUSH or REQ_DISCARD, just bypass crypt queues.
+	 * - for REQ_FLUSH device-mapper core ensures that no IO is in-flight
 	 * - for REQ_DISCARD caller must use flush if IO ordering matters
 	 */
-	if (unlikely(bio->bi_rw & REQ_PREFLUSH ||
-	    bio->bi_op == REQ_OP_DISCARD)) {
+	if (unlikely(bio->bi_rw & (REQ_FLUSH | REQ_DISCARD))) {
 		bio->bi_bdev = cc->dev->bdev;
 		if (bio_sectors(bio))
 			bio->bi_iter.bi_sector = cc->start +

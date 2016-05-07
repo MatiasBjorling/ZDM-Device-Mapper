@@ -806,8 +806,7 @@ static void stripe_add_to_batch_list(struct r5conf *conf, struct stripe_head *sh
 	dd_idx = 0;
 	while (dd_idx == sh->pd_idx || dd_idx == sh->qd_idx)
 		dd_idx++;
-	if (head->dev[dd_idx].towrite->bi_rw != sh->dev[dd_idx].towrite->bi_rw ||
-	    head->dev[dd_idx].towrite->bi_op != sh->dev[dd_idx].towrite->bi_op)
+	if (head->dev[dd_idx].towrite->bi_rw != sh->dev[dd_idx].towrite->bi_rw)
 		goto unlock_out;
 
 	if (head->batch_head) {
@@ -892,32 +891,29 @@ static void ops_run_io(struct stripe_head *sh, struct stripe_head_state *s)
 	if (r5l_write_stripe(conf->log, sh) == 0)
 		return;
 	for (i = disks; i--; ) {
-		int op;
-		int op_flags = 0;
+		int rw;
 		int replace_only = 0;
 		struct bio *bi, *rbi;
 		struct md_rdev *rdev, *rrdev = NULL;
 
 		sh = head_sh;
 		if (test_and_clear_bit(R5_Wantwrite, &sh->dev[i].flags)) {
-			if (test_and_clear_bit(R5_WantFUA, &sh->dev[i].flags)) {
-				op = REQ_OP_WRITE;
-				op_flags = WRITE_FUA;
-			} else {
-				op = REQ_OP_WRITE;
-			}
+			if (test_and_clear_bit(R5_WantFUA, &sh->dev[i].flags))
+				rw = WRITE_FUA;
+			else
+				rw = WRITE;
 			if (test_bit(R5_Discard, &sh->dev[i].flags))
-				op = REQ_OP_DISCARD;
+				rw |= REQ_DISCARD;
 		} else if (test_and_clear_bit(R5_Wantread, &sh->dev[i].flags))
-			op = REQ_OP_READ;
+			rw = READ;
 		else if (test_and_clear_bit(R5_WantReplace,
 					    &sh->dev[i].flags)) {
-			op = REQ_OP_WRITE;
+			rw = WRITE;
 			replace_only = 1;
 		} else
 			continue;
 		if (test_and_clear_bit(R5_SyncIO, &sh->dev[i].flags))
-			op_flags |= REQ_SYNC;
+			rw |= REQ_SYNC;
 
 again:
 		bi = &sh->dev[i].req;
@@ -931,9 +927,9 @@ again:
 			rdev = rrdev;
 			rrdev = NULL;
 		}
-		if (op_is_write(op)) {
+		if (rw & WRITE) {
 			if (i == sh->pd_idx || i == sh->qd_idx)
-				op_flags |= REQ_META;
+				rw |= REQ_META;
 			if (replace_only)
 				rdev = NULL;
 			if (rdev == rrdev)
@@ -959,7 +955,7 @@ again:
 		 * need to check for writes.  We never accept write errors
 		 * on the replacement, so we don't to check rrdev.
 		 */
-		while (op_is_write(op) && rdev &&
+		while ((rw & WRITE) && rdev &&
 		       test_bit(WriteErrorSeen, &rdev->flags)) {
 			sector_t first_bad;
 			int bad_sectors;
@@ -1001,16 +997,15 @@ again:
 
 			bio_reset(bi);
 			bi->bi_bdev = rdev->bdev;
-			bi->bi_op = op;
-			bi->bi_rw = op_flags;
-			bi->bi_end_io = op_is_write(op)
+			bi->bi_rw = rw;
+			bi->bi_end_io = (rw & WRITE)
 				? raid5_end_write_request
 				: raid5_end_read_request;
 			bi->bi_private = sh;
 
-			pr_debug("%s: for %llu schedule op %d,%u on disc %d\n",
+			pr_debug("%s: for %llu schedule op %ld on disc %d\n",
 				__func__, (unsigned long long)sh->sector,
-				bi->bi_op, bi->bi_rw, i);
+				bi->bi_rw, i);
 			atomic_inc(&sh->count);
 			if (sh != head_sh)
 				atomic_inc(&head_sh->count);
@@ -1034,7 +1029,7 @@ again:
 			 * If this is discard request, set bi_vcnt 0. We don't
 			 * want to confuse SCSI because SCSI will replace payload
 			 */
-			if (op == REQ_OP_DISCARD)
+			if (rw & REQ_DISCARD)
 				bi->bi_vcnt = 0;
 			if (rrdev)
 				set_bit(R5_DOUBLE_LOCKED, &sh->dev[i].flags);
@@ -1054,16 +1049,15 @@ again:
 
 			bio_reset(rbi);
 			rbi->bi_bdev = rrdev->bdev;
-			rbi->bi_op = op;
-			rbi->bi_rw = op_flags;
-			BUG_ON(!op_is_write(op));
+			rbi->bi_rw = rw;
+			BUG_ON(!(rw & WRITE));
 			rbi->bi_end_io = raid5_end_write_request;
 			rbi->bi_private = sh;
 
-			pr_debug("%s: for %llu schedule op %d,%u on "
+			pr_debug("%s: for %llu schedule op %ld on "
 				 "replacement disc %d\n",
 				__func__, (unsigned long long)sh->sector,
-				rbi->bi_op, rbi->bi_rw, i);
+				rbi->bi_rw, i);
 			atomic_inc(&sh->count);
 			if (sh != head_sh)
 				atomic_inc(&head_sh->count);
@@ -1084,7 +1078,7 @@ again:
 			 * If this is discard request, set bi_vcnt 0. We don't
 			 * want to confuse SCSI because SCSI will replace payload
 			 */
-			if (op == REQ_OP_DISCARD)
+			if (rw & REQ_DISCARD)
 				rbi->bi_vcnt = 0;
 			if (conf->mddev->gendisk)
 				trace_block_bio_remap(bdev_get_queue(rbi->bi_bdev),
@@ -1093,11 +1087,10 @@ again:
 			generic_make_request(rbi);
 		}
 		if (!rdev && !rrdev) {
-			if (op_is_write(op))
+			if (rw & WRITE)
 				set_bit(STRIPE_DEGRADED, &sh->state);
-			pr_debug("skip op %d,%u on disc %d for sector %llu\n",
-				 bi->bi_op, bi->bi_rw, i,
-				 (unsigned long long)sh->sector);
+			pr_debug("skip op %ld on disc %d for sector %llu\n",
+				bi->bi_rw, i, (unsigned long long)sh->sector);
 			clear_bit(R5_LOCKED, &sh->dev[i].flags);
 			set_bit(STRIPE_HANDLE, &sh->state);
 		}
@@ -1632,7 +1625,7 @@ again:
 					set_bit(R5_WantFUA, &dev->flags);
 				if (wbi->bi_rw & REQ_SYNC)
 					set_bit(R5_SyncIO, &dev->flags);
-				if (wbi->bi_op == REQ_OP_DISCARD)
+				if (wbi->bi_rw & REQ_DISCARD)
 					set_bit(R5_Discard, &dev->flags);
 				else {
 					tx = async_copy_data(1, wbi, &dev->page,
@@ -5161,7 +5154,7 @@ static void raid5_make_request(struct mddev *mddev, struct bio * bi)
 	DEFINE_WAIT(w);
 	bool do_prepare;
 
-	if (unlikely(bi->bi_rw & REQ_PREFLUSH)) {
+	if (unlikely(bi->bi_rw & REQ_FLUSH)) {
 		int ret = r5l_handle_flush_request(conf->log, bi);
 
 		if (ret == 0)
@@ -5187,7 +5180,7 @@ static void raid5_make_request(struct mddev *mddev, struct bio * bi)
 			return;
 	}
 
-	if (unlikely(bi->bi_op == REQ_OP_DISCARD)) {
+	if (unlikely(bi->bi_rw & REQ_DISCARD)) {
 		make_discard_request(mddev, bi);
 		return;
 	}

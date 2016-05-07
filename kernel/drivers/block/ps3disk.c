@@ -196,7 +196,7 @@ static void ps3disk_do_request(struct ps3_storage_device *dev,
 	dev_dbg(&dev->sbd.core, "%s:%u\n", __func__, __LINE__);
 
 	while ((req = blk_fetch_request(q))) {
-		if (req->op == REQ_OP_FLUSH) {
+		if (req->cmd_flags & REQ_FLUSH) {
 			if (ps3disk_submit_flush_request(dev, req))
 				break;
 		} else if (req->cmd_type == REQ_TYPE_FS) {
@@ -256,7 +256,7 @@ static irqreturn_t ps3disk_interrupt(int irq, void *data)
 		return IRQ_HANDLED;
 	}
 
-	if (req->op == REQ_OP_FLUSH) {
+	if (req->cmd_flags & REQ_FLUSH) {
 		read = 0;
 		op = "flush";
 	} else {
@@ -468,7 +468,7 @@ static int ps3disk_probe(struct ps3_system_bus_device *_dev)
 	blk_queue_dma_alignment(queue, dev->blk_size-1);
 	blk_queue_logical_block_size(queue, dev->blk_size);
 
-	blk_queue_flush(queue, REQ_PREFLUSH);
+	blk_queue_flush(queue, REQ_FLUSH);
 
 	blk_queue_max_segments(queue, -1);
 	blk_queue_max_segment_size(queue, dev->bounce_size);

@@ -393,11 +393,8 @@ xfs_submit_ioend_bio(
 	atomic_inc(&ioend->io_remaining);
 	bio->bi_private = ioend;
 	bio->bi_end_io = xfs_end_bio;
-	bio->bi_op = REQ_OP_WRITE;
-	if (wbc->sync_mode == WB_SYNC_ALL)
-		bio->bi_rw = WRITE_SYNC;
-        bio_set_streamid(bio, inode_streamid(ioend->io_inode));
-	submit_bio(bio);
+	bio_set_streamid(bio, inode_streamid(ioend->io_inode));
+	submit_bio(wbc->sync_mode == WB_SYNC_ALL ? WRITE_SYNC : WRITE, bio);
 }
 
 STATIC struct bio *

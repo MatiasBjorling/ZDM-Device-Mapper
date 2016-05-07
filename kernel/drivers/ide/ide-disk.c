@@ -431,7 +431,7 @@ static int idedisk_prep_fn(struct request_queue *q, struct request *rq)
 	ide_drive_t *drive = q->queuedata;
 	struct ide_cmd *cmd;
 
-	if (rq->op != REQ_OP_FLUSH)
+	if (!(rq->cmd_flags & REQ_FLUSH))
 		return BLKPREP_OK;
 
 	if (rq->special) {
@@ -546,7 +546,7 @@ static void update_flush(ide_drive_t *drive)
 		       drive->name, barrier ? "" : "not ");
 
 		if (barrier) {
-			flush = REQ_PREFLUSH;
+			flush = REQ_FLUSH;
 			blk_queue_prep_rq(drive->queue, idedisk_prep_fn);
 		}
 	}

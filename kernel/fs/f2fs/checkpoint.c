@@ -55,15 +55,14 @@ static struct page *__get_meta_page(struct f2fs_sb_info *sbi, pgoff_t index,
 	struct f2fs_io_info fio = {
 		.sbi = sbi,
 		.type = META,
-		.op = REQ_OP_READ,
-		.op_flags = READ_SYNC | REQ_META | REQ_PRIO,
+		.rw = READ_SYNC | REQ_META | REQ_PRIO,
 		.old_blkaddr = index,
 		.new_blkaddr = index,
 		.encrypted_page = NULL,
 	};
 
 	if (unlikely(!is_meta))
-		fio.op_flags &= ~REQ_META;
+		fio.rw &= ~REQ_META;
 repeat:
 	page = grab_cache_page(mapping, index);
 	if (!page) {
@@ -150,14 +149,13 @@ int ra_meta_pages(struct f2fs_sb_info *sbi, block_t start, int nrpages,
 	struct f2fs_io_info fio = {
 		.sbi = sbi,
 		.type = META,
-		.op = REQ_OP_READ,
-		.op_flags = sync ? (READ_SYNC | REQ_META | REQ_PRIO) : READA,
+		.rw = sync ? (READ_SYNC | REQ_META | REQ_PRIO) : READA,
 		.encrypted_page = NULL,
 	};
 	struct blk_plug plug;
 
 	if (unlikely(type == META_POR))
-		fio.op_flags &= ~REQ_META;
+		fio.rw &= ~REQ_META;
 
 	blk_start_plug(&plug);
 	for (; nrpages-- > 0; blkno++) {

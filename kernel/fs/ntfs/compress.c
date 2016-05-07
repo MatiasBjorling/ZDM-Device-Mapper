@@ -670,7 +670,7 @@ lock_retry_remap:
 		}
 		get_bh(tbh);
 		tbh->b_end_io = end_buffer_read_sync;
-		submit_bh(REQ_OP_READ, 0, tbh);
+		submit_bh(READ, tbh);
 	}
 
 	/* Wait for io completion on all buffer heads. */

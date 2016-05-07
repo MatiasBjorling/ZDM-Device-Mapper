@@ -230,20 +230,17 @@ static void gfs2_end_log_write(struct bio *bio)
 /**
  * gfs2_log_flush_bio - Submit any pending log bio
  * @sdp: The superblock
- * @op: REQ_OP
- * @op_flags: rq_flag_bits
+ * @rw: The rw flags
  *
  * Submit any pending part-built or full bio to the block device. If
  * there is no pending bio, then this is a no-op.
  */
 
-void gfs2_log_flush_bio(struct gfs2_sbd *sdp, int op, int op_flags)
+void gfs2_log_flush_bio(struct gfs2_sbd *sdp, int rw)
 {
 	if (sdp->sd_log_bio) {
 		atomic_inc(&sdp->sd_log_in_flight);
-		sdp->sd_log_bio->bi_op = op;
-		sdp->sd_log_bio->bi_rw = op_flags;
-		submit_bio(sdp->sd_log_bio);
+		submit_bio(rw, sdp->sd_log_bio);
 		sdp->sd_log_bio = NULL;
 	}
 }
@@ -302,7 +299,7 @@ static struct bio *gfs2_log_get_bio(struct gfs2_sbd *sdp, u64 blkno)
 		nblk >>= sdp->sd_fsb2bb_shift;
 		if (blkno == nblk)
 			return bio;
-		gfs2_log_flush_bio(sdp, REQ_OP_WRITE, 0);
+		gfs2_log_flush_bio(sdp, WRITE);
 	}
 
 	return gfs2_log_alloc_bio(sdp, blkno);
@@ -331,7 +328,7 @@ static void gfs2_log_write(struct gfs2_sbd *sdp, struct page *page,
 	bio = gfs2_log_get_bio(sdp, blkno);
 	ret = bio_add_page(bio, page, size, offset);
 	if (ret == 0) {
-		gfs2_log_flush_bio(sdp, REQ_OP_WRITE, 0);
+		gfs2_log_flush_bio(sdp, WRITE);
 		bio = gfs2_log_alloc_bio(sdp, blkno);
 		ret = bio_add_page(bio, page, size, offset);
 		WARN_ON(ret == 0);

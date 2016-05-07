@@ -1493,7 +1493,6 @@ static const char *ata_err_string(unsigned int err_mask)
  *	@page: page to read
  *	@buf: buffer to store read page
  *	@sectors: number of sectors to read
- *	@fpdma: flag if fpdma should be used
  *
  *	Read log page using READ_LOG_EXT command.
  *
@@ -1504,8 +1503,7 @@ static const char *ata_err_string(unsigned int err_mask)
  *	0 on success, AC_ERR_* mask otherwise.
  */
 unsigned int ata_read_log_page(struct ata_device *dev, u8 log,
-			       u8 page, void *buf, unsigned int sectors,
-			       bool fpdma)
+			       u8 page, void *buf, unsigned int sectors)
 {
 	unsigned long ap_flags = dev->link->ap->flags;
 	struct ata_taskfile tf;
@@ -1523,43 +1521,25 @@ unsigned int ata_read_log_page(struct ata_device *dev, u8 log,
 
 retry:
 	ata_tf_init(dev, &tf);
-	if (fpdma && ata_ncq_enabled(dev) &&
-	    ata_fpdma_read_log_supported(dev)) {
-		tf.command = ATA_CMD_FPDMA_RECV;
-		tf.protocol = ATA_PROT_NCQ;
-		tf.hob_nsect = ATA_SUBCMD_FPDMA_RECV_RD_LOG_DMA_EXT & 0x1f;
-		tf.nsect = ATA_TAG_INTERNAL << 3;
-		tf.feature = sectors;
-		tf.hob_feature = sectors >> 8;
-		dma = true;
-	} else if (dev->dma_mode && ata_id_has_read_log_dma_ext(dev->id) &&
+	if (dev->dma_mode && ata_id_has_read_log_dma_ext(dev->id) &&
 	    !(dev->horkage & ATA_HORKAGE_NO_NCQ_LOG)) {
 		tf.command = ATA_CMD_READ_LOG_DMA_EXT;
 		tf.protocol = ATA_PROT_DMA;
-		tf.nsect = sectors;
-		tf.hob_nsect = sectors >> 8;
 		dma = true;
 	} else {
 		tf.command = ATA_CMD_READ_LOG_EXT;
 		tf.protocol = ATA_PROT_PIO;
-		tf.nsect = sectors;
-		tf.hob_nsect = sectors >> 8;
 		dma = false;
 	}
 	tf.lbal = log;
 	tf.lbam = page;
+	tf.nsect = sectors;
+	tf.hob_nsect = sectors >> 8;
 	tf.flags |= ATA_TFLAG_ISADDR | ATA_TFLAG_LBA48 | ATA_TFLAG_DEVICE;
 
 	err_mask = ata_exec_internal(dev, &tf, NULL, DMA_FROM_DEVICE,
 				     buf, sectors * ATA_SECT_SIZE, 0);
 
-	if (err_mask && fpdma) {
-		ata_dev_warn(dev,
-			     "RECEIVE FPDMA failed, trying READ LOG_DMA EXT\n");
-		dev->ncq_send_recv_cmds[ATA_LOG_NCQ_SEND_RECV_RD_LOG_OFFSET] &=
-		    ~ATA_LOG_NCQ_SEND_RECV_RD_LOG_SUPPORTED;
-		goto retry;
-	}
 	if (err_mask && dma) {
 		dev->horkage |= ATA_HORKAGE_NO_NCQ_LOG;
 		ata_dev_warn(dev, "READ LOG DMA EXT failed, trying unqueued\n");
@@ -1593,7 +1573,7 @@ static int ata_eh_read_log_10h(struct ata_device *dev,
 	u8 csum;
 	int i;
 
-	err_mask = ata_read_log_page(dev, ATA_LOG_SATA_NCQ, 0, buf, 1, false);
+	err_mask = ata_read_log_page(dev, ATA_LOG_SATA_NCQ, 0, buf, 1);
 	if (err_mask)
 		return -EIO;
 
@@ -1664,7 +1644,7 @@ unsigned int atapi_eh_tur(struct ata_device *dev, u8 *r_sense_key)
  *
  *	Perform REQUEST_SENSE_DATA_EXT after the device reported CHECK
  *	SENSE.  This function is an EH helper.
-*
+ *
  *	LOCKING:
  *	Kernel thread context (may sleep).
  */
@@ -1918,8 +1898,9 @@ static unsigned int ata_eh_analyze_tf(struct ata_queued_cmd *qc,
 		 */
 		if (stat & ATA_DF)
 			stat &= ~ATA_SENSE;
-	} else
+	} else {
 		return 0;
+	}
 
 	switch (qc->dev->class) {
 	case ATA_DEV_ATA:
@@ -1960,8 +1941,9 @@ static unsigned int ata_eh_analyze_tf(struct ata_queued_cmd *qc,
 		if (ret == NEEDS_RETRY || ret == ADD_TO_MLQUEUE) {
 			qc->flags |= ATA_QCFLAG_RETRY;
 			qc->err_mask |= AC_ERR_OTHER;
-		} else if (ret != SUCCESS)
+		} else if (ret != SUCCESS) {
 			qc->err_mask |= AC_ERR_HSM;
+		}
 	}
 	if (qc->err_mask & (AC_ERR_HSM | AC_ERR_TIMEOUT | AC_ERR_ATA_BUS))
 		action |= ATA_EH_RESET;

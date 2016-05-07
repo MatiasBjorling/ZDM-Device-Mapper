@@ -1131,8 +1131,7 @@ xfs_buf_ioapply_map(
 	int		map,
 	int		*buf_offset,
 	int		*count,
-	int		op,
-	int		op_flags)
+	int		rw)
 {
 	int		page_index;
 	int		total_nr_pages = bp->b_page_count;
@@ -1171,8 +1170,7 @@ next_chunk:
 	bio->bi_iter.bi_sector = sector;
 	bio->bi_end_io = xfs_buf_bio_end_io;
 	bio->bi_private = bp;
-	bio->bi_op = op;
-	bio->bi_rw = op_flags;
+
 
 	for (; size && nr_pages; nr_pages--, page_index++) {
 		int	rbytes, nbytes = PAGE_SIZE - offset;
@@ -1196,7 +1194,7 @@ next_chunk:
 			flush_kernel_vmap_range(bp->b_addr,
 						xfs_buf_vmap_len(bp));
 		}
-		submit_bio(bio);
+		submit_bio(rw, bio);
 		if (size)
 			goto next_chunk;
 	} else {
@@ -1216,8 +1214,7 @@ _xfs_buf_ioapply(
 	struct xfs_buf	*bp)
 {
 	struct blk_plug	plug;
-	int		op;
-	int		op_flags = 0;
+	int		rw;
 	int		offset;
 	int		size;
 	int		i;
@@ -1236,13 +1233,14 @@ _xfs_buf_ioapply(
 		bp->b_ioend_wq = bp->b_target->bt_mount->m_buf_workqueue;
 
 	if (bp->b_flags & XBF_WRITE) {
-		op = REQ_OP_WRITE;
 		if (bp->b_flags & XBF_SYNCIO)
-			op_flags = WRITE_SYNC;
+			rw = WRITE_SYNC;
+		else
+			rw = WRITE;
 		if (bp->b_flags & XBF_FUA)
-			op_flags |= REQ_FUA;
+			rw |= REQ_FUA;
 		if (bp->b_flags & XBF_FLUSH)
-			op_flags |= REQ_PREFLUSH;
+			rw |= REQ_FLUSH;
 
 		/*
 		 * Run the write verifier callback function if it exists. If
@@ -1272,14 +1270,13 @@ _xfs_buf_ioapply(
 			}
 		}
 	} else if (bp->b_flags & XBF_READ_AHEAD) {
-		op = REQ_OP_READ;
-		op_flags = REQ_RAHEAD;
+		rw = READA;
 	} else {
-		op = REQ_OP_READ;
+		rw = READ;
 	}
 
 	/* we only use the buffer cache for meta-data */
-	op_flags |= REQ_META;
+	rw |= REQ_META;
 
 	/*
 	 * Walk all the vectors issuing IO on them. Set up the initial offset
@@ -1291,7 +1288,7 @@ _xfs_buf_ioapply(
 	size = BBTOB(bp->b_io_length);
 	blk_start_plug(&plug);
 	for (i = 0; i < bp->b_map_count; i++) {
-		xfs_buf_ioapply_map(bp, i, &offset, &size, op, op_flags);
+		xfs_buf_ioapply_map(bp, i, &offset, &size, rw);
 		if (bp->b_error)
 			break;
 		if (size <= 0)

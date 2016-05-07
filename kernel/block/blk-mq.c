@@ -159,18 +159,16 @@ bool blk_mq_can_queue(struct blk_mq_hw_ctx *hctx)
 EXPORT_SYMBOL(blk_mq_can_queue);
 
 static void blk_mq_rq_ctx_init(struct request_queue *q, struct blk_mq_ctx *ctx,
-			       struct request *rq, int op,
-			       unsigned int op_flags)
+			       struct request *rq, u64 rw_flags)
 {
 	if (blk_queue_io_stat(q))
-		op_flags |= REQ_IO_STAT;
+		rw_flags |= REQ_IO_STAT;
 
 	INIT_LIST_HEAD(&rq->queuelist);
 	/* csd/requeue_work/fifo_time is initialized before use */
 	rq->q = q;
 	rq->mq_ctx = ctx;
-	rq->op = op;
-	rq->cmd_flags |= op_flags;
+	rq->cmd_flags |= rw_flags;
 	/* do not touch atomic flags, it needs atomic ops against the timer */
 	rq->cpu = -1;
 	INIT_HLIST_NODE(&rq->hash);
@@ -205,11 +203,11 @@ static void blk_mq_rq_ctx_init(struct request_queue *q, struct blk_mq_ctx *ctx,
 	rq->end_io_data = NULL;
 	rq->next_rq = NULL;
 
-	ctx->rq_dispatched[rw_is_sync(op, op_flags)]++;
+	ctx->rq_dispatched[rw_is_sync(rw_flags)]++;
 }
 
 static struct request *
-__blk_mq_alloc_request(struct blk_mq_alloc_data *data, int op, int op_flags)
+__blk_mq_alloc_request(struct blk_mq_alloc_data *data, int rw)
 {
 	struct request *rq;
 	unsigned int tag;
@@ -224,7 +222,7 @@ __blk_mq_alloc_request(struct blk_mq_alloc_data *data, int op, int op_flags)
 		}
 
 		rq->tag = tag;
-		blk_mq_rq_ctx_init(data->q, data->ctx, rq, op, op_flags);
+		blk_mq_rq_ctx_init(data->q, data->ctx, rq, rw);
 		return rq;
 	}
 
@@ -248,7 +246,7 @@ struct request *blk_mq_alloc_request(struct request_queue *q, int rw,
 	hctx = q->mq_ops->map_queue(q, ctx->cpu);
 	blk_mq_set_alloc_data(&alloc_data, q, flags, ctx, hctx);
 
-	rq = __blk_mq_alloc_request(&alloc_data, rw, 0);
+	rq = __blk_mq_alloc_request(&alloc_data, rw);
 	if (!rq && !(flags & BLK_MQ_REQ_NOWAIT)) {
 		__blk_mq_run_hw_queue(hctx);
 		blk_mq_put_ctx(ctx);
@@ -256,7 +254,7 @@ struct request *blk_mq_alloc_request(struct request_queue *q, int rw,
 		ctx = blk_mq_get_ctx(q);
 		hctx = q->mq_ops->map_queue(q, ctx->cpu);
 		blk_mq_set_alloc_data(&alloc_data, q, flags, ctx, hctx);
-		rq =  __blk_mq_alloc_request(&alloc_data, rw, 0);
+		rq =  __blk_mq_alloc_request(&alloc_data, rw);
 		ctx = alloc_data.ctx;
 	}
 	blk_mq_put_ctx(ctx);
@@ -795,6 +793,7 @@ static void __blk_mq_run_hw_queue(struct blk_mq_hw_ctx *hctx)
 			pr_err("blk-mq: bad return on queue: %d\n", ret);
 		case BLK_MQ_RQ_QUEUE_ERROR:
 			rq->errors = -EIO;
+		case BLK_MQ_RQ_QUEUE_DONE:
 			blk_mq_end_request(rq, rq->errors);
 			break;
 		}
@@ -1172,29 +1171,28 @@ static struct request *blk_mq_map_request(struct request_queue *q,
 	struct blk_mq_hw_ctx *hctx;
 	struct blk_mq_ctx *ctx;
 	struct request *rq;
-	int op = bio_data_dir(bio);
-	int op_flags = 0;
+	int rw = bio_data_dir(bio);
 	struct blk_mq_alloc_data alloc_data;
 
 	blk_queue_enter_live(q);
 	ctx = blk_mq_get_ctx(q);
 	hctx = q->mq_ops->map_queue(q, ctx->cpu);
 
-	if (rw_is_sync(bio->bi_op, bio->bi_rw))
-		op_flags |= REQ_SYNC;
+	if (rw_is_sync(bio->bi_rw))
+		rw |= REQ_SYNC;
 
-	trace_block_getrq(q, bio, op);
+	trace_block_getrq(q, bio, rw);
 	blk_mq_set_alloc_data(&alloc_data, q, BLK_MQ_REQ_NOWAIT, ctx, hctx);
-	rq = __blk_mq_alloc_request(&alloc_data, op, op_flags);
+	rq = __blk_mq_alloc_request(&alloc_data, rw);
 	if (unlikely(!rq)) {
 		__blk_mq_run_hw_queue(hctx);
 		blk_mq_put_ctx(ctx);
-		trace_block_sleeprq(q, bio, op);
+		trace_block_sleeprq(q, bio, rw);
 
 		ctx = blk_mq_get_ctx(q);
 		hctx = q->mq_ops->map_queue(q, ctx->cpu);
 		blk_mq_set_alloc_data(&alloc_data, q, 0, ctx, hctx);
-		rq = __blk_mq_alloc_request(&alloc_data, op, op_flags);
+		rq = __blk_mq_alloc_request(&alloc_data, rw);
 		ctx = alloc_data.ctx;
 		hctx = alloc_data.hctx;
 	}
@@ -1248,8 +1246,8 @@ static int blk_mq_direct_issue_request(struct request *rq, blk_qc_t *cookie)
  */
 static blk_qc_t blk_mq_make_request(struct request_queue *q, struct bio *bio)
 {
-	const int is_sync = rw_is_sync(bio->bi_op, bio->bi_rw);
-	const int is_flush_fua = bio->bi_rw & (REQ_PREFLUSH | REQ_FUA);
+	const int is_sync = rw_is_sync(bio->bi_rw);
+	const int is_flush_fua = bio->bi_rw & (REQ_FLUSH | REQ_FUA);
 	struct blk_map_ctx data;
 	struct request *rq;
 	unsigned int request_count = 0;
@@ -1345,8 +1343,8 @@ done:
  */
 static blk_qc_t blk_sq_make_request(struct request_queue *q, struct bio *bio)
 {
-	const int is_sync = rw_is_sync(bio->bi_op, bio->bi_rw);
-	const int is_flush_fua = bio->bi_rw & (REQ_PREFLUSH | REQ_FUA);
+	const int is_sync = rw_is_sync(bio->bi_rw);
+	const int is_flush_fua = bio->bi_rw & (REQ_FLUSH | REQ_FUA);
 	struct blk_plug *plug;
 	unsigned int request_count = 0;
 	struct blk_map_ctx data;

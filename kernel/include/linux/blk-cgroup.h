@@ -590,26 +590,25 @@ static inline void blkg_rwstat_exit(struct blkg_rwstat *rwstat)
 /**
  * blkg_rwstat_add - add a value to a blkg_rwstat
  * @rwstat: target blkg_rwstat
- * @op: REQ_OP
- * @op_flags: rq_flag_bits
+ * @rw: mask of REQ_{WRITE|SYNC}
  * @val: value to add
  *
  * Add @val to @rwstat.  The counters are chosen according to @rw.  The
  * caller is responsible for synchronizing calls to this function.
  */
 static inline void blkg_rwstat_add(struct blkg_rwstat *rwstat,
-				   int op, int op_flags, uint64_t val)
+				   int rw, uint64_t val)
 {
 	struct percpu_counter *cnt;
 
-	if (op_is_write(op))
+	if (rw & REQ_WRITE)
 		cnt = &rwstat->cpu_cnt[BLKG_RWSTAT_WRITE];
 	else
 		cnt = &rwstat->cpu_cnt[BLKG_RWSTAT_READ];
 
 	__percpu_counter_add(cnt, val, BLKG_STAT_CPU_BATCH);
 
-	if (op_flags & REQ_SYNC)
+	if (rw & REQ_SYNC)
 		cnt = &rwstat->cpu_cnt[BLKG_RWSTAT_SYNC];
 	else
 		cnt = &rwstat->cpu_cnt[BLKG_RWSTAT_ASYNC];
@@ -714,9 +713,9 @@ static inline bool blkcg_bio_issue_check(struct request_queue *q,
 
 	if (!throtl) {
 		blkg = blkg ?: q->root_blkg;
-		blkg_rwstat_add(&blkg->stat_bytes, bio->bi_op, bio->bi_rw,
+		blkg_rwstat_add(&blkg->stat_bytes, bio->bi_rw,
 				bio->bi_iter.bi_size);
-		blkg_rwstat_add(&blkg->stat_ios, bio->bi_op, bio->bi_rw, 1);
+		blkg_rwstat_add(&blkg->stat_ios, bio->bi_rw, 1);
 	}
 
 	rcu_read_unlock();

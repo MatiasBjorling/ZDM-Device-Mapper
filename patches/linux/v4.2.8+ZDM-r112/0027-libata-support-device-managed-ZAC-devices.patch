@@ -1,0 +1,130 @@
+From c418be9f65dbb4b965c563b0f2d0ad7c08fd0c03 Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Sat, 30 Apr 2016 11:43:23 -0500
+Subject: [PATCH 27/65] libata: support device-managed ZAC devices
+
+Device-managed ZAC devices just set the zoned capabilities field
+in INQUIRY byte 69 (cf ACS-4). This corresponds to the 'zoned'
+field in the block device characteristics VPD page.
+As this is only defined in SPC-5/SBC-4 we also need to update
+the supported SCSI version descriptor.
+
+Reviewed-by: Shaun Tancheff <shaun.tancheff@seagate.com>
+Tested-by: Shaun Tancheff <shaun.tancheff@seagate.com>
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+
+Backported to v4.2.8
+Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
+---
+ drivers/ata/libata-scsi.c | 19 ++++++++++---------
+ include/linux/ata.h       |  5 +++++
+ include/scsi/scsi_proto.h |  9 +++++++++
+ 3 files changed, 24 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/ata/libata-scsi.c b/drivers/ata/libata-scsi.c
+index 97f3722..29afb21 100644
+--- a/drivers/ata/libata-scsi.c
++++ b/drivers/ata/libata-scsi.c
+@@ -2085,14 +2085,14 @@ static unsigned int ata_scsiop_inq_std(struct ata_scsi_args *args, u8 *rbuf)
+ 		0x00,
+ 		0xA0,	/* SAM-5 (no version claimed) */
+ 
+-		0x04,
+-		0xC0,	/* SBC-3 (no version claimed) */
++		0x06,
++		0x00,	/* SBC-4 (no version claimed) */
+ 
+-		0x04,
+-		0x60,	/* SPC-4 (no version claimed) */
++		0x05,
++		0xC0,	/* SPC-5 (no version claimed) */
+ 
+ 		0x60,
+-		0x20,   /* ZBC (no version claimed) */
++		0x24,   /* ZBC r05 */
+ 	};
+ 
+ 	u8 hdr[] = {
+@@ -2109,10 +2109,8 @@ static unsigned int ata_scsiop_inq_std(struct ata_scsi_args *args, u8 *rbuf)
+ 	if (ata_id_removable(args->id))
+ 		hdr[1] |= (1 << 7);
+ 
+-	if (args->dev->class == ATA_DEV_ZAC) {
++	if (args->dev->class == ATA_DEV_ZAC)
+ 		hdr[0] = TYPE_ZBC;
+-		hdr[2] = 0x6; /* ZBC is defined in SPC-4 */
+-	}
+ 
+ 	memcpy(rbuf, hdr, sizeof(hdr));
+ 	memcpy(&rbuf[8], "ATA     ", 8);
+@@ -2126,7 +2124,7 @@ static unsigned int ata_scsiop_inq_std(struct ata_scsi_args *args, u8 *rbuf)
+ 	if (rbuf[32] == 0 || rbuf[32] == ' ')
+ 		memcpy(&rbuf[32], "n/a ", 4);
+ 
+-	if (args->dev->class == ATA_DEV_ZAC)
++	if (ata_id_zoned_cap(args->id) || args->dev->class == ATA_DEV_ZAC)
+ 		memcpy(rbuf + 58, versions_zbc, sizeof(versions_zbc));
+ 	else
+ 		memcpy(rbuf + 58, versions, sizeof(versions));
+@@ -2322,12 +2320,15 @@ static unsigned int ata_scsiop_inq_b1(struct ata_scsi_args *args, u8 *rbuf)
+ {
+ 	int form_factor = ata_id_form_factor(args->id);
+ 	int media_rotation_rate = ata_id_rotation_rate(args->id);
++	u8 zoned = ata_id_zoned_cap(args->id);
+ 
+ 	rbuf[1] = 0xb1;
+ 	rbuf[3] = 0x3c;
+ 	rbuf[4] = media_rotation_rate >> 8;
+ 	rbuf[5] = media_rotation_rate;
+ 	rbuf[7] = form_factor;
++	if (zoned)
++		rbuf[8] = (zoned << 4);
+ 
+ 	return 0;
+ }
+diff --git a/include/linux/ata.h b/include/linux/ata.h
+index f598987..ad311ab 100644
+--- a/include/linux/ata.h
++++ b/include/linux/ata.h
+@@ -935,6 +935,11 @@ static inline bool ata_id_is_ssd(const u16 *id)
+ 	return id[ATA_ID_ROT_SPEED] == 0x01;
+ }
+ 
++static inline u8 ata_id_zoned_cap(const u16 *id)
++{
++	return (id[ATA_ID_ADDITIONAL_SUPP] & 0x3);
++}
++
+ static inline bool ata_id_pio_need_iordy(const u16 *id, const u8 pio)
+ {
+ 	/* CF spec. r4.1 Table 22 says no IORDY on PIO5 and PIO6. */
+diff --git a/include/scsi/scsi_proto.h b/include/scsi/scsi_proto.h
+index a9fbf1b..58f168d 100644
+--- a/include/scsi/scsi_proto.h
++++ b/include/scsi/scsi_proto.h
+@@ -115,6 +115,8 @@
+ #define VERIFY_16	      0x8f
+ #define SYNCHRONIZE_CACHE_16  0x91
+ #define WRITE_SAME_16	      0x93
++#define ZBC_OUT		      0x94
++#define ZBC_IN		      0x95
+ #define SERVICE_ACTION_BIDIRECTIONAL 0x9d
+ #define SERVICE_ACTION_IN_16  0x9e
+ #define SERVICE_ACTION_OUT_16 0x9f
+@@ -143,6 +145,13 @@
+ #define MO_SET_PRIORITY       0x0e
+ #define MO_SET_TIMESTAMP      0x0f
+ #define MO_MANAGEMENT_PROTOCOL_OUT 0x10
++/* values for ZBC_IN */
++#define ZI_REPORT_ZONES	      0x00
++/* values for ZBC_OUT */
++#define ZO_CLOSE_ZONE	      0x01
++#define ZO_FINISH_ZONE	      0x02
++#define ZO_OPEN_ZONE	      0x03
++#define ZO_RESET_WRITE_POINTER 0x04
+ /* values for variable length command */
+ #define XDREAD_32	      0x03
+ #define XDWRITE_32	      0x04
+-- 
+2.8.1
+

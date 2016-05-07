@@ -1,0 +1,479 @@
+From 802d4acfee2d971cbdeafd0d674b382acfa1ac65 Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Sat, 30 Apr 2016 10:12:29 -0500
+Subject: [PATCH 43/65] Configure discard granularity and max sectors
+
+On SMR drives translating RESET WP -> DISCARD makes a fine analogue.
+However the discard granularity is a ZONE. Also fix max sectors to
+a ZONE size as we are only setup to perform a RESET WP one zone at
+a time.
+
+Also avoid some slow paths for HA drives where it is not needed.
+
+Also prepare to support RESET WP -> WRITE SAME on conventional zones.
+
+Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
+---
+ drivers/scsi/sd.c     |  56 +++++++++++++++++-----
+ drivers/scsi/sd.h     |  23 +++++++--
+ drivers/scsi/sd_zbc.c | 128 +++++++++++++++++++++++++++++++++++++++++---------
+ 3 files changed, 170 insertions(+), 37 deletions(-)
+
+diff --git a/drivers/scsi/sd.c b/drivers/scsi/sd.c
+index eb382bc..fdad970 100644
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -678,9 +678,13 @@ static void sd_config_discard(struct scsi_disk *sdkp, unsigned int mode)
+ 		break;
+ 
+ 	case SD_ZBC_RESET_WP:
+-		max_blocks = min_not_zero(sdkp->max_unmap_blocks,
+-					  (u32)SD_MAX_WS16_BLOCKS);
+ 		q->limits.discard_zeroes_data = 1;
++		q->limits.discard_granularity =
++			sd_zbc_discard_granularity(sdkp);
++
++		max_blocks = min_not_zero(sdkp->max_unmap_blocks,
++					  q->limits.discard_granularity >>
++						ilog2(logical_block_size));
+ 		break;
+ 
+ 	case SD_LBP_ZERO:
+@@ -788,6 +792,29 @@ static int sd_setup_discard_cmnd(struct scsi_cmnd *cmd)
+ 				  blk_zone_is_cmr(zone) ? "CMR" : "unknown",
+ 				  zone->start, zone->len);
+ 			spin_unlock_irqrestore(&zone->lock, flags);
++
++			if (blk_zone_is_cmr(zone) &&
++			    nr_sectors < sdkp->max_ws_blocks) {
++				page = alloc_page(GFP_ATOMIC | __GFP_ZERO);
++				if (!page)
++					return BLKPREP_DEFER;
++
++				sd_printk(KERN_INFO, sdkp,
++					  "Discardi CMR -> Write Same 16\n");
++				sd_printk(KERN_INFO, sdkp,
++					  "Write Same Z:%zx/%zx len %zx/%x\n",
++					  zone->start, zone->len,
++					  sector, nr_sectors);
++
++				cmd->cmd_len = 16;
++				cmd->cmnd[0] = WRITE_SAME_16;
++				put_unaligned_be64(sector, &cmd->cmnd[2]);
++				put_unaligned_be32(nr_sectors, &cmd->cmnd[10]);
++
++				len = sdkp->device->sector_size;
++				ret = BLKPREP_OK;
++				break;
++			}
+ 			ret = BLKPREP_DONE;
+ 			goto out;
+ 		}
+@@ -799,8 +826,8 @@ static int sd_setup_discard_cmnd(struct scsi_cmnd *cmd)
+ 		if (zone->start != sector ||
+ 		    zone->len < nr_sectors) {
+ 			sd_printk(KERN_INFO, sdkp,
+-				  "Misaligned RESET WP, start %zu/%zu "
+-				  "len %zu/%u\n",
++				  "Misaligned RESET WP, start %zx/%zx "
++				  "len %zx/%x\n",
+ 				  zone->start, sector, zone->len, nr_sectors);
+ 			spin_unlock_irqrestore(&zone->lock, flags);
+ 			ret = BLKPREP_KILL;
+@@ -1758,13 +1785,12 @@ static int sd_done(struct scsi_cmnd *SCpnt)
+ 			good_bytes = blk_rq_bytes(req);
+ 			scsi_set_resid(SCpnt, 0);
+ 		} else {
+-#ifdef CONFIG_SCSI_ZBC
+ 			if (op == ZBC_OUT)
+ 				/* RESET WRITE POINTER failed */
+ 				sd_zbc_update_zones(sdkp,
+ 						    blk_rq_pos(req),
+-						    512, true);
+-#endif
++						    512, SD_ZBC_RESET_WP_ERR);
++
+ 			good_bytes = 0;
+ 			scsi_set_resid(SCpnt, blk_rq_bytes(req));
+ 		}
+@@ -1837,7 +1863,6 @@ static int sd_done(struct scsi_cmnd *SCpnt)
+ 				good_bytes = blk_rq_bytes(req);
+ 				scsi_set_resid(SCpnt, 0);
+ 			}
+-#ifdef CONFIG_SCSI_ZBC
+ 			/*
+ 			 * ZBC: Unaligned write command.
+ 			 * Write did not start a write pointer position.
+@@ -1845,8 +1870,7 @@ static int sd_done(struct scsi_cmnd *SCpnt)
+ 			if (sshdr.ascq == 0x04)
+ 				sd_zbc_update_zones(sdkp,
+ 						    blk_rq_pos(req),
+-						    512, true);
+-#endif
++						    512, SD_ZBC_WRITE_ERR);
+ 		}
+ 		break;
+ 	default:
+@@ -2072,7 +2096,7 @@ static void sd_read_zones(struct scsi_disk *sdkp, unsigned char *buffer)
+ 	 * supports equal zone sizes.
+ 	 */
+ 	same = buffer[4] & 0xf;
+-	if (same == 0 || same > 3) {
++	if (same > 3) {
+ 		sd_printk(KERN_WARNING, sdkp,
+ 			  "REPORT ZONES SAME type %d not supported\n", same);
+ 		return;
+@@ -2082,10 +2106,16 @@ static void sd_read_zones(struct scsi_disk *sdkp, unsigned char *buffer)
+ 	zone_len = logical_to_sectors(sdkp->device,
+ 				      get_unaligned_be64(&desc[8]));
+ 	blk_queue_chunk_sectors(sdkp->disk->queue, zone_len);
+-	sd_config_discard(sdkp, SD_ZBC_RESET_WP);
+ 	queue_flag_set_unlocked(QUEUE_FLAG_SINGLE, sdkp->disk->queue);
+ 
+-	sd_zbc_setup(sdkp, buffer, SD_BUF_SIZE);
++	if (same == 0) {
++		sd_printk(KERN_WARNING, sdkp,
++			  "REPORT ZONES SAME type %d "
++			  "ignoring zones not of 0x%llx size\n", same, zone_len);
++	}
++
++	sd_zbc_setup(sdkp, zone_len, buffer, SD_BUF_SIZE);
++	sd_config_discard(sdkp, SD_ZBC_RESET_WP);
+ }
+ 
+ static void read_capacity_error(struct scsi_disk *sdkp, struct scsi_device *sdp,
+diff --git a/drivers/scsi/sd.h b/drivers/scsi/sd.h
+index 1a19ba2..bbe7a83 100644
+--- a/drivers/scsi/sd.h
++++ b/drivers/scsi/sd.h
+@@ -277,17 +277,23 @@ static inline void sd_dif_complete(struct scsi_cmnd *cmd, unsigned int a)
+ 
+ #endif /* CONFIG_BLK_DEV_INTEGRITY */
+ 
++
++#define SD_ZBC_INIT		0
++#define SD_ZBC_RESET_WP_ERR	1
++#define SD_ZBC_WRITE_ERR	2
++
++
+ #ifdef CONFIG_SCSI_ZBC
+ 
+ extern int sd_zbc_report_zones(struct scsi_disk *, unsigned char *, int,
+ 			       sector_t, enum zbc_zone_reporting_options, bool);
+-extern int sd_zbc_setup(struct scsi_disk *, char *, int);
++extern int sd_zbc_setup(struct scsi_disk *, u64, char *, int);
+ extern void sd_zbc_remove(struct scsi_disk *);
+ extern void sd_zbc_reset_zones(struct scsi_disk *);
+ extern int sd_zbc_lookup_zone(struct scsi_disk *, struct request *,
+ 			      sector_t, unsigned int);
+-extern void sd_zbc_update_zones(struct scsi_disk *, sector_t, int, bool);
+-extern void sd_zbc_refresh_zone_work(struct work_struct *);
++extern void sd_zbc_update_zones(struct scsi_disk *, sector_t, int, int);
++extern unsigned int sd_zbc_discard_granularity(struct scsi_disk *);
+ 
+ #else /* CONFIG_SCSI_ZBC */
+ 
+@@ -314,6 +320,17 @@ static inline int sd_zbc_lookup_zone(struct scsi_disk *sdkp,
+ }
+ 
+ static inline void sd_zbc_remove(struct scsi_disk *sdkp) {}
++
++static inline void sd_zbc_update_zones(struct scsi_disk *sdkp, sector_t s,
++				       int a, int b)
++{
++}
++
++static inline unsigned int sd_zbc_discard_granularity(struct scsi_disk *sdkp)
++{
++	return sdkp->device->sector_size;
++}
++
+ #endif /* CONFIG_SCSI_ZBC */
+ 
+ #endif /* _SCSI_DISK_H */
+diff --git a/drivers/scsi/sd_zbc.c b/drivers/scsi/sd_zbc.c
+index c1cf255..ee95401 100644
+--- a/drivers/scsi/sd_zbc.c
++++ b/drivers/scsi/sd_zbc.c
+@@ -50,7 +50,7 @@ enum zbc_zone_cond {
+ #define SD_ZBC_BUF_SIZE 524288
+ 
+ #define sd_zbc_debug(sdkp, fmt, args...)				\
+-	pr_debug("%s %s [%s]: " fmt,					\
++	pr_err  ("%s %s [%s]: " fmt,					\
+ 		 dev_driver_string(&(sdkp)->device->sdev_gendev),	\
+ 		 dev_name(&(sdkp)->device->sdev_gendev),		\
+ 		 (sdkp)->disk->disk_name, ## args)
+@@ -70,6 +70,7 @@ struct zbc_update_work {
+ 	char		zone_buf[0];
+ };
+ 
++static
+ struct blk_zone *zbc_desc_to_zone(struct scsi_disk *sdkp, unsigned char *rec)
+ {
+ 	struct blk_zone *zone;
+@@ -123,7 +124,8 @@ struct blk_zone *zbc_desc_to_zone(struct scsi_disk *sdkp, unsigned char *rec)
+ 	return zone;
+ }
+ 
+-sector_t zbc_parse_zones(struct scsi_disk *sdkp, unsigned char *buf,
++static
++sector_t zbc_parse_zones(struct scsi_disk *sdkp, u64 zlen, unsigned char *buf,
+ 			 unsigned int buf_len)
+ {
+ 	struct request_queue *q = sdkp->disk->queue;
+@@ -150,6 +152,11 @@ sector_t zbc_parse_zones(struct scsi_disk *sdkp, unsigned char *buf,
+ 		if (!this)
+ 			break;
+ 
++		if (same == 0 && this->len != zlen) {
++			next_sector = this->start + this->len;
++			break;
++		}
++
+ 		next_sector = this->start + this->len;
+ 		old = blk_insert_zone(q, this);
+ 		if (old) {
+@@ -172,29 +179,58 @@ sector_t zbc_parse_zones(struct scsi_disk *sdkp, unsigned char *buf,
+ 	return next_sector;
+ }
+ 
+-void sd_zbc_refresh_zone_work(struct work_struct *work)
++static void sd_zbc_refresh_zone_work(struct work_struct *work)
+ {
+ 	struct zbc_update_work *zbc_work =
+ 		container_of(work, struct zbc_update_work, zone_work);
+ 	struct scsi_disk *sdkp = zbc_work->sdkp;
+ 	struct request_queue *q = sdkp->disk->queue;
+-	unsigned int zone_buflen;
++	unsigned char *zone_buf = zbc_work->zone_buf;
++	unsigned int zone_buflen = zbc_work->zone_buflen;
+ 	int ret;
++	u8 same;
++	u64 zlen = 0;
+ 	sector_t last_sector;
+ 	sector_t capacity = logical_to_sectors(sdkp->device, sdkp->capacity);
+ 
+-	zone_buflen = zbc_work->zone_buflen;
+-	ret = sd_zbc_report_zones(sdkp, zbc_work->zone_buf, zone_buflen,
++	ret = sd_zbc_report_zones(sdkp, zone_buf, zone_buflen,
+ 				  zbc_work->zone_sector,
+ 				  ZBC_ZONE_REPORTING_OPTION_ALL, true);
+ 	if (ret)
+ 		goto done_free;
+ 
+-	last_sector = zbc_parse_zones(sdkp, zbc_work->zone_buf, zone_buflen);
++	/* this whole path is unlikely so extra reports shouldn't be a
++	 * large impact */
++	same = zone_buf[4] & 0xf;
++	if (same == 0) {
++		unsigned char *desc = &zone_buf[64];
++		unsigned int blen = zone_buflen;
++
++		/* just pull the first zone */
++		if (blen > 512)
++			blen = 512;
++		ret = sd_zbc_report_zones(sdkp, zone_buf, blen, 0,
++					  ZBC_ZONE_REPORTING_OPTION_ALL, true);
++		if (ret)
++			goto done_free;
++
++		/* Read the zone length from the first zone descriptor */
++		zlen = logical_to_sectors(sdkp->device,
++					  get_unaligned_be64(&desc[8]));
++
++		ret = sd_zbc_report_zones(sdkp, zone_buf, zone_buflen,
++					  zbc_work->zone_sector,
++					  ZBC_ZONE_REPORTING_OPTION_ALL, true);
++		if (ret)
++			goto done_free;
++	}
++
++	last_sector = zbc_parse_zones(sdkp, zlen, zone_buf, zone_buflen);
++	capacity = logical_to_sectors(sdkp->device, sdkp->capacity);
+ 	if (last_sector != -1 && last_sector < capacity) {
+ 		if (test_bit(SD_ZBC_ZONE_RESET, &sdkp->zone_flags)) {
+ 			sd_zbc_debug(sdkp,
+-				     "zones in reset, cancelling refresh\n");
++				     "zones in reset, canceling refresh\n");
+ 			ret = -EAGAIN;
+ 			goto done_free;
+ 		}
+@@ -208,7 +244,7 @@ done_free:
+ 	kfree(zbc_work);
+ 	if (test_and_clear_bit(SD_ZBC_ZONE_INIT, &sdkp->zone_flags) && ret) {
+ 		sd_zbc_debug(sdkp,
+-			     "Cancelling zone initialisation\n");
++			     "Canceling zone initialization\n");
+ 	}
+ done_start_queue:
+ 	if (q->mq_ops)
+@@ -227,10 +263,10 @@ done_start_queue:
+  * @sdkp: SCSI disk for which the zone information needs to be updated
+  * @sector: sector to be updated
+  * @bufsize: buffersize to be allocated
+- * @update: true if existing zones should be updated
++ * @reason: non-zero if existing zones should be updated
+  */
+ void sd_zbc_update_zones(struct scsi_disk *sdkp, sector_t sector, int bufsize,
+-			 bool update)
++			 int reason)
+ {
+ 	struct request_queue *q = sdkp->disk->queue;
+ 	struct zbc_update_work *zbc_work;
+@@ -241,10 +277,21 @@ void sd_zbc_update_zones(struct scsi_disk *sdkp, sector_t sector, int bufsize,
+ 
+ 	if (test_bit(SD_ZBC_ZONE_RESET, &sdkp->zone_flags)) {
+ 		sd_zbc_debug(sdkp,
+-			     "zones in reset, not starting update\n");
++			     "zones in reset, not starting reason\n");
+ 		return;
+ 	}
+ 
++	if (reason != SD_ZBC_INIT) {
++		/* lookup sector, is zone pref? then ignore */
++		struct blk_zone *zone = blk_lookup_zone(q, sector);
++
++		if (reason == SD_ZBC_RESET_WP)
++			sd_zbc_debug(sdkp, "RESET WP failed %lx\n", sector);
++
++		if (zone && zone->type == BLK_ZONE_TYPE_SEQWRITE_PREF)
++			return;
++	}
++
+ retry:
+ 	zbc_work = kzalloc(sizeof(struct zbc_update_work) + bufsize,
+ 			   GFP_KERNEL);
+@@ -257,7 +304,7 @@ retry:
+ 		}
+ 		sd_zbc_debug(sdkp,
+ 			     "failed to allocate %d bytes\n", bufsize);
+-		if (!update)
++		if (reason == SD_ZBC_INIT)
+ 			clear_bit(SD_ZBC_ZONE_INIT, &sdkp->zone_flags);
+ 		return;
+ 	}
+@@ -270,7 +317,7 @@ retry:
+ 	/*
+ 	 * Mark zones under update as BUSY
+ 	 */
+-	if (update) {
++	if (reason != SD_ZBC_INIT) {
+ 		for (node = rb_first(&q->zones); node; node = rb_next(node)) {
+ 			unsigned long flags;
+ 
+@@ -284,6 +331,8 @@ retry:
+ 
+ 			spin_lock_irqsave(&zone->lock, flags);
+ 			if (blk_zone_is_smr(zone)) {
++
++
+ 				if (zone->state == BLK_ZONE_BUSY) {
+ 					zone_busy++;
+ 				} else {
+@@ -334,8 +383,7 @@ int sd_zbc_report_zones(struct scsi_disk *sdkp, unsigned char *buffer,
+ 	if (!scsi_device_online(sdp))
+ 		return -ENODEV;
+ 
+-	sd_zbc_debug(sdkp, "REPORT ZONES lba %zu len %d\n",
+-		     start_lba, bufflen);
++	sd_zbc_debug(sdkp, "REPORT ZONES lba %zu len %d\n", start_lba, bufflen);
+ 
+ 	memset(cmd, 0, 16);
+ 	cmd[0] = ZBC_IN;
+@@ -359,6 +407,13 @@ int sd_zbc_report_zones(struct scsi_disk *sdkp, unsigned char *buffer,
+ 	return 0;
+ }
+ 
++/**
++ * sd_zbc_lookup_zone - Test if request if valid for containing zone.
++ * @sdkp: SCSI disk to which the command should be send
++ * @rq: Active io request to test.
++ * @sector: Sector of io start
++ * @num_sectors: Number of sectors of io to consider
++ */
+ int sd_zbc_lookup_zone(struct scsi_disk *sdkp, struct request *rq,
+ 		       sector_t sector, unsigned int num_sectors)
+ {
+@@ -410,7 +465,8 @@ int sd_zbc_lookup_zone(struct scsi_disk *sdkp, struct request *rq,
+ 			sd_zbc_debug(sdkp,
+ 				     "Read beyond wp %zu/%zu\n",
+ 				     sector, zone->wp);
+-			ret = BLKPREP_DONE;
++			if (zone->type == BLK_ZONE_TYPE_SEQWRITE_REQ)
++				ret = BLKPREP_DONE;
+ 		}
+ 	}
+ out:
+@@ -419,14 +475,18 @@ out:
+ 	return ret;
+ }
+ 
+-int sd_zbc_setup(struct scsi_disk *sdkp, char *buf, int buf_len)
++/**
++ * sd_zbc_setup - Load zones of matching zlen size into rb tree.
++ *
++ */
++int sd_zbc_setup(struct scsi_disk *sdkp, u64 zlen, char *buf, int buf_len)
+ {
+ 	sector_t capacity = logical_to_sectors(sdkp->device, sdkp->capacity);
+ 	sector_t last_sector;
+ 
+ 	if (test_and_set_bit(SD_ZBC_ZONE_INIT, &sdkp->zone_flags)) {
+ 		sdev_printk(KERN_WARNING, sdkp->device,
+-			    "zone initialisation already running\n");
++			    "zone initialization already running\n");
+ 		return 0;
+ 	}
+ 
+@@ -445,15 +505,20 @@ int sd_zbc_setup(struct scsi_disk *sdkp, char *buf, int buf_len)
+ 		clear_bit(SD_ZBC_ZONE_RESET, &sdkp->zone_flags);
+ 	}
+ 
+-	last_sector = zbc_parse_zones(sdkp, buf, buf_len);
++	last_sector = zbc_parse_zones(sdkp, zlen, buf, buf_len);
++	capacity = logical_to_sectors(sdkp->device, sdkp->capacity);
+ 	if (last_sector != -1 && last_sector < capacity) {
+-		sd_zbc_update_zones(sdkp, last_sector, SD_ZBC_BUF_SIZE, false);
++		sd_zbc_update_zones(sdkp, last_sector,
++				    SD_ZBC_BUF_SIZE, SD_ZBC_INIT);
+ 	} else
+ 		clear_bit(SD_ZBC_ZONE_INIT, &sdkp->zone_flags);
+ 
+ 	return 0;
+ }
+ 
++/**
++ * sd_zbc_remove -
++ */
+ void sd_zbc_remove(struct scsi_disk *sdkp)
+ {
+ 	if (sdkp->zone_work_q) {
+@@ -463,3 +528,24 @@ void sd_zbc_remove(struct scsi_disk *sdkp)
+ 		destroy_workqueue(sdkp->zone_work_q);
+ 	}
+ }
++/**
++ * sd_zbc_discard_granularity - Determine discard granularity.
++ * @sdkp: SCSI disk used to calculate discard granularity.
++ *
++ * Discard granularity should match the (maximum non-CMR) zone
++ * size reported on the drive.
++ */
++unsigned int sd_zbc_discard_granularity(struct scsi_disk *sdkp)
++{
++	unsigned int bytes = 1;
++	struct request_queue *q = sdkp->disk->queue;
++	struct rb_node *node = rb_first(&q->zones);
++
++	if (node) {
++		struct blk_zone *zone = rb_entry(node, struct blk_zone, node);
++
++		bytes = zone->len;
++	}
++	bytes <<= ilog2(sdkp->device->sector_size);
++	return bytes;
++}
+-- 
+2.8.1
+

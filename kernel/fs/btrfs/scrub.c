@@ -1504,9 +1504,8 @@ static void scrub_recheck_block(struct btrfs_fs_info *fs_info,
 				sblock->no_io_error_seen = 0;
 		} else {
 			bio->bi_iter.bi_sector = page->physical >> 9;
-			bio->bi_op = REQ_OP_READ;
 
-			if (btrfsic_submit_bio_wait(bio))
+			if (btrfsic_submit_bio_wait(READ, bio))
 				sblock->no_io_error_seen = 0;
 		}
 
@@ -1584,7 +1583,6 @@ static int scrub_repair_page_from_good_copy(struct scrub_block *sblock_bad,
 			return -EIO;
 		bio->bi_bdev = page_bad->dev->bdev;
 		bio->bi_iter.bi_sector = page_bad->physical >> 9;
-		bio->bi_op = REQ_OP_WRITE;
 
 		ret = bio_add_page(bio, page_good->page, PAGE_SIZE, 0);
 		if (PAGE_SIZE != ret) {
@@ -1592,7 +1590,7 @@ static int scrub_repair_page_from_good_copy(struct scrub_block *sblock_bad,
 			return -EIO;
 		}
 
-		if (btrfsic_submit_bio_wait(bio)) {
+		if (btrfsic_submit_bio_wait(WRITE, bio)) {
 			btrfs_dev_stat_inc_and_print(page_bad->dev,
 				BTRFS_DEV_STAT_WRITE_ERRS);
 			btrfs_dev_replace_stats_inc(
@@ -1686,7 +1684,6 @@ again:
 		bio->bi_end_io = scrub_wr_bio_end_io;
 		bio->bi_bdev = sbio->dev->bdev;
 		bio->bi_iter.bi_sector = sbio->physical >> 9;
-		bio->bi_op = REQ_OP_WRITE;
 		sbio->err = 0;
 	} else if (sbio->physical + sbio->page_count * PAGE_SIZE !=
 		   spage->physical_for_dev_replace ||
@@ -1734,7 +1731,7 @@ static void scrub_wr_submit(struct scrub_ctx *sctx)
 	 * orders the requests before sending them to the driver which
 	 * doubled the write performance on spinning disks when measured
 	 * with Linux 3.5 */
-	btrfsic_submit_bio(sbio->bio);
+	btrfsic_submit_bio(WRITE, sbio->bio);
 }
 
 static void scrub_wr_bio_end_io(struct bio *bio)
@@ -2044,7 +2041,7 @@ static void scrub_submit(struct scrub_ctx *sctx)
 	sbio = sctx->bios[sctx->curr];
 	sctx->curr = -1;
 	scrub_pending_bio_inc(sctx);
-	btrfsic_submit_bio(sbio->bio);
+	btrfsic_submit_bio(READ, sbio->bio);
 }
 
 static int scrub_add_page_to_rd_bio(struct scrub_ctx *sctx,
@@ -2091,7 +2088,6 @@ again:
 		bio->bi_end_io = scrub_bio_end_io;
 		bio->bi_bdev = sbio->dev->bdev;
 		bio->bi_iter.bi_sector = sbio->physical >> 9;
-		bio->bi_op = REQ_OP_READ;
 		sbio->err = 0;
 	} else if (sbio->physical + sbio->page_count * PAGE_SIZE !=
 		   spage->physical ||
@@ -4394,8 +4390,6 @@ static int write_page_nocow(struct scrub_ctx *sctx,
 	bio->bi_iter.bi_size = 0;
 	bio->bi_iter.bi_sector = physical_for_dev_replace >> 9;
 	bio->bi_bdev = dev->bdev;
-	bio->bi_op = REQ_OP_WRITE;
-	bio->bi_rw = WRITE_SYNC;
 	ret = bio_add_page(bio, page, PAGE_SIZE, 0);
 	if (ret != PAGE_SIZE) {
 leave_with_eio:
@@ -4404,7 +4398,7 @@ leave_with_eio:
 		return -EIO;
 	}
 
-	if (btrfsic_submit_bio_wait(bio))
+	if (btrfsic_submit_bio_wait(WRITE_SYNC, bio))
 		goto leave_with_eio;
 
 	bio_put(bio);

@@ -212,7 +212,6 @@ static void __write_super(struct cache_sb *sb, struct bio *bio)
 	unsigned i;
 
 	bio->bi_iter.bi_sector	= SB_SECTOR;
-	bio->bi_op		= REQ_OP_WRITE;
 	bio->bi_rw		= REQ_SYNC|REQ_META;
 	bio->bi_iter.bi_size	= SB_SIZE;
 	bch_bio_map(bio, NULL);
@@ -239,7 +238,7 @@ static void __write_super(struct cache_sb *sb, struct bio *bio)
 	pr_debug("ver %llu, flags %llu, seq %llu",
 		 sb->version, sb->flags, sb->seq);
 
-	submit_bio(bio);
+	submit_bio(REQ_WRITE, bio);
 }
 
 static void bch_write_bdev_super_unlock(struct closure *cl)
@@ -334,7 +333,7 @@ static void uuid_io_unlock(struct closure *cl)
 	up(&c->uuid_write_mutex);
 }
 
-static void uuid_io(struct cache_set *c, int op, unsigned long op_flags,
+static void uuid_io(struct cache_set *c, unsigned long rw,
 		    struct bkey *k, struct closure *parent)
 {
 	struct closure *cl = &c->uuid_write;
@@ -349,8 +348,7 @@ static void uuid_io(struct cache_set *c, int op, unsigned long op_flags,
 	for (i = 0; i < KEY_PTRS(k); i++) {
 		struct bio *bio = bch_bbio_alloc(c);
 
-		bio->bi_op	= op;
-		bio->bi_rw	= REQ_SYNC|REQ_META|op_flags;
+		bio->bi_rw	= REQ_SYNC|REQ_META|rw;
 		bio->bi_iter.bi_size = KEY_SIZE(k) << 9;
 
 		bio->bi_end_io	= uuid_endio;
@@ -359,12 +357,12 @@ static void uuid_io(struct cache_set *c, int op, unsigned long op_flags,
 
 		bch_submit_bbio(bio, c, k, i);
 
-		if (op != REQ_OP_WRITE)
+		if (!(rw & WRITE))
 			break;
 	}
 
 	bch_extent_to_text(buf, sizeof(buf), k);
-	pr_debug("%s UUIDs at %s", op == REQ_OP_WRITE ? "wrote" : "read", buf);
+	pr_debug("%s UUIDs at %s", rw & REQ_WRITE ? "wrote" : "read", buf);
 
 	for (u = c->uuids; u < c->uuids + c->nr_uuids; u++)
 		if (!bch_is_zero(u->uuid, 16))
@@ -383,7 +381,7 @@ static char *uuid_read(struct cache_set *c, struct jset *j, struct closure *cl)
 		return "bad uuid pointer";
 
 	bkey_copy(&c->uuid_bucket, k);
-	uuid_io(c, REQ_OP_READ, READ_SYNC, k, cl);
+	uuid_io(c, READ_SYNC, k, cl);
 
 	if (j->version < BCACHE_JSET_VERSION_UUIDv1) {
 		struct uuid_entry_v0	*u0 = (void *) c->uuids;
@@ -428,7 +426,7 @@ static int __uuid_write(struct cache_set *c)
 		return 1;
 
 	SET_KEY_SIZE(&k.key, c->sb.bucket_size);
-	uuid_io(c, REQ_OP_WRITE, 0, &k.key, &cl);
+	uuid_io(c, REQ_WRITE, &k.key, &cl);
 	closure_sync(&cl);
 
 	bkey_copy(&c->uuid_bucket, &k.key);
@@ -500,8 +498,7 @@ static void prio_endio(struct bio *bio)
 	closure_put(&ca->prio);
 }
 
-static void prio_io(struct cache *ca, uint64_t bucket, int op,
-		    unsigned long op_flags)
+static void prio_io(struct cache *ca, uint64_t bucket, unsigned long rw)
 {
 	struct closure *cl = &ca->prio;
 	struct bio *bio = bch_bbio_alloc(ca->set);
@@ -510,8 +507,7 @@ static void prio_io(struct cache *ca, uint64_t bucket, int op,
 
 	bio->bi_iter.bi_sector	= bucket * ca->sb.bucket_size;
 	bio->bi_bdev		= ca->bdev;
-	bio->bi_op		= op;
-	bio->bi_rw		= REQ_SYNC|REQ_META|op_flags;
+	bio->bi_rw		= REQ_SYNC|REQ_META|rw;
 	bio->bi_iter.bi_size	= bucket_bytes(ca);
 
 	bio->bi_end_io	= prio_endio;
@@ -561,7 +557,7 @@ void bch_prio_write(struct cache *ca)
 		BUG_ON(bucket == -1);
 
 		mutex_unlock(&ca->set->bucket_lock);
-		prio_io(ca, bucket, REQ_OP_WRITE, 0);
+		prio_io(ca, bucket, REQ_WRITE);
 		mutex_lock(&ca->set->bucket_lock);
 
 		ca->prio_buckets[i] = bucket;
@@ -603,7 +599,7 @@ static void prio_read(struct cache *ca, uint64_t bucket)
 			ca->prio_last_buckets[bucket_nr] = bucket;
 			bucket_nr++;
 
-			prio_io(ca, bucket, REQ_OP_READ, READ_SYNC);
+			prio_io(ca, bucket, READ_SYNC);
 
 			if (p->csum != bch_crc64(&p->magic, bucket_bytes(ca) - 8))
 				pr_warn("bad csum reading priorities");
@@ -820,7 +816,7 @@ static int bcache_device_init(struct bcache_device *d, unsigned block_size,
 	clear_bit(QUEUE_FLAG_ADD_RANDOM, &d->disk->queue->queue_flags);
 	set_bit(QUEUE_FLAG_DISCARD,	&d->disk->queue->queue_flags);
 
-	blk_queue_flush(q, REQ_PREFLUSH|REQ_FUA);
+	blk_queue_flush(q, REQ_FLUSH|REQ_FUA);
 
 	return 0;
 }

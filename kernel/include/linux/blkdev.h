@@ -96,7 +96,6 @@ struct request {
 	struct request_queue *q;
 	struct blk_mq_ctx *mq_ctx;
 
-	u8 op;
 	u64 cmd_flags;
 	unsigned cmd_type;
 	unsigned long atomic_flags;
@@ -249,6 +248,50 @@ struct blk_queue_tag {
 
 #define BLK_SCSI_MAX_CMDS	(256)
 #define BLK_SCSI_CMD_PER_LONG	(BLK_SCSI_MAX_CMDS / (sizeof(long) * 8))
+
+#ifdef CONFIG_BLK_DEV_ZONED
+enum blk_zone_type {
+	BLK_ZONE_TYPE_UNKNOWN,
+	BLK_ZONE_TYPE_CONVENTIONAL,
+	BLK_ZONE_TYPE_SEQWRITE_REQ,
+	BLK_ZONE_TYPE_SEQWRITE_PREF,
+	BLK_ZONE_TYPE_RESERVED,
+};
+
+enum blk_zone_state {
+	BLK_ZONE_UNKNOWN,
+	BLK_ZONE_NO_WP,
+	BLK_ZONE_OPEN,
+	BLK_ZONE_READONLY,
+	BLK_ZONE_OFFLINE,
+	BLK_ZONE_BUSY,
+};
+
+struct blk_zone {
+	struct rb_node node;
+	spinlock_t lock;
+	sector_t start;
+	size_t len;
+	sector_t wp;
+	enum blk_zone_type type;
+	enum blk_zone_state state;
+	void *private_data;
+};
+
+#define blk_zone_is_smr(z) ((z)->type == BLK_ZONE_TYPE_SEQWRITE_REQ ||	\
+			    (z)->type == BLK_ZONE_TYPE_SEQWRITE_PREF)
+
+#define blk_zone_is_cmr(z) ((z)->type == BLK_ZONE_TYPE_CONVENTIONAL)
+#define blk_zone_is_full(z) ((z)->wp == (z)->start + (z)->len)
+#define blk_zone_is_empty(z) ((z)->wp == (z)->start)
+
+extern struct blk_zone *blk_lookup_zone(struct request_queue *, sector_t);
+extern struct blk_zone *blk_insert_zone(struct request_queue *,
+					struct blk_zone *);
+extern void blk_drop_zones(struct request_queue *);
+#else
+static inline void blk_drop_zones(struct request_queue *q) { };
+#endif
 
 struct queue_limits {
 	unsigned long		bounce_pfn;
@@ -423,6 +466,9 @@ struct request_queue {
 
 	struct queue_limits	limits;
 
+#ifdef CONFIG_BLK_DEV_ZONED
+	struct rb_root		zones;
+#endif
 	/*
 	 * sg stuff
 	 */
@@ -493,6 +539,7 @@ struct request_queue {
 #define QUEUE_FLAG_INIT_DONE   20	/* queue is initialized */
 #define QUEUE_FLAG_NO_SG_MERGE 21	/* don't attempt to merge SG segments*/
 #define QUEUE_FLAG_POLL	       22	/* IO polling enabled if set */
+#define QUEUE_FLAG_SINGLE      23	/* single-threaded submission only */
 
 #define QUEUE_FLAG_DEFAULT	((1 << QUEUE_FLAG_IO_STAT) |		\
 				 (1 << QUEUE_FLAG_STACKABLE)	|	\
@@ -582,6 +629,7 @@ static inline void queue_flag_clear(unsigned int flag, struct request_queue *q)
 #define blk_queue_discard(q)	test_bit(QUEUE_FLAG_DISCARD, &(q)->queue_flags)
 #define blk_queue_secdiscard(q)	(blk_queue_discard(q) && \
 	test_bit(QUEUE_FLAG_SECDISCARD, &(q)->queue_flags))
+#define blk_queue_single(q)	test_bit(QUEUE_FLAG_SINGLE, &(q)->queue_flags)
 
 #define blk_noretry_request(rq) \
 	((rq)->cmd_flags & (REQ_FAILFAST_DEV|REQ_FAILFAST_TRANSPORT| \
@@ -598,7 +646,7 @@ static inline void queue_flag_clear(unsigned int flag, struct request_queue *q)
 
 #define list_entry_rq(ptr)	list_entry((ptr), struct request, queuelist)
 
-#define rq_data_dir(rq)		(op_is_write(rq->op) ? WRITE : READ)
+#define rq_data_dir(rq)		((int)((rq)->cmd_flags & 1))
 
 /*
  * Driver can handle struct request, if it either has an old style
@@ -617,14 +665,14 @@ static inline unsigned int blk_queue_cluster(struct request_queue *q)
 /*
  * We regard a request as sync, if either a read or a sync write
  */
-static inline bool rw_is_sync(int op, unsigned int rw_flags)
+static inline bool rw_is_sync(unsigned int rw_flags)
 {
-	return op == REQ_OP_READ || (rw_flags & REQ_SYNC);
+	return !(rw_flags & REQ_WRITE) || (rw_flags & REQ_SYNC);
 }
 
 static inline bool rq_is_sync(struct request *rq)
 {
-	return rw_is_sync(rq->op, rq->cmd_flags);
+	return rw_is_sync(rq->cmd_flags);
 }
 
 static inline bool blk_rl_full(struct request_list *rl, bool sync)
@@ -653,25 +701,22 @@ static inline bool rq_mergeable(struct request *rq)
 	if (rq->cmd_type != REQ_TYPE_FS)
 		return false;
 
-	if (rq->op == REQ_OP_FLUSH)
-		return false;
-
 	if (rq->cmd_flags & REQ_NOMERGE_FLAGS)
 		return false;
 
 	return true;
 }
 
-static inline bool blk_check_merge_flags(unsigned int flags1, unsigned int op1,
-					 unsigned int flags2, unsigned int op2)
+static inline bool blk_check_merge_flags(unsigned int flags1,
+					 unsigned int flags2)
 {
-	if ((op1 == REQ_OP_DISCARD) != (op2 == REQ_OP_DISCARD))
+	if ((flags1 & REQ_DISCARD) != (flags2 & REQ_DISCARD))
 		return false;
 
 	if ((flags1 & REQ_SECURE) != (flags2 & REQ_SECURE))
 		return false;
 
-	if ((op1 == REQ_OP_WRITE_SAME) != (op2 == REQ_OP_WRITE_SAME))
+	if ((flags1 & REQ_WRITE_SAME) != (flags2 & REQ_WRITE_SAME))
 		return false;
 
 	return true;
@@ -693,6 +738,7 @@ enum {
 	BLKPREP_KILL,		/* fatal error, kill, return -EIO */
 	BLKPREP_DEFER,		/* leave on queue */
 	BLKPREP_INVALID,	/* invalid command, kill, return -EREMOTEIO */
+	BLKPREP_DONE,		/* complete w/o error */
 };
 
 extern unsigned long blk_max_low_pfn, blk_max_pfn;
@@ -872,12 +918,12 @@ static inline unsigned int blk_rq_cur_sectors(const struct request *rq)
 }
 
 static inline unsigned int blk_queue_get_max_sectors(struct request_queue *q,
-						     int op)
+						     unsigned int cmd_flags)
 {
-	if (unlikely(op == REQ_OP_DISCARD))
+	if (unlikely(cmd_flags & REQ_DISCARD))
 		return min(q->limits.max_discard_sectors, UINT_MAX >> 9);
 
-	if (unlikely(op == REQ_OP_WRITE_SAME))
+	if (unlikely(cmd_flags & REQ_WRITE_SAME))
 		return q->limits.max_write_same_sectors;
 
 	return q->limits.max_sectors;
@@ -897,18 +943,19 @@ static inline unsigned int blk_max_size_offset(struct request_queue *q,
 			(offset & (q->limits.chunk_sectors - 1));
 }
 
-static inline unsigned int blk_rq_get_max_sectors(struct request *rq)
+static inline unsigned int blk_rq_get_max_sectors(struct request *rq,
+						  sector_t offset)
 {
 	struct request_queue *q = rq->q;
 
 	if (unlikely(rq->cmd_type != REQ_TYPE_FS))
 		return q->limits.max_hw_sectors;
 
-	if (!q->limits.chunk_sectors || (rq->op == REQ_OP_DISCARD))
-		return blk_queue_get_max_sectors(q, rq->op);
+	if (!q->limits.chunk_sectors || (rq->cmd_flags & REQ_DISCARD))
+		return blk_queue_get_max_sectors(q, rq->cmd_flags);
 
-	return min(blk_max_size_offset(q, blk_rq_pos(rq)),
-			blk_queue_get_max_sectors(q, rq->op));
+	return min(blk_max_size_offset(q, offset),
+			blk_queue_get_max_sectors(q, rq->cmd_flags));
 }
 
 static inline unsigned int blk_rq_count_bios(struct request *rq)

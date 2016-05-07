@@ -1046,7 +1046,7 @@ int bdi_streamid_close(struct backing_dev_info *bdi, unsigned int id)
 	 * If we don't have a specific open, free the ID we allocated
 	 */
 	if (!bdi->streamid_open)
-		ida_simple_remove(&bdi->stream_ids, id);
+		return ida_simple_remove(&bdi->stream_ids, id);
 
 	return 0;
 }

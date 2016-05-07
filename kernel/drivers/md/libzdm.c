@@ -12,7 +12,7 @@
  * warranty of any kind, whether express or implied.
  */
 
-#define BUILD_NO		110
+#define BUILD_NO		112
 
 #define EXTRA_DEBUG		0
 
@@ -23,7 +23,6 @@
 #define MEM_HOT_BOOST_INC	5000
 #define DISCARD_IDLE_MSECS	2000
 #define DISCARD_MAX_INGRESS	150
-#define MAX_WSET		2048
 
 /* acceptable 'free' count for MZ free levels */
 #define GC_PRIO_DEFAULT		0xFF00
@@ -40,8 +39,8 @@
 #define GC_MAX_STRIPE		256
 #define REPORT_ORDER		7
 #define REPORT_FILL_PGS		65 /* 65 -> min # pages for 4096 descriptors */
-#define SYNC_IO_ORDER		2
-#define SYNC_IO_SZ		((1 << SYNC_IO_ORDER) * PAGE_SIZE)
+#define SYNC_MAX		512
+#define MAX_WSET		2048
 
 #define MZTEV_UNUSED		(cpu_to_le32(0xFFFFFFFFu))
 #define MZTEV_NF		(cpu_to_le32(0xFFFFFFFEu))
@@ -50,11 +49,7 @@
 #define Z_KEY_SIG		0xFEDCBA987654321Ful
 
 #define Z_CRC_4K		4096
-#define ZONE_SECT_BITS		19
-#define Z_BLKBITS		16
-#define Z_BLKSZ			(1ul << Z_BLKBITS)
 #define MAX_ZONES_PER_MZ	1024
-#define Z_SMR_SZ_BYTES		(Z_C4K << Z_BLKBITS)
 
 #define GC_READ			(1ul << 15)
 #define BAD_ADDR		(~0ul)
@@ -69,7 +64,6 @@
 
 #define MD_CRC_INIT		(cpu_to_le16(0x5249u))
 
-static int zoned_wp_sync(struct zdm *znd, int reset_non_empty);
 static u32 dmz_report_count(struct zdm *znd, void *rpt_in, size_t bufsz);
 static int map_addr_calc(struct zdm *, u64 dm_s, struct map_addr *out);
 static int zoned_io_flush(struct zdm *znd);
@@ -89,6 +83,7 @@ static struct map_pg *get_map_entry(struct zdm *, u64 lba, gfp_t gfp);
 static void put_map_entry(struct map_pg *);
 static int cache_pg(struct zdm *znd, struct map_pg *pg, gfp_t gfp,
 		    struct mpinfo *mpi);
+static int _pool_read(struct zdm *znd, struct map_pg **wset, int count);
 static int move_to_map_tables(struct zdm *znd, struct map_cache *mcache);
 static void update_stale_ratio(struct zdm *znd, u32 zone);
 static int zoned_create_disk(struct dm_target *ti, struct zdm *znd);
@@ -96,6 +91,7 @@ static int do_init_zoned(struct dm_target *ti, struct zdm *znd);
 static void update_all_stale_ratio(struct zdm *znd);
 static int z_discard_partial(struct zdm *znd, u32 blks, gfp_t gfp);
 static u64 z_discard_range(struct zdm *znd, u64 addr, gfp_t gfp);
+static u64 z_lookup_journal_cache(struct zdm *znd, u64 addr);
 static u64 z_lookup_cache(struct zdm *znd, u64 addr, int type);
 static u64 z_lookup_table(struct zdm *znd, u64 addr, gfp_t gfp);
 static u64 current_mapping(struct zdm *znd, u64 addr, gfp_t gfp);
@@ -104,8 +100,8 @@ static int z_mapped_discard(struct zdm *znd, u64 tlba, u64 count, gfp_t gfp);
 static int z_mapped_addmany(struct zdm *znd, u64 dm_s, u64 lba, u64,
 			    gfp_t gfp);
 static int z_to_map_list(struct zdm *znd, u64 dm_s, u64 lba, gfp_t gfp);
-static int z_to_journal_list(struct zdm *znd, u64 dm_s, u64 lba, gfp_t gfp);
 static int z_to_discard_list(struct zdm *znd, u64 dm_s, u64 blks, gfp_t gfp);
+static int md_journal_add_map(struct zdm *znd, u64 addr, u64 lba);
 static int discard_merge(struct zdm *znd, u64 tlba, u64 blks);
 static int z_mapped_sync(struct zdm *znd);
 static int z_mapped_init(struct zdm *znd);
@@ -149,6 +145,14 @@ static __always_inline void test_and_spin(spinlock_t *lock, int lineno)
 static __always_inline void deref_pg(struct map_pg *pg)
 {
 	atomic_dec(&pg->refcount);
+#if 0 /* ALLOC_DEBUG */
+	if (atomic_read(&pg->refcount) < 0) {
+		pr_err("Excessive %"PRIx64": %d who dunnit?\n",
+			pg->lba, atomic_read(&pg->refcount));
+		dump_stack();
+	}
+#endif
+
 }
 
 /**
@@ -280,7 +284,7 @@ static inline u32 crcpg(void *data)
  *
  * Return: 32 bit CRC in little endian format.
  */
-static inline __le32 crc32c_le32(u32 init, void * data, u32 sz)
+static inline __le32 crc32c_le32(u32 init, void *data, u32 sz)
 {
 	return cpu_to_le32(crc32c(init, data, sz));
 }
@@ -452,6 +456,9 @@ static inline int pool_add(struct zdm *znd, struct map_pg *expg)
 	/* undrop from journal will be in lazy list */
 	if (test_bit(IS_LAZY, &expg->flags)) {
 		set_bit(DELAY_ADD, &expg->flags);
+		return rcode;
+	}
+	if (test_bit(IN_ZLT, &expg->flags)) {
 		return rcode;
 	}
 
@@ -713,42 +720,44 @@ static inline int is_ready_for_gc(struct zdm *znd, u32 z_id)
  *  NOTE: ALL allocations are zero'd before returning.
  *	  alloc/free count is tracked for dynamic analysis.
  */
-
+#define GET_PGS		0x020000
 #define GET_ZPG		0x040000
 #define GET_KM		0x080000
 #define GET_VM		0x100000
 
-#define PG_01    (GET_ZPG |  1)
-#define PG_02    (GET_ZPG |  2)
-#define PG_05    (GET_ZPG |  5)
-#define PG_06    (GET_ZPG |  6)
-#define PG_08    (GET_ZPG |  8)
-#define PG_09    (GET_ZPG |  9)
-#define PG_10    (GET_ZPG | 10)
-#define PG_11    (GET_ZPG | 11)
-#define PG_13    (GET_ZPG | 13)
-#define PG_17    (GET_ZPG | 17)
-#define PG_27    (GET_ZPG | 27)
+#define xx_01    (GET_ZPG |  1) /* unused */
+#define xx_09    (GET_ZPG |  9) /* unused */
+#define xx_13    (GET_ZPG | 13) /* unused */
+#define xx_17    (GET_ZPG | 17) /* unused */
+#define xx_14    (GET_KM  | 14) /* unused */
+#define xx_15    (GET_KM  | 15) /* unused */
+#define xx_25    (GET_KM  | 25) /* unused */
+#define xx_26    (GET_KM  | 26) /* unused */
+#define xx_28    (GET_KM  | 28) /* unused */
+#define xx_29    (GET_KM  | 29) /* unused */
+#define xx_30    (GET_KM  | 30) /* unused */
 
-#define KM_00    (GET_KM  |  0)
-#define KM_07    (GET_KM  |  7)
-#define KM_14    (GET_KM  | 14)
-#define KM_15    (GET_KM  | 15)
-#define KM_16    (GET_KM  | 16)
-#define KM_18    (GET_KM  | 18)
-#define KM_19    (GET_KM  | 19)
-#define KM_20    (GET_KM  | 20)
-#define KM_25    (GET_KM  | 25)
-#define KM_26    (GET_KM  | 26)
-#define KM_28    (GET_KM  | 28)
-#define KM_29    (GET_KM  | 29)
-#define KM_30    (GET_KM  | 30)
+#define PG_02    (GET_ZPG |  2) /* CoW [RMW] block */
+#define PG_05    (GET_ZPG |  5) /* superblock */
+#define PG_06    (GET_ZPG |  6) /* WP: Alloc, Used, Shadow */
+#define PG_08    (GET_ZPG |  8) /* mcache data block */
+#define PG_10    (GET_ZPG | 10) /* superblock: temporary */
+#define PG_11    (GET_ZPG | 11) /* superblock: temporary */
+#define PG_27    (GET_ZPG | 27) /* map_pg data block */
 
-#define VM_03    (GET_VM  |  3)
-#define VM_04    (GET_VM  |  4)
-#define VM_12    (GET_VM  | 12)
-#define VM_21    (GET_VM  | 21)
-#define VM_22    (GET_VM  | 22)
+#define KM_00    (GET_KM  |  0) /* ZDM: Instance */
+#define KM_07    (GET_KM  |  7) /* mcache struct */
+#define KM_16    (GET_KM  | 16) /* gc descriptor */
+#define KM_18    (GET_KM  | 18) /* wset : sync */
+#define KM_19    (GET_KM  | 19) /* wset */
+#define KM_20    (GET_KM  | 20) /* map_pg struct */
+
+#define VM_03    (GET_VM  |  3) /* gc postmap */
+#define VM_04    (GET_VM  |  4) /* gc io buffer */
+#define VM_12    (GET_VM  | 12) /* vm io cache */
+#define VM_21    (GET_VM  | 21) /* wp array (of ptrs) */
+#define MP_22    (GET_PGS | 22) /* Metadata CRCs */
+#define MP_23    (GET_PGS | 23) /* WB Journal map */
 
 #define ZDM_FREE(z, _p, sz, id) \
 	do { zdm_free((z), (_p), (sz), (id)); (_p) = NULL; } while (0)
@@ -823,6 +832,9 @@ static void zdm_free(struct zdm *znd, void *p, size_t sz, u32 code)
 		switch (flag) {
 		case GET_ZPG:
 			free_page((unsigned long)p);
+			break;
+		case GET_PGS:
+			free_pages((unsigned long)p, ilog2(sz >> PAGE_SHIFT));
 			break;
 		case GET_KM:
 			kfree(p);
@@ -913,6 +925,15 @@ static void *zdm_alloc(struct zdm *znd, size_t sz, int code, gfp_t gfp)
 		if (!pmem && gfp_mask == GFP_ATOMIC) {
 			Z_ERR(znd, "No atomic for %d, try noio.", id);
 			pmem = (void *)get_zeroed_page(GFP_NOIO);
+		}
+		break;
+
+	case GET_PGS:
+		{
+			int order = ilog2(sz >> PAGE_SHIFT);
+			struct page *pgs = alloc_pages(gfp_mask, order);
+			if (pgs)
+				pmem = page_address(pgs);
 		}
 		break;
 	case GET_KM:
@@ -1068,7 +1089,7 @@ static int release_memcache(struct zdm *znd)
 		SpinLock(&znd->mclck[no]);
 		list_for_each_entry_safe(mcache, _mc, head, mclist) {
 			list_del(&mcache->mclist);
-			ZDM_FREE(znd, mcache->jdata, Z_C4K, PG_08);
+			ZDM_FREE(znd, mcache->mcd, Z_C4K, PG_08);
 			ZDM_FREE(znd, mcache, sizeof(*mcache), KM_07);
 		}
 		spin_unlock(&znd->mclck[no]);
@@ -1289,7 +1310,7 @@ static void _free_md_journal(struct zdm *znd)
 	u32 avail = jrnl->size;
 
 	if (znd->jrnl.wb && avail)
-		ZDM_FREE(znd, jrnl->wb, avail * sizeof(*jrnl->wb), VM_03);
+		ZDM_FREE(znd, jrnl->wb, avail * sizeof(*jrnl->wb), MP_23);
 	jrnl->size = 0;
 }
 
@@ -1340,13 +1361,18 @@ static void zoned_destroy(struct zdm *znd)
 	if (znd->wp)
 		_release_wp(znd, znd->wp);
 	if (znd->md_crcs)
-		ZDM_FREE(znd, znd->md_crcs, Z_C4K * 2, VM_22);
+		ZDM_FREE(znd, znd->md_crcs, Z_C4K * 2, MP_22);
 	if (znd->gc_io_buf)
 		ZDM_FREE(znd, znd->gc_io_buf, Z_C4K * GC_MAX_STRIPE, VM_04);
-	if (znd->gc_postmap.jdata) {
-		size_t sz = Z_BLKSZ * sizeof(*znd->gc_postmap.jdata);
+	if (znd->gc_postmap.mcd) {
+		size_t sz = sizeof(struct gc_map_cache_data);
 
-		ZDM_FREE(znd, znd->gc_postmap.jdata, sz, VM_03);
+		ZDM_FREE(znd, znd->gc_postmap.mcd, sz, VM_03);
+	}
+	if (znd->jrnl_map.mcd) {
+		size_t sz = sizeof(struct jrnl_map_cache_data);
+
+		ZDM_FREE(znd, znd->jrnl_map.mcd, sz, VM_03);
 	}
 
 	for (purge = 0; purge < ARRAY_SIZE(znd->io_vcache); purge++) {
@@ -1364,6 +1390,13 @@ static void zoned_destroy(struct zdm *znd)
 
 	_free_md_journal(znd);
 
+	if (znd->bio_set) {
+		struct bio_set *bs = znd->bio_set;
+
+		znd->bio_set = NULL;
+		bioset_free(bs);
+	}
+
 	ZDM_FREE(NULL, znd, sizeof(*znd), KM_00);
 }
 
@@ -1376,8 +1409,8 @@ static void zoned_destroy(struct zdm *znd)
 static int _init_md_journal(struct zdm *znd)
 {
 	struct md_journal *jrnl = &znd->jrnl;
-	u32 blks = (znd->md_start - WB_JRNL_BASE) >> 12;
-	u32 avail = (blks << 12) / sizeof(*jrnl->wb);
+	u32 blks = (znd->md_start - WB_JRNL_BASE) >> PAGE_SHIFT;
+	u32 avail = (blks << PAGE_SHIFT) / sizeof(*jrnl->wb);
 	u32 iter;
 
 	Z_ERR(znd, "MD journal space: %u [%u]", avail, blks);
@@ -1386,10 +1419,10 @@ static int _init_md_journal(struct zdm *znd)
 	if (avail > WB_JRNL_MAX)
 		avail = WB_JRNL_MAX;
 
-//	if (avail > WB_JRNL_MIN)
-//		avail = WB_JRNL_MIN;
+	if (avail > WB_JRNL_MIN)
+		avail = WB_JRNL_MIN;
 
-	jrnl->wb = ZDM_ALLOC(znd, avail * sizeof(*jrnl->wb), VM_03, NORMAL);
+	jrnl->wb = ZDM_ALLOC(znd, avail * sizeof(*jrnl->wb), MP_23, NORMAL);
 	jrnl->size = avail;
 
 	if (!jrnl->wb) {
@@ -1740,6 +1773,7 @@ static int do_init_zoned(struct dm_target *ti, struct zdm *znd)
 	mutex_init(&znd->pool_mtx);
 	mutex_init(&znd->gc_wait);
 	mutex_init(&znd->gc_postmap.cached_lock);
+	mutex_init(&znd->jrnl_map.cached_lock);
 	mutex_init(&znd->gc_vcio_lock);
 	mutex_init(&znd->vcio_lock);
 	mutex_init(&znd->mz_io_mutex);
@@ -1850,9 +1884,9 @@ static int do_init_zoned(struct dm_target *ti, struct zdm *znd)
 	Z_INFO(znd, "Reverse CRC table %" PRIx64, znd->c_mid );
 	Z_INFO(znd, "Normal data start %" PRIx64, znd->data_lba);
 
-	znd->gc_postmap.jdata = ZDM_CALLOC(znd, Z_BLKSZ,
-		sizeof(*znd->gc_postmap.jdata), VM_03, NORMAL);
-	znd->md_crcs = ZDM_ALLOC(znd, Z_C4K * 2, VM_22, NORMAL);
+	znd->gc_postmap.mcd = ZDM_ALLOC(znd, sizeof(struct gc_map_cache_data),
+					VM_03, NORMAL);
+	znd->md_crcs = ZDM_ALLOC(znd, Z_C4K * 2, MP_22, NORMAL);
 	znd->gc_io_buf = ZDM_CALLOC(znd, GC_MAX_STRIPE, Z_C4K, VM_04, NORMAL);
 	znd->wp = _alloc_wp(znd);
 	znd->io_vcache[0] = ZDM_CALLOC(znd, IO_VCACHE_PAGES,
@@ -1860,13 +1894,23 @@ static int do_init_zoned(struct dm_target *ti, struct zdm *znd)
 	znd->io_vcache[1] = ZDM_CALLOC(znd, IO_VCACHE_PAGES,
 				sizeof(struct io_4k_block), VM_12, NORMAL);
 
-	if (!znd->gc_postmap.jdata || !znd->md_crcs || !znd->gc_io_buf ||
+	if (!znd->gc_postmap.mcd || !znd->md_crcs || !znd->gc_io_buf ||
 	    !znd->wp || !znd->io_vcache[0] || !znd->io_vcache[1]) {
 		rcode = -ENOMEM;
 		goto out;
 	}
 	znd->gc_postmap.jsize = Z_BLKSZ;
+	znd->gc_postmap.map_content = IS_POST_MAP;
 	_init_mdcrcs(znd);
+
+	znd->jrnl_map.mcd = ZDM_ALLOC(znd, sizeof(struct jrnl_map_cache_data),
+					VM_03, NORMAL);
+	if (!znd->jrnl_map.mcd) {
+		rcode = -ENOMEM;
+		goto out;
+	}
+	znd->jrnl_map.jsize = WB_JRNL_MAX;
+	znd->jrnl_map.map_content = IS_JRNL_PG;
 
 	znd->io_client = dm_io_client_create();
 	if (!znd->io_client) {
@@ -2140,20 +2184,27 @@ static int zoned_init_disk(struct dm_target *ti, struct zdm *znd,
 }
 
 /**
- * compare_tlba() - Compare on tlba48 ignoring high 16 bits.
+ * mcache_cmp() - Compare on tlba48 ignoring high 16 bits.
  * @x1: Page of map cache
  * @x2: Page of map cache
  *
- * Return: -1 less than, 1 greater than, 0 if equal.
+ * Return: 1 less than, -1 greater than, 0 if equal.
  */
-static int compare_tlba(const void *x1, const void *x2)
+static int mcache_cmp(const void *x1, const void *x2)
 {
-	const struct map_sect_to_lba *r1 = x1;
-	const struct map_sect_to_lba *r2 = x2;
+	const struct map_cache_entry *r1 = x1;
+	const struct map_cache_entry *r2 = x2;
 	const u64 v1 = le64_to_lba48(r1->tlba, NULL);
 	const u64 v2 = le64_to_lba48(r2->tlba, NULL);
 
-	return (v1 < v2) ? -1 : ((v1 > v2) ? 1 : 0);
+	return (v1 < v2) ? 1 : ((v1 > v2) ? -1 : 0);
+}
+
+static inline void *get_mcd(struct map_cache *mcache)
+{
+	BUG_ON(!mcache->mcd);
+
+	return mcache->mcd;
 }
 
 /**
@@ -2166,19 +2217,131 @@ static int compare_tlba(const void *x1, const void *x2)
 static int _lsearch_tlba(struct map_cache *mcache, u64 dm_s)
 {
 	int at = -1;
-	int jentry;
+	int idx;
+	struct map_cache_data *mcd = get_mcd(mcache);
 
-	for (jentry = mcache->jcount; jentry > 0; jentry--) {
-		u64 logi = le64_to_lba48(mcache->jdata[jentry].tlba, NULL);
+	for (idx = 0; idx < mcache->jcount; idx++) {
+		u64 logi = le64_to_lba48(mcd->maps[idx].tlba, NULL);
 
 		if (logi == dm_s) {
-			at = jentry - 1;
+			at = idx;
 			goto out;
 		}
 	}
 
 out:
 	return at;
+}
+
+/* Perform a binary search for KEY in BASE which has NMEMB elements
+   of SIZE bytes each.  The comparisons are done by (*COMPAR)().  */
+
+static void *bsearchg(const void *key, const void *base,
+			 size_t nmemb, size_t size,
+			 int (*compar) (const void *, const void *))
+{
+	size_t lower, upper, idx;
+	const void *p;
+	int comparison;
+
+	lower = 0;
+	upper = nmemb;
+	while (lower < upper)
+	{
+		idx = (lower + upper) / 2;
+		p = (void *) (((const char *) base) + (idx * size));
+
+		comparison = (*compar) (key, p);
+		if (comparison < 0)
+			upper = idx;
+		else if (comparison > 0)
+			lower = idx + 1;
+		else
+			return (void *) p;
+	}
+
+	return NULL;
+}
+
+/**
+ * _bsrch_tlba() - Do a binary search over a page of map_cache entries.
+ * @mcache: Page of map cache entries to search.
+ * @tlba: tlba being sought.
+ *
+ * Return: 0 to jcount - 1 if found. -1 if not found
+ */
+static int _bsrch_tlba(struct map_cache *mcache, u64 tlba)
+{
+	int at = -1;
+	struct map_cache_data *mcd = get_mcd(mcache);
+	void *base = &mcd->maps[0];
+	void *map;
+	struct map_cache_entry find;
+
+	find.tlba = lba48_to_le64(0, tlba);
+
+	if (mcache->jcount < 0 || mcache->jcount > mcache->jsize)
+		goto out;
+
+	map = bsearchg(&find, base, mcache->jcount, sizeof(find), mcache_cmp);
+	if (map)
+		at = (map - base) / sizeof(find);
+out:
+
+#if 1
+	{
+	int kbsrc = -1;
+	int cmp;
+
+	map = bsearch(&find, base, mcache->jcount,
+		      sizeof(find), mcache_cmp);
+	if (map) {
+		kbsrc = (map - base) / sizeof(find);
+	}
+
+	if (kbsrc != at) {
+		pr_err("bsearch() is failing got %d need %d "
+		       "[items: %d, sorted %s.\n",
+			at, kbsrc, mcache->jcount,
+			(mcache->jcount == mcache->jsorted)
+				? "yes" : "no");
+	}
+
+	cmp = _lsearch_tlba(mcache, tlba);
+	if (cmp != at) {
+		pr_err("_bsrch_tlba is failing got %d need %d "
+		       "[items: %d, sorted %s.\n",
+			at, cmp, mcache->jcount,
+			(mcache->jcount == mcache->jsorted)
+				? "yes" : "no");
+		at = cmp;
+	}
+	}
+#endif
+
+	return at;
+}
+
+/**
+ * compare_ext() - Compare on tlba48 ignoring high 16 bits.
+ * @x1: Page of map cache
+ * @x2: Page of map cache
+ *
+ * Return: -1 less than, 1 greater than, 0 if equal.
+ */
+static int compare_ext(const void *x1, const void *x2)
+{
+	const struct map_cache_entry *r1 = x1;
+	const struct map_cache_entry *r2 = x2;
+	const u64 key = le64_to_lba48(r1->tlba, NULL);
+	const u64 val = le64_to_lba48(r2->tlba, NULL);
+	const u64 ext = le64_to_lba48(r2->bval, NULL);
+
+	if (key < val)
+		return 1;
+	if (key >= val && key < (val+ext))
+		return 0;
+	return -1;
 }
 
 /**
@@ -2193,14 +2356,15 @@ out:
 static int _lsearch_extent(struct map_cache *mcache, u64 dm_s)
 {
 	int at = -1;
-	int jentry;
+	int idx;
+	struct map_cache_data *mcd = get_mcd(mcache);
 
-	for (jentry = mcache->jcount; jentry > 0; jentry--) {
-		u64 addr = le64_to_lba48(mcache->jdata[jentry].tlba, NULL);
-		u64 blocks = le64_to_lba48(mcache->jdata[jentry].bval, NULL);
+	for (idx = 0; idx < mcache->jcount; idx++) {
+		u64 addr = le64_to_lba48(mcd->maps[idx].tlba, NULL);
+		u64 blocks = le64_to_lba48(mcd->maps[idx].bval, NULL);
 
 		if ((dm_s >= addr) && dm_s < (addr+blocks)) {
-			at = jentry - 1;
+			at = idx;
 			goto out;
 		}
 	}
@@ -2208,55 +2372,6 @@ static int _lsearch_extent(struct map_cache *mcache, u64 dm_s)
 out:
 	return at;
 }
-
-/**
- * _bsrch_tlba() - Do a binary search over a page of map_cache entries.
- * @mcache: Page of map cache entries to search.
- * @tlba: tlba being sought.
- *
- * Return: 0 to jcount - 1 if found. -1 if not found
- */
-static int _bsrch_tlba(struct map_cache *mcache, u64 tlba)
-{
-	int at = -1;
-	void *base = &mcache->jdata[1];
-	void *map;
-	struct map_sect_to_lba find;
-
-	find.tlba = lba48_to_le64(0, tlba);
-
-	if (mcache->jcount < 0 || mcache->jcount > mcache->jsize)
-		return at;
-
-	map = bsearch(&find, base, mcache->jcount, sizeof(find), compare_tlba);
-	if (map)
-		at = (map - base) / sizeof(find);
-
-	return at;
-}
-
-/**
- * compare_ext() - Compare on tlba48 ignoring high 16 bits.
- * @x1: Page of map cache
- * @x2: Page of map cache
- *
- * Return: -1 less than, 1 greater than, 0 if equal.
- */
-static int compare_ext(const void *x1, const void *x2)
-{
-	const struct map_sect_to_lba *r1 = x1;
-	const struct map_sect_to_lba *r2 = x2;
-	const u64 key = le64_to_lba48(r1->tlba, NULL);
-	const u64 val = le64_to_lba48(r2->tlba, NULL);
-	const u64 ext = le64_to_lba48(r2->bval, NULL);
-
-	if (key < val)
-		return -1;
-	if (key >= val && key < (val+ext))
-		return 0;
-	return 1;
-}
-
 
 /**
  * _bsrch_extent() - Do a binary search over a page of map_cache extents.
@@ -2268,12 +2383,13 @@ static int compare_ext(const void *x1, const void *x2)
 static int _bsrch_extent(struct map_cache *mcache, u64 tlba)
 {
 	int at = -1;
-	void *base = &mcache->jdata[1];
+	struct map_cache_data *mcd = get_mcd(mcache);
+	void *base = &mcd->maps[0];
 	void *map;
-	struct map_sect_to_lba find;
+	struct map_cache_entry find;
 
 	find.tlba = lba48_to_le64(0, tlba);
-	map = bsearch(&find, base, mcache->jcount, sizeof(find), compare_ext);
+	map = bsearchg(&find, base, mcache->jcount, sizeof(find), compare_ext);
 	if (map)
 		at = (map - base) / sizeof(find);
 
@@ -2293,7 +2409,7 @@ static int _bsrch_extent(struct map_cache *mcache, u64 tlba)
 }
 
 /**
- * _bsrch_tlba() - Mutex Lock and binary search.
+ * _bsrch_tlba_lck() - Mutex Lock and binary search.
  * @mcache: Page of map cache entries to search.
  * @tlba: tlba being sought.
  *
@@ -2344,9 +2460,6 @@ static inline int mcache_bsearch(struct map_cache *mcache, u64 tlba)
 	case IS_DISCARD:
 		at = _bsrch_extent(mcache, tlba);
 		break;
-	case IS_JRNL_PG:
-		at = _bsrch_tlba(mcache, tlba);
-		break;
 	default:
 		pr_err("Invalid map type: %u\n", mcache->map_content);
 		dump_stack();
@@ -2372,9 +2485,6 @@ static inline int mcache_lsearch(struct map_cache *mcache, u64 tlba)
 		break;
 	case IS_DISCARD:
 		at = _lsearch_extent(mcache, tlba);
-		break;
-	case IS_JRNL_PG:
-		at = _lsearch_tlba(mcache, tlba);
 		break;
 	default:
 		pr_err("Invalid map type: %u\n", mcache->map_content);
@@ -2453,7 +2563,7 @@ static u64 _current_mapping(struct zdm *znd, int nodisc, u64 addr, gfp_t gfp)
 	u64 found = 0ul;
 
 	if (addr < znd->data_lba) {
-		found = z_lookup_cache(znd, addr, IS_JRNL_PG);
+		found = z_lookup_journal_cache(znd, addr);
 		if (!found)
 			found = addr;
 	}
@@ -2541,38 +2651,6 @@ static int z_mapped_add_one(struct zdm *znd, u64 dm_s, u64 lba, gfp_t gfp)
 	do {
 		err = z_to_map_list(znd, dm_s, lba, gfp);
 	} while (-EBUSY == err);
-
-	return err;
-}
-
-/**
- * md_journal_add_map() - Add an entry to the map cache block mapping.
- * @znd: ZDM Instance
- * @tlba: Address being discarded.
- * @blks: number of blocks being discard.
- * @gfp: Current memory allocation scheme.
- *
- * Add a new extent entry.
- */
-static int md_journal_add_map(struct zdm *znd, u64 dm_s, u64 lba, gfp_t gfp)
-{
-	int err = 0;
-
-	if (dm_s < znd->data_lba) {
-		struct md_journal *jrnl = &znd->jrnl;
-		u32 entry = lba - WB_JRNL_BASE;
-
-		if (entry < jrnl->size) {
-			SpinLock(&jrnl->wb_alloc);
-			jrnl->wb[entry] = dm_s;
-			set_bit(IS_DIRTY, &jrnl->flags);
-			spin_unlock(&jrnl->wb_alloc);
-		}
-
-		do {
-			err = z_to_journal_list(znd, dm_s, lba, gfp);
-		} while (-EBUSY == err);
-	}
 
 	return err;
 }
@@ -2679,26 +2757,26 @@ static int z_mapped_discard(struct zdm *znd, u64 tlba, u64 blks, gfp_t gfp)
  * @znd: ZDM Instance
  * @gfp: Current memory allocation scheme.
  */
-static struct map_cache *mcache_alloc(struct zdm *znd, gfp_t gfp)
+static struct map_cache *mcache_alloc(struct zdm *znd, int type, gfp_t gfp)
 {
 	struct map_cache *mcache;
 
 	mcache = ZDM_ALLOC(znd, sizeof(*mcache), KM_07, gfp);
 	if (mcache) {
 		mutex_init(&mcache->cached_lock);
+		mcache->map_content = type;
 		mcache->jcount = 0;
 		mcache->jsorted = 0;
-		mcache->jdata = ZDM_CALLOC(znd, Z_UNSORTED,
-			sizeof(*mcache->jdata), PG_08, gfp);
-
-		if (mcache->jdata) {
+		mcache->mcd = ZDM_ALLOC(znd, sizeof(struct map_cache_data),
+					PG_08, gfp);
+		if (mcache->mcd) {
+			struct map_cache_data *data = mcache->mcd;
 			u64 logical = Z_LOWER48;
 			u64 physical = Z_LOWER48;
 
-			mcache->jdata[0].tlba = cpu_to_le64(logical);
-			mcache->jdata[0].bval = cpu_to_le64(physical);
-			mcache->jsize = Z_UNSORTED - 1;
-
+			data->header.tlba = cpu_to_le64(logical);
+			data->header.bval = cpu_to_le64(physical);
+			mcache->jsize = ARRAY_SIZE(data->maps);
 		} else {
 			Z_ERR(znd, "%s: mcache is out of space.",
 			      __func__);
@@ -2824,9 +2902,11 @@ static inline void mcache_put(struct map_cache *mcache)
 static void memcache_sort(struct zdm *znd, struct map_cache *mcache)
 {
 	mcache_ref(mcache);
-	if (mcache->jsorted < mcache->jcount) {
-		sort(&mcache->jdata[1], mcache->jcount,
-		     sizeof(*mcache->jdata), compare_tlba, NULL);
+	if (mcache->jcount > 1 && mcache->jsorted < mcache->jcount) {
+		struct map_cache_data *mcd = get_mcd(mcache);
+		struct map_cache_entry *base = &mcd->maps[0];
+
+		sort(base, mcache->jcount, sizeof(*base), mcache_cmp, NULL);
 		mcache->jsorted = mcache->jcount;
 	}
 	mcache_deref(mcache);
@@ -2856,6 +2936,35 @@ static int memcache_lock_and_sort(struct zdm *znd, struct map_cache *mcache)
 }
 
 /**
+ * z_lookup_journal_cache() - Scan mcache entries for addr
+ * @znd: ZDM Instance
+ * @addr: Address [tLBA] to find.
+ * @type: mcache type (MAP or DISCARD cache).
+ */
+static u64 z_lookup_journal_cache(struct zdm *znd, u64 addr)
+{
+	u64 found = 0ul;
+	struct map_cache *mcache = &znd->jrnl_map;
+	int err = memcache_lock_and_sort(znd, mcache);
+	int at;
+
+	/* sort, if needed. only err is -EBUSY so do a linear find. */
+	if (!err)
+		at = _bsrch_tlba(mcache, addr);
+	else
+		at = _lsearch_tlba(mcache, addr);
+
+	if (at != -1) {
+		struct jrnl_map_cache_data *mcd = mcache->mcd;
+		struct map_cache_entry *entry = &mcd->maps[at];
+
+		found = le64_to_lba48(entry->bval, NULL);
+	}
+
+	return found;
+}
+
+/**
  * z_lookup_cache() - Scan mcache entries for addr
  * @znd: ZDM Instance
  * @addr: Address [tLBA] to find.
@@ -2879,7 +2988,8 @@ static u64 z_lookup_cache(struct zdm *znd, u64 addr, int type)
 			at = mcache_lsearch(mcache, addr);
 
 		if (at != -1) {
-			struct map_sect_to_lba *data = &mcache->jdata[at + 1];
+			struct map_cache_data *mcd = get_mcd(mcache);
+			struct map_cache_entry *data = &mcd->maps[at];
 
 			found = le64_to_lba48(data->bval, NULL);
 		}
@@ -2904,61 +3014,66 @@ out:
 static void mcache_insert(struct zdm *znd, struct map_cache *mcache,
 			 u64 tlba, u64 blba)
 {
-	u16 fido = ++mcache->jcount;
-	u16 idx;
+	struct map_cache_data *mcd = get_mcd(mcache);
+	u16 top = mcache->jcount;
 
-	WARN_ON(mcache->jcount > mcache->jsize);
+	BUG_ON(mcache->jcount >= mcache->jsize);
 
-	for (idx = fido; idx > 1; --idx) {
-		u16 prev = idx - 1;
-		u64 a0 = le64_to_lba48(mcache->jdata[prev].tlba, NULL);
+	mcd->maps[top].tlba = lba48_to_le64(0, tlba);
+	mcd->maps[top].bval = lba48_to_le64(0, blba);
 
-		if (a0 < tlba) {
-			mcache->jdata[idx].tlba = lba48_to_le64(0, tlba);
-			mcache->jdata[idx].bval = lba48_to_le64(0, blba);
-			if ((mcache->jsorted + 1) == mcache->jcount)
-				mcache->jsorted = mcache->jcount;
-			break;
-		}
-		/* move UP .. tlba < a0 */
-		mcache->jdata[idx].tlba = mcache->jdata[prev].tlba;
-		mcache->jdata[idx].bval = mcache->jdata[prev].bval;
-	}
-	if (idx == 1) {
-		mcache->jdata[idx].tlba = lba48_to_le64(0, tlba);
-		mcache->jdata[idx].bval = lba48_to_le64(0, blba);
-		mcache->jsorted = mcache->jcount;
-	}
+	++mcache->jcount;
 }
-
 
 /**
  * mc_delete_entry - Overwrite a map_cache entry (for mostly sorted data)
  * @mcache: Map Cache block
  * @entry: Entry to remove. [1 .. count]
  */
-void mc_delete_entry(struct map_cache *mcache, int entry)
+static __always_inline
+void mc_delete_entry_locked(struct map_cache *mcache, int entry)
 {
 	int iter;
+	int last = mcache->jcount - 1;
+	struct map_cache_data *mcd = get_mcd(mcache);
 
-	MutexLock(&mcache->cached_lock);
+	if (mcache->jcount <= 0) {
+		pr_err("mcache delete %d ... discard below empty\n", entry);
+		dump_stack();
+		return;
+	}
+	/* if unsorted .. just fill the hole and leave. */
+	if (mcache->jsorted != mcache->jcount) {
+		mcd->maps[entry].tlba = mcd->maps[last].tlba;
+		mcd->maps[entry].bval = mcd->maps[last].bval;
+		mcache->jsorted = 0;
+		mcache->jcount--;
+		return;
+	}
 
-	mcache->jdata[entry].tlba = lba48_to_le64(0, 0ul);
-	mcache->jdata[entry].bval = lba48_to_le64(0, 0ul);
+	/* if sorted .. fill in the hole */
+	mcd->maps[entry].tlba = lba48_to_le64(0, 0ul);
+	mcd->maps[entry].bval = lba48_to_le64(0, 0ul);
 
-	for (iter = entry; iter < mcache->jcount; iter++) {
+	for (iter = entry; iter < last; iter++) {
 		int next = iter + 1;
 
-		mcache->jdata[iter].tlba = mcache->jdata[next].tlba;
-		mcache->jdata[iter].bval = mcache->jdata[next].bval;
+		mcd->maps[iter].tlba = mcd->maps[next].tlba;
+		mcd->maps[iter].bval = mcd->maps[next].bval;
 	}
-	if (mcache->jcount > 0) {
-		if (mcache->jsorted == mcache->jcount)
-			mcache->jsorted--;
-		mcache->jcount--;
-	} else {
-		pr_err("mcache delete ... discard below empty\n");
-	}
+	mcache->jsorted--;
+	mcache->jcount--;
+}
+
+/**
+ * mc_delete_entry - Overwrite a map_cache entry (for mostly sorted data)
+ * @mcache: Map Cache block
+ * @entry: Entry to remove. [1 .. count]
+ */
+static void mc_delete_entry(struct map_cache *mcache, int entry)
+{
+	MutexLock(&mcache->cached_lock);
+	mc_delete_entry_locked(mcache, entry);
 	mutex_unlock(&mcache->cached_lock);
 }
 
@@ -2978,7 +3093,8 @@ static int _discard_split_entry(struct zdm *znd, struct map_cache *mcache,
 {
 	const int merge = 0;
 	int err = 0;
-	struct map_sect_to_lba *entry = &mcache->jdata[at + 1];
+	struct map_cache_data *mcd = get_mcd(mcache);
+	struct map_cache_entry *entry = &mcd->maps[at];
 	u64 tlba   = le64_to_lba48(entry->tlba, NULL);
 	u64 blocks = le64_to_lba48(entry->bval, NULL);
 	u64 dblks  = blocks;
@@ -3003,7 +3119,7 @@ static int _discard_split_entry(struct zdm *znd, struct map_cache *mcache,
 		entry->bval = lba48_to_le64(0, blocks);
 
 		if (blocks == 0ul) {
-			mc_delete_entry(mcache, at + 1);
+			mc_delete_entry(mcache, at);
 			goto out;
 		}
 		dblks = blocks;
@@ -3045,7 +3161,7 @@ static int _discard_split_entry(struct zdm *znd, struct map_cache *mcache,
 		entry->tlba = lba48_to_le64(0, tlba);
 		entry->bval = lba48_to_le64(0, blocks);
 		if (blocks == 0ul)
-			mc_delete_entry(mcache, at + 1);
+			mc_delete_entry(mcache, at);
 	} else {
 		u64 start = addr + dblks;
 
@@ -3152,9 +3268,9 @@ static int z_discard_partial(struct zdm *znd, u32 minblks, gfp_t gfp)
 
 		if (at != -1) {
 			const int nodisc = 1;
-			s32 e = at + 1;
-			u64 tlba = le64_to_lba48(mcache->jdata[e].tlba, NULL);
-			u64 blks = le64_to_lba48(mcache->jdata[e].bval, NULL);
+			struct map_cache_data *mcd = get_mcd(mcache);
+			u64 tlba = le64_to_lba48(mcd->maps[at].tlba, NULL);
+			u64 blks = le64_to_lba48(mcd->maps[at].bval, NULL);
 			u64 chunk = DISCARD_MAX_INGRESS - 1;
 			u32 dcount = 0;
 			u32 dstop = minblks;
@@ -3179,7 +3295,7 @@ static int z_discard_partial(struct zdm *znd, u32 minblks, gfp_t gfp)
 				chunk = blks;
 
 			if (chunk == 0) {
-				mc_delete_entry(mcache, e);
+				mc_delete_entry(mcache, at);
 				completions++;
 			} else if (chunk < DISCARD_MAX_INGRESS) {
 				err = mapped_discard(znd, tlba, chunk, 0, gfp);
@@ -3190,10 +3306,10 @@ static int z_discard_partial(struct zdm *znd, u32 minblks, gfp_t gfp)
 				blks -= chunk;
 				tlba += chunk;
 
-				mcache->jdata[e].tlba = lba48_to_le64(0, tlba);
-				mcache->jdata[e].bval = lba48_to_le64(0, blks);
+				mcd->maps[at].tlba = lba48_to_le64(0, tlba);
+				mcd->maps[at].bval = lba48_to_le64(0, blks);
 				if (blks == 0ul)
-					mc_delete_entry(mcache, e);
+					mc_delete_entry(mcache, at);
 			}
 			completions++;
 		}
@@ -3209,7 +3325,7 @@ static int z_discard_partial(struct zdm *znd, u32 minblks, gfp_t gfp)
 			mcache_put(mcache);
 
 			if (deleted) {
-				ZDM_FREE(znd, mcache->jdata, Z_C4K, PG_08);
+				ZDM_FREE(znd, mcache->mcd, Z_C4K, PG_08);
 				ZDM_FREE(znd, mcache, sizeof(*mcache), KM_07);
 				mcache = NULL;
 				znd->dc_entries--;
@@ -3234,13 +3350,14 @@ out:
  */
 static int lba_in_zone(struct zdm *znd, struct map_cache *mcache, u32 zone)
 {
-	int jentry;
+	int idx;
+	struct map_cache_data *mcd = get_mcd(mcache);
 
 	if (zone >= znd->data_zones)
 		goto out;
 
-	for (jentry = mcache->jcount; jentry > 0; jentry--) {
-		u64 lba = le64_to_lba48(mcache->jdata[jentry].bval, NULL);
+	for (idx = 0; idx < mcache->jcount; idx++) {
+		u64 lba = le64_to_lba48(mcd->maps[idx].bval, NULL);
 
 		if (lba && _calc_zone(znd, lba) == zone)
 			return 1;
@@ -3346,7 +3463,7 @@ static int __cached_to_tables(struct zdm *znd, int type, u32 zone)
 		mcache_deref(mcache);
 
 		if (deleted) {
-			ZDM_FREE(znd, mcache->jdata, Z_C4K, PG_08);
+			ZDM_FREE(znd, mcache->mcd, Z_C4K, PG_08);
 			ZDM_FREE(znd, mcache, sizeof(*mcache), KM_07);
 			mcache = NULL;
 			znd->mc_entries--;
@@ -3357,7 +3474,6 @@ out:
 
 	return err;
 }
-
 
 /**
  * _cached_to_tables() - Migrate memcache entries to lookup tables
@@ -3378,7 +3494,6 @@ static int _cached_to_tables(struct zdm *znd, u32 zone)
 	err = __cached_to_tables(znd, IS_MAP, zone);
 	return err;
 }
-
 
 /**
  * z_flush_bdev() - Request backing device flushed to disk.
@@ -3472,8 +3587,6 @@ out:
 	return req_flush;
 }
 
-static int _pool_read(struct zdm *znd, struct map_pg **wset, int count);
-
 /**
  * manage_lazy_activity() - Migrate delayed 'add' entries to the 'ZTL'
  * @znd: ZDM Instance
@@ -3511,9 +3624,20 @@ static int manage_lazy_activity(struct zdm *znd)
 		if (test_bit(IS_DIRTY, &expg->flags))
 			set_bit(DELAY_ADD, &expg->flags);
 
-		if (test_bit(WB_RE_CACHE, &expg->flags))
-			if (entries < MAX_WSET)
-				wset[entries++] = expg;
+		if (test_bit(WB_RE_CACHE, &expg->flags)) {
+			if (!expg->data.addr) {
+				if (entries < MAX_WSET) {
+					ref_pg(expg);
+					wset[entries] = expg;
+					entries++;
+					clear_bit(WB_RE_CACHE, &expg->flags);
+				}
+			} else {
+				set_bit(IS_DIRTY, &expg->flags);
+				clear_bit(IS_FLUSH, &expg->flags);
+				clear_bit(WB_RE_CACHE, &expg->flags);
+			}
+		}
 
 		/*
 		 * Migrage pg to zltlst list
@@ -3530,7 +3654,7 @@ static int manage_lazy_activity(struct zdm *znd)
 					list_add(&expg->zltlst, &znd->zltpool);
 					znd->in_zlt++;
 				} else {
-					Z_ERR(znd, "** ZLT double add? %"PRIx64"",
+					Z_ERR(znd, "** ZLT double add? %"PRIx64,
 						expg->lba);
 				}
 				spin_unlock(&znd->zlt_lck);
@@ -3552,9 +3676,8 @@ static int manage_lazy_activity(struct zdm *znd)
 out:
 	spin_unlock(&znd->lzy_lck);
 
-	if (entries > 0) {
+	if (entries > 0)
 		_pool_read(znd, wset, entries);
-	}
 
 	if (wset)
 		ZDM_FREE(znd, wset, sizeof(*wset) * MAX_WSET, KM_19);
@@ -3572,8 +3695,9 @@ static inline void pg_toggle_wb_journal(struct zdm *znd, struct map_pg *expg)
 {
 	if (test_and_clear_bit(WB_JRNL_2, &expg->flags)) {
 		/* migrating from journal -> home, must return home */
-		set_bit(WB_DIRECT,  &expg->flags);
-		set_bit(WB_RE_CACHE,  &expg->flags);
+		set_bit(WB_DIRECT, &expg->flags);
+		if (test_and_clear_bit(IN_WB_JOURNAL, &expg->flags))
+			set_bit(WB_RE_CACHE, &expg->flags);
 	} else if (test_and_clear_bit(WB_JRNL_1, &expg->flags)) {
 		/* migrating from 1 to 2 is okay stay in journal */
 		set_bit(WB_JRNL_2,  &expg->flags);
@@ -3597,6 +3721,7 @@ static void mark_clean_flush_zlt(struct zdm *znd, int wb_toggle)
 	struct map_pg *_tpg;
 
 	spin_lock(&znd->zlt_lck);
+	znd->flush_age = jiffies_64;
 	if (list_empty(&znd->zltpool))
 		goto out;
 
@@ -3675,11 +3800,12 @@ static void mark_clean_flush(struct zdm *znd, int wb_toggle)
 static int do_sync_metadata(struct zdm *znd, int sync, int drop)
 {
 	int err = 0;
-	int want_flush;
 
-	want_flush = manage_lazy_activity(znd);
-	if (want_flush)
+	if (manage_lazy_activity(znd)) {
+		if (!test_bit(DO_FLUSH, &znd->flags))
+			Z_ERR(znd, "Extra flush [MD Cache too small]");
 		set_bit(DO_FLUSH, &znd->flags);
+	}
 
 	/* if drop is non-zero, DO_FLUSH may be set on return */
 	err = sync_mapped_pages(znd, sync, drop);
@@ -3699,7 +3825,6 @@ static int do_sync_metadata(struct zdm *znd, int sync, int drop)
 	 *       as flushed and we can bypass elevating the drop count
 	 *       to trigger a flush for such already flushed blocks.
 	 */
-	want_flush = test_bit(DO_FLUSH, &znd->flags);
 	err = z_mapped_sync(znd);
 	if (err) {
 		Z_ERR(znd, "Uh oh. z_mapped_sync -> %d", err);
@@ -3851,19 +3976,19 @@ static void meta_work_task(struct work_struct *work)
 static int _update_entry(struct zdm *znd, struct map_cache *mcache, int at,
 			 u64 dm_s, u64 lba, gfp_t gfp)
 {
-	struct map_sect_to_lba *data;
+	struct map_cache_data *mcd = get_mcd(mcache);
+	struct map_cache_entry *entry = &mcd->maps[at];
 	u64 lba_was;
 	int err = 0;
 
-	data = &mcache->jdata[at + 1];
-	lba_was = le64_to_lba48(data->bval, NULL);
+	lba_was = le64_to_lba48(entry->bval, NULL);
 	lba &= Z_LOWER48;
-	data->bval = lba48_to_le64(0, lba);
+	entry->bval = lba48_to_le64(0, lba);
 
 	if (lba != lba_was) {
 		Z_DBG(znd, "Remap %" PRIx64 " -> %" PRIx64
 			   " (was %" PRIx64 "->%" PRIx64 ")",
-		      dm_s, lba, le64_to_lba48(data->tlba, NULL), lba_was);
+		      dm_s, lba, le64_to_lba48(entry->tlba, NULL), lba_was);
 		err = unused_phy(znd, lba_was, 0, gfp);
 		if (err == 1)
 			err = 0;
@@ -3883,55 +4008,15 @@ static int _update_entry(struct zdm *znd, struct map_cache *mcache, int at,
 static int _update_disc(struct zdm *znd, struct map_cache *mcache, int at,
 			u64 dm_s, u64 blks)
 {
-	struct map_sect_to_lba *data;
+	struct map_cache_data *mcd = get_mcd(mcache);
+	struct map_cache_entry *entry = &mcd->maps[at];
 	u64 oldsz;
 	int err = 0;
 
-	data = &mcache->jdata[at + 1];
-	oldsz = le64_to_lba48(data->bval, NULL);
-	data->bval = lba48_to_le64(0, blks);
+	oldsz = le64_to_lba48(entry->bval, NULL);
+	entry->bval = lba48_to_le64(0, blks);
 
 	return err;
-}
-
-/**
- * _update_journal() - Update an existing map cache entry.
- * @znd: ZDM instance
- * @mcache: Map cache block
- * @at: Data entry in map cache block
- * @dm_s: tBLA mapping from
- * @lba: New lba
- * @gfp: Allocation flags to use.
- */
-static int _update_journal(struct zdm *znd, struct map_cache *mcache, int at,
-			   u64 dm_s, u64 lba)
-{
-	struct map_sect_to_lba *data;
-	u64 lba_was;
-
-	data = &mcache->jdata[at + 1];
-	lba_was = le64_to_lba48(data->bval, NULL);
-	lba &= Z_LOWER48;
-	data->bval = lba48_to_le64(0, lba);
-
-	if (lba_was) {
-		struct md_journal *jrnl = &znd->jrnl;
-		u32 entry = lba_was - WB_JRNL_BASE;
-
-		if (entry >= jrnl->size) {
-			Z_ERR(znd, "BAD WB Journal! Got %" PRIx64 " max %x",
-			           lba_was, jrnl->size);
-			return -EIO;
-		}
-
-		SpinLock(&jrnl->wb_alloc);
-		jrnl->in_use--;
-		jrnl->wb[entry] = MZTEV_UNUSED;
-		set_bit(IS_DIRTY, &jrnl->flags);
-		spin_unlock(&jrnl->wb_alloc);
-	}
-
-	return 0;
 }
 
 /**
@@ -3953,8 +4038,6 @@ static int mc_update(struct zdm *znd, struct map_cache *mcache, int at,
 		rcode = _update_entry(znd, mcache, at, dm_s, lba, gfp);
 	else if (type == IS_DISCARD)
 		rcode = _update_disc(znd, mcache, at, dm_s, lba);
-	else if (type == IS_JRNL_PG)
-		rcode = _update_journal(znd, mcache, at, dm_s, lba);
 	else
 		dump_stack();
 
@@ -3969,8 +4052,7 @@ static int mc_update(struct zdm *znd, struct map_cache *mcache, int at,
  * @type: List (type) to be adding to (MAP or DISCARD)
  * @gfp: Allocation (kmalloc) flags
  */
-static
-int _mapped_list(struct zdm *znd, u64 dm_s, u64 lba, int type, gfp_t gfp)
+static int _mapped_list(struct zdm *znd, u64 dm_s, u64 lba, int type, gfp_t gfp)
 {
 	struct map_cache *mcache = NULL;
 	struct map_cache *mc_add = NULL;
@@ -4012,7 +4094,7 @@ int _mapped_list(struct zdm *znd, u64 dm_s, u64 lba, int type, gfp_t gfp)
 	/* ------------------------------------------------------------------ */
 
 	if (!mc_add) {
-		mc_add = mcache_alloc(znd, gfp);
+		mc_add = mcache_alloc(znd, type, gfp);
 		if (!mc_add) {
 			Z_ERR(znd, "%s: in memory journal is out of space.",
 			      __func__);
@@ -4037,18 +4119,17 @@ int _mapped_list(struct zdm *znd, u64 dm_s, u64 lba, int type, gfp_t gfp)
 
 	if (mc_add) {
 		MutexLock(&mc_add->cached_lock);
-
-		if (!mc_add->jdata) {
-			mc_add->jdata = ZDM_CALLOC(znd, Z_UNSORTED,
-				sizeof(*mc_add->jdata), PG_08, gfp);
+		if (!mc_add->mcd) {
+			mc_add->mcd = ZDM_ALLOC(znd,
+						sizeof(struct map_cache_data),
+						PG_08, gfp);
 		}
-		if (!mc_add->jdata) {
+		if (!mc_add->mcd) {
 			Z_ERR(znd, "%s: in memory journal is out of space.",
 			      __func__);
 			err = -ENOMEM;
 			goto out;
 		}
-
 		if (mc_add->jcount < mc_add->jsize) {
 			mcache_insert(znd, mc_add, dm_s, lba);
 			if (add_to_list)
@@ -4085,25 +4166,6 @@ static int z_to_discard_list(struct zdm *znd, u64 dm_s, u64 blks, gfp_t gfp)
 static int z_to_map_list(struct zdm *znd, u64 dm_s, u64 lba, gfp_t gfp)
 {
 	return _mapped_list(znd, dm_s, lba, IS_MAP, gfp);
-}
-
-/**
- * z_to_journal_list() - Add a map cache entry to the map cache
- * @znd: ZDM instance
- * @dm_s: tBLA mapping from
- * @lba: bLBA mapping to
- * @gfp: Allocation (kmalloc) flags
- */
-static int z_to_journal_list(struct zdm *znd, u64 dm_s, u64 lba, gfp_t gfp)
-{
-	if (lba != 0ul) {
-		u32 entry = lba - WB_JRNL_BASE;
-
-		if (entry >= znd->jrnl.size)
-			Z_ERR(znd, "Warning: Invalid bLBA: %"PRIx64, lba);
-	}
-
-	return _mapped_list(znd, dm_s, lba, IS_JRNL_PG, gfp);
 }
 
 /**
@@ -4157,11 +4219,13 @@ static int discard_merge(struct zdm *znd, u64 tlba, u64 blks)
 		}
 		at = _bsrch_tlba(mcache, ends);
 		if (at != -1) {
-			struct map_sect_to_lba *data;
+			struct map_cache_data *mcd;
+			struct map_cache_entry *data;
 			u64 oldsz;
 
 			mcache_ref(mcache);
-			data = &mcache->jdata[at + 1];
+			mcd = get_mcd(mcache);
+			data = &mcd->maps[at];
 			data->tlba = lba48_to_le64(0, tlba);
 			oldsz = le64_to_lba48(data->bval, NULL);
 			data->bval = lba48_to_le64(0, oldsz + blks);
@@ -4183,13 +4247,15 @@ static int discard_merge(struct zdm *znd, u64 tlba, u64 blks)
 				at = _bsrch_extent_lck(mcache, ends);
 		}
 		if (at != -1) {
-			struct map_sect_to_lba *data;
+			struct map_cache_data *mcd;
+			struct map_cache_entry *data;
 			u64 oldsz;
 			u64 origin;
 			u64 extend;
 
 			mcache_ref(mcache);
-			data = &mcache->jdata[at + 1];
+			mcd = get_mcd(mcache);
+			data = &mcd->maps[at];
 			origin = le64_to_lba48(data->tlba, NULL);
 			oldsz = le64_to_lba48(data->bval, NULL);
 			extend = (tlba - origin) + blks;
@@ -4227,186 +4293,59 @@ static inline u64 next_generation(struct zdm *znd)
 	return generation;
 }
 
-/**
- * z_mapped_sync() - Write cache entries and bump superblock generation.
- * @znd: ZDM instance
- */
-static int z_mapped_sync(struct zdm *znd)
+static struct bio *next_bio(struct bio *bio, gfp_t gfp, unsigned int nr_pages,
+	struct bio_set *bs)
 {
-	struct md_journal *jrnl = &znd->jrnl;
-	struct dm_target *ti = znd->ti;
-	struct map_cache *mcache;
-	int nblks = 1;
-	int use_wq = 0;
-	int rc = 1;
-	int discards = 0;
-	int maps = 0;
-	int jwrote = 0;
-	int cached = 0;
-	int idx = 0;
-	int no;
-	int need_sync_io = 1;
-	u64 lba = LBA_SB_START;
-	u64 generation = next_generation(znd);
-	u64 modulo = CACHE_COPIES;
-	u64 incr = MAX_SB_INCR_SZ;
-	struct io_4k_block *io_vcache;
+	struct bio *new = bio_alloc_bioset(gfp, nr_pages, bs);
 
-	MutexLock(&znd->vcio_lock);
-	io_vcache = get_io_vcache(znd, NORMAL);
-	if (!io_vcache) {
-		Z_ERR(znd, "%s: FAILED to get IO CACHE.", __func__);
-		rc = -ENOMEM;
-		goto out;
+	if (bio) {
+#if 0
+		int nr_phys;
+
+		nr_phys = bio_phys_segments(bdev_get_queue(bio->bi_bdev), bio);
+		if (!nr_phys)
+			pr_err("next_bio: Bio Segments: %u\n", nr_phys);
+#endif
+
+		bio_chain(bio, new);
+		submit_bio(bio->bi_rw, bio);
 	}
 
-	/* write dirty WP/ZF_EST blocks */
-	lba = WP_ZF_BASE;
-	for (idx = 0; idx < znd->gz_count; idx++) {
-		struct meta_pg *wpg = &znd->wp[idx];
+	return new;
+}
 
-		if (test_bit(IS_DIRTY, &wpg->flags)) {
-			cached = 0;
-			memcpy(io_vcache[cached].data, wpg->wp_alloc, Z_C4K);
-			znd->bmkeys->wp_crc[idx] =
-				crc_md_le16(io_vcache[cached].data, Z_CRC_4K);
-			cached++;
-			memcpy(io_vcache[cached].data, wpg->zf_est, Z_C4K);
-			znd->bmkeys->zf_crc[idx] =
-				crc_md_le16(io_vcache[cached].data, Z_CRC_4K);
-			cached++;
-			rc = write_block(ti, DM_IO_VMA, io_vcache, lba,
-				cached, use_wq);
-			if (rc)
-				goto out;
-			clear_bit(IS_DIRTY, &wpg->flags);
-
-			Z_DBG(znd, "%d# -- WP: %04x | ZF: %04x",
-			      idx, znd->bmkeys->wp_crc[idx],
-				   znd->bmkeys->zf_crc[idx]);
+static unsigned int bio_add_km(struct bio *bio, void *kmem, int pgs)
+{
+	unsigned int added = 0;
+	unsigned int len = pgs << PAGE_SHIFT;
+	struct page *pg;
+	unsigned long addr = (unsigned long)kmem;
+	if (addr && bio) {
+		pg = virt_to_page((void*)addr);
+		if (pg) {
+			added = bio_add_page(bio, pg, len, 0);
+			if (added != len)
+				pr_err("Failed to add %u to bio\n", len);
+		} else {
+			pr_err("Invalid pg ? \n");
 		}
-		lba += 2;
+	} else {
+		pr_err("Invalid addr / bio ? \n");
 	}
+	return added;
+}
 
-	if (test_bit(IS_DIRTY, &jrnl->flags)) {
-		znd->bmkeys->wb_next = cpu_to_le32(jrnl->wb_next);
-		znd->bmkeys->wb_crc32 = crc32c_le32(~0u, jrnl->wb, jrnl->size);
-		lba = WB_JRNL_IDX;
-		cached = jrnl->size >> 10;
-		rc = write_block(ti, DM_IO_VMA, jrnl->wb, lba, cached, use_wq);
-		if (rc)
-			goto out;
-		clear_bit(IS_DIRTY, &jrnl->flags);
-	}
+static int bio_add_wp(struct bio *bio, struct zdm *znd, int idx)
+{
+	int len;
+	struct meta_pg *wpg = &znd->wp[idx];
 
-	/* Begin mem cache writeback (  */
-	lba = (generation % modulo) * incr;
-	if (lba == 0)
-		lba++;
+	znd->bmkeys->wp_crc[idx] = crc_md_le16(wpg->wp_alloc, Z_CRC_4K);
+	len = bio_add_km(bio, wpg->wp_alloc, 1);
+	znd->bmkeys->zf_crc[idx] = crc_md_le16(wpg->zf_est, Z_CRC_4K);
+	len += bio_add_km(bio, wpg->zf_est, 1);
 
-	znd->bmkeys->generation = cpu_to_le64(generation);
-	znd->bmkeys->gc_resv = cpu_to_le32(znd->z_gc_resv);
-	znd->bmkeys->meta_resv = cpu_to_le32(znd->z_meta_resv);
-
-	idx = 0;
-	for (no = 0; no < MAP_COUNT; no++) {
-		if (no == IS_JRNL_PG)
-			continue;
-
-		mcache = mcache_first_get(znd, no);
-		while (mcache) {
-			u64 phy = le64_to_lba48(mcache->jdata[0].bval, NULL);
-			u16 jcount = mcache->jcount & 0xFFFF;
-
-			if (jcount) {
-				mcache->jdata[0].bval =
-					lba48_to_le64(jcount, phy);
-				znd->bmkeys->crcs[idx] =
-					crc_md_le16(mcache->jdata, Z_CRC_4K);
-				idx++;
-				memcpy(io_vcache[cached].data,
-					mcache->jdata, Z_C4K);
-				cached++;
-
-				if (no == IS_DISCARD)
-					discards++;
-				else
-					maps++;
-			}
-
-			if (cached == IO_VCACHE_PAGES) {
-				rc = write_block(ti, DM_IO_VMA, io_vcache, lba,
-						 cached, use_wq);
-				if (rc) {
-					Z_ERR(znd, "%s: cache-> %" PRIu64
-					      " [%d blks] %p -> %d",
-					      __func__, lba, nblks,
-					      mcache->jdata, rc);
-					mcache_put(mcache);
-					goto out;
-				}
-				lba    += cached;
-				jwrote += cached;
-				cached  = 0;
-			}
-			mcache = mcache_put_get_next(znd, mcache, no);
-		}
-	}
-	jwrote += cached;
-	if (discards > 40)
-		Z_ERR(znd, "**WARNING** large discard cache %d", discards);
-	if (maps > 40)
-		Z_ERR(znd, "**WARNING** large map cache %d", maps);
-
-	znd->bmkeys->md_crc = crc_md_le16(znd->md_crcs, 2 * Z_CRC_4K);
-	znd->bmkeys->n_crcs = cpu_to_le16(jwrote);
-	znd->bmkeys->discards = cpu_to_le16(discards);
-	znd->bmkeys->maps = cpu_to_le16(maps);
-	znd->bmkeys->crc32 = 0;
-	znd->bmkeys->crc32 = cpu_to_le32(crc32c(~0u, znd->bmkeys, Z_CRC_4K));
-	if (cached < (IO_VCACHE_PAGES - 3)) {
-		memcpy(io_vcache[cached].data, znd->bmkeys, Z_C4K);
-		cached++;
-		memcpy(io_vcache[cached].data, znd->md_crcs, Z_C4K * 2);
-		cached += 2;
-		need_sync_io = 0;
-	}
-
-	do {
-		if (cached > 0) {
-			unsigned int op_flags = 0;
-
-			if (!need_sync_io &&
-			    test_and_clear_bit(DO_FLUSH, &znd->flags))
-				op_flags = REQ_PREFLUSH | REQ_FUA;
-
-			rc = writef_block(ti, DM_IO_VMA, io_vcache, lba,
-					  op_flags, cached, use_wq);
-			if (rc) {
-				Z_ERR(znd, "%s: mcache-> %" PRIu64
-				      " [%d blks] %p -> %d",
-				      __func__, lba, cached, io_vcache, rc);
-				goto out;
-			}
-			lba += cached;
-		}
-
-		cached = 0;
-		if (need_sync_io) {
-			memcpy(io_vcache[cached].data, znd->bmkeys, Z_C4K);
-			cached++;
-			memcpy(io_vcache[cached].data, znd->md_crcs, Z_C4K * 2);
-			cached += 2;
-			need_sync_io = 0;
-		}
-	} while (cached > 0);
-
-	mark_clean_flush(znd, 1);
-
-out:
-	put_io_vcache(znd, io_vcache);
-	mutex_unlock(&znd->vcio_lock);
-	return rc;
+	return len;
 }
 
 /**
@@ -4432,6 +4371,203 @@ static inline int is_key_page(void *_data)
 			is_key = 1;
 	}
 	return is_key;
+}
+
+/**
+ * z_mapped_sync() - Write cache entries and bump superblock generation.
+ * @znd: ZDM instance
+ */
+static int z_mapped_sync(struct zdm *znd)
+{
+	struct md_journal *jrnl = &znd->jrnl;
+	struct map_cache *mc;
+	struct map_cache **wset = NULL;
+	int wset_count = 0;
+	int rc = 1;
+	int discards = 0;
+	int maps = 0;
+	int cached = 0;
+	int idx = 0;
+	int no;
+	int more_data = 1;
+	int n_writes = 0;
+	int n_blocks = 0;
+	struct bio *bio = NULL;
+	u64 lba = LBA_SB_START;
+	u64 generation = next_generation(znd);
+	u64 modulo = CACHE_COPIES;
+	u64 incr = MAX_SB_INCR_SZ;
+
+	wset = ZDM_CALLOC(znd, sizeof(*wset), SYNC_MAX, KM_18, NORMAL);
+	if (!wset)
+		return -ENOMEM;
+
+	/* write dirty WP/ZF_EST blocks */
+	lba = WP_ZF_BASE;
+	for (idx = 0; idx < znd->gz_count; idx++) {
+		struct meta_pg *wpg = &znd->wp[idx];
+
+		if (test_bit(IS_DIRTY, &wpg->flags)) {
+			if (bio)
+				n_writes++, n_blocks += 2;
+
+			bio = next_bio(bio, GFP_KERNEL, 2, znd->bio_set);
+			if (!bio) {
+				Z_ERR(znd, "%s: alloc bio.", __func__);
+				rc = -ENOMEM;
+				goto out;
+			}
+			bio->bi_iter.bi_sector = lba << Z_SHFT4K;
+			bio->bi_bdev = znd->dev->bdev;
+			bio->bi_rw = WRITE;
+			bio->bi_iter.bi_size = 0;
+			if (!bio_add_wp(bio, znd, idx)) {
+				rc = -EIO;
+				goto out;
+			}
+			clear_bit(IS_DIRTY, &wpg->flags);
+
+			Z_DBG(znd, "%d# -- WP: %04x | ZF: %04x",
+			      idx, znd->bmkeys->wp_crc[idx],
+				   znd->bmkeys->zf_crc[idx]);
+		}
+		lba += 2;
+	}
+	lba = (generation % modulo) * incr;
+	if (lba == 0)
+		lba++;
+	if (bio)
+		n_writes++, n_blocks += 2;
+
+	bio = next_bio(bio, GFP_KERNEL, BIO_MAX_PAGES, znd->bio_set);
+	if (!bio) {
+		Z_ERR(znd, "%s: alloc bio.", __func__);
+		rc = -ENOMEM;
+		goto out;
+	}
+	bio->bi_iter.bi_sector = lba << Z_SHFT4K;
+	bio->bi_bdev = znd->dev->bdev;
+	bio->bi_rw = WRITE;
+	bio->bi_iter.bi_size = 0;
+
+	cached = jrnl->size >> 10;
+	if (!bio_add_km(bio, jrnl->wb, cached)) {
+		rc = -EIO;
+		Z_ERR(znd, "%s: bio_add_km -> %d", __func__, rc);
+		goto out;
+	}
+
+	znd->bmkeys->generation = cpu_to_le64(generation);
+	znd->bmkeys->wb_blocks = cpu_to_le32(cached);
+	znd->bmkeys->wb_next = cpu_to_le32(jrnl->wb_next);
+	znd->bmkeys->wb_crc32 = crc32c_le32(~0u, jrnl->wb, jrnl->size);
+	znd->bmkeys->gc_resv = cpu_to_le32(znd->z_gc_resv);
+	znd->bmkeys->meta_resv = cpu_to_le32(znd->z_meta_resv);
+
+	lba += cached;
+	idx = 0;
+	for (no = 0; no < MAP_COUNT; no++) {
+		if (no == IS_JRNL_PG)
+			continue;
+
+		mc = mcache_first_get(znd, no);
+		while (mc) {
+			struct map_cache_data *mcd = mc->mcd;
+
+			u64 phy = le64_to_lba48(mcd->header.bval, NULL);
+			u16 jcount = mc->jcount & 0xFFFF;
+
+			if (jcount) {
+				mcd->header.bval = lba48_to_le64(jcount, phy);
+				znd->bmkeys->crcs[idx] =
+						crc_md_le16(mcd, Z_CRC_4K);
+				idx++;
+				bio_add_km(bio, mcd, 1);
+				if (wset_count < SYNC_MAX) {
+					wset[wset_count] = mc;
+					wset_count++;
+					mcache_ref(mc);
+				}
+				cached++;
+				lba++;
+				if (no == IS_DISCARD)
+					discards++;
+				else
+					maps++;
+			}
+			if (cached == BIO_MAX_PAGES) {
+				bio = next_bio(bio, BIO_MAX_PAGES, GFP_KERNEL,
+					       znd->bio_set);
+				if (!bio) {
+					Z_ERR(znd, "%s: alloc bio.", __func__);
+					rc = -ENOMEM;
+					mcache_put(mc);
+					goto out;
+				}
+
+				bio->bi_iter.bi_sector = lba << Z_SHFT4K;
+				bio->bi_bdev = znd->dev->bdev;
+				bio->bi_rw = WRITE;
+				bio->bi_iter.bi_size = 0;
+
+				n_writes++, n_blocks += cached;
+				idx = 0;
+				cached  = 0;
+			}
+			mc = mcache_put_get_next(znd, mc, no);
+		}
+	}
+	if (discards > 40)
+		Z_ERR(znd, "**WARNING** large discard cache %d", discards);
+	if (maps > 40)
+		Z_ERR(znd, "**WARNING** large map cache %d", maps);
+
+	znd->bmkeys->md_crc = crc_md_le16(znd->md_crcs, Z_CRC_4K << 1);
+	znd->bmkeys->discards = cpu_to_le16(discards);
+	znd->bmkeys->n_crcs = cpu_to_le16(maps + discards);
+	znd->bmkeys->maps = cpu_to_le16(maps);
+	znd->bmkeys->crc32 = 0;
+	znd->bmkeys->crc32 = cpu_to_le32(crc32c(~0u, znd->bmkeys, Z_CRC_4K));
+	if (cached < (BIO_MAX_PAGES - 3)) {
+		bio_add_km(bio, znd->z_sballoc, 1);
+		bio_add_km(bio, znd->md_crcs, 2);
+		more_data = 0;
+	}
+
+	if (unlikely(more_data)) {
+		bio = next_bio(bio, GFP_KERNEL, 3, znd->bio_set);
+		bio->bi_iter.bi_sector = lba << Z_SHFT4K;
+		bio->bi_bdev = znd->dev->bdev;
+		bio->bi_rw = WRITE;
+		bio->bi_iter.bi_size = 0;
+
+		n_writes++, n_blocks += cached;
+		cached = 0;
+
+		bio_add_km(bio, znd->z_sballoc, 1);
+		bio_add_km(bio, znd->md_crcs, 2);
+	}
+	cached += 3;
+
+	if (bio) {
+		bio->bi_rw |= WRITE_FLUSH_FUA;
+		rc = submit_bio_wait(bio->bi_rw, bio);
+		n_writes++, n_blocks += cached;
+	}
+
+	for (idx = 0; idx < wset_count; idx++) {
+		mc = wset[idx];
+		if (mc)
+			mcache_deref(mc);
+	}
+	mark_clean_flush(znd, 1);
+	Z_DBG(znd, "Sync/Flush: %d writes / %d blocks written [gen %"PRIx64"]",
+		n_writes, n_blocks, generation);
+out:
+	if (wset)
+		ZDM_FREE(znd, wset, sizeof(*wset) * SYNC_MAX, KM_18);
+
+	return rc;
 }
 
 /**
@@ -4468,6 +4604,8 @@ int find_superblock_at(struct zdm *znd, u64 lba, int use_wq, int do_init)
 	}
 	if (lba == 0)
 		lba++;
+
+	lba += WB_JRNL_BLKS;
 	do {
 		rc = read_block(ti, DM_IO_KMEM, data, lba, nblks, use_wq);
 		if (rc) {
@@ -4490,7 +4628,8 @@ int find_superblock_at(struct zdm *znd, u64 lba, int use_wq, int do_init)
 		if (data[0] == 0 && data[1] == 0) {
 			/* No SB here. */
 			Z_ERR(znd, "FGen: Invalid block %" PRIx64 "?", lba);
-			goto out;
+			if (count > 16)
+				goto out;
 		}
 		lba++;
 		count++;
@@ -4691,30 +4830,33 @@ static int do_load_cache(struct zdm *znd, int type, u64 lba, int idx, int wq)
 	__le16 crc;
 	int rc = 0;
 	int blks = 1;
-	struct map_cache *mcache = mcache_alloc(znd, NORMAL);
+	struct map_cache *mcache = mcache_alloc(znd, type, NORMAL);
+	struct map_cache_data *mcd;
 
 	if (!mcache) {
 		rc = -ENOMEM;
 		goto out;
 	}
 
-	rc = read_block(znd->ti, DM_IO_KMEM, mcache->jdata, lba, blks, wq);
+	mcd = get_mcd(mcache);
+	rc = read_block(znd->ti, DM_IO_KMEM, mcd, lba, blks, wq);
 	if (rc) {
 		Z_ERR(znd, "%s: mcache-> %" PRIu64
 			   " [%d blks] %p -> %d",
-		      __func__, lba, blks, mcache->jdata, rc);
+		      __func__, lba, blks, mcd, rc);
 
-		ZDM_FREE(znd, mcache->jdata, Z_C4K, PG_08);
+		ZDM_FREE(znd, mcd, Z_C4K, PG_08);
 		ZDM_FREE(znd, mcache, sizeof(*mcache), KM_07);
 		goto out;
 	}
-	crc = crc_md_le16(mcache->jdata, Z_CRC_4K);
+	crc = crc_md_le16(mcd, Z_CRC_4K);
 	if (crc != znd->bmkeys->crcs[idx]) {
 		rc = -EIO;
 		Z_ERR(znd, "%s: bad crc %" PRIu64,  __func__, lba);
 		goto out;
 	}
-	(void)le64_to_lba48(mcache->jdata[0].bval, &count);
+
+	(void)le64_to_lba48(mcd->header.bval, &count);
 	mcache->jcount = count;
 	mclist_add(znd, mcache, type);
 
@@ -4793,6 +4935,21 @@ static int z_mapped_init(struct zdm *znd)
 
 	memcpy(znd->bmkeys, io_vcache, sizeof(*znd->bmkeys));
 
+	/* read WB Journal map */
+	nblks = le32_to_cpu(znd->bmkeys->wb_blocks);
+	jrnl->size = nblks << 10;
+	rc = read_block(ti, DM_IO_KMEM, jrnl->wb, lba, nblks, wq);
+	if (rc)
+		goto out;
+
+	lba += nblks;
+	jrnl->wb_next = le32_to_cpu(znd->bmkeys->wb_next);
+	if (znd->bmkeys->wb_crc32 != crc32c_le32(~0u, jrnl->wb, jrnl->size)) {
+		rc = -EIO;
+		Z_ERR(znd, "WB Journal corrupt.");
+		goto out;
+	}
+
 	/* read in map cache */
 	for (idx = 0; idx < le16_to_cpu(znd->bmkeys->maps); idx++) {
 		rc = do_load_map_cache(znd, lba++, jcount++, wq);
@@ -4812,7 +4969,7 @@ static int z_mapped_init(struct zdm *znd)
 		lba++;
 
 	/* read in CRC pgs */
-	rc = read_block(ti, DM_IO_VMA, znd->md_crcs, lba, 2, wq);
+	rc = read_block(ti, DM_IO_KMEM, znd->md_crcs, lba, 2, wq);
 	if (rc)
 		goto out;
 
@@ -4882,18 +5039,6 @@ static int z_mapped_init(struct zdm *znd)
 	znd->z_gc_resv   = le32_to_cpu(znd->bmkeys->gc_resv);
 	znd->z_meta_resv = le32_to_cpu(znd->bmkeys->meta_resv);
 
-	lba = WB_JRNL_IDX;
-	nblks = jrnl->size >> 10;
-	rc = read_block(ti, DM_IO_VMA, jrnl->wb, lba, nblks, wq);
-	if (rc)
-		goto out;
-
-	jrnl->wb_next = le32_to_cpu(znd->bmkeys->wb_next);
-	if (znd->bmkeys->wb_crc32 != crc32c_le32(~0u, jrnl->wb, jrnl->size)) {
-		Z_ERR(znd, "WB Journal corrupt.");
-		goto out;
-	}
-
 	for (idx = 0; idx < jrnl->size; idx++) {
 		u64 blba;
 		u64 tlba;
@@ -4906,16 +5051,28 @@ static int z_mapped_init(struct zdm *znd)
 		blba = idx + WB_JRNL_BASE;
 		tlba = le32_to_cpu(jrnl->wb[idx]);
 
-		Z_ERR(znd, " .. restore map: %"PRIx64 " -> %"PRIx64,
-		      tlba, blba);
+		Z_ERR(znd, " .. redux map: %" PRIx64 " -> %"PRIx64, tlba, blba);
+		mcache_insert(znd, &znd->jrnl_map, tlba, blba);
+	}
 
-		/* Create the journal mcache entries */
-		do {
-			rc = z_to_journal_list(znd, tlba, blba, gfp);
-		} while (-EBUSY == rc);
+	for (idx = 0; idx < jrnl->size; idx++) {
+		static struct map_pg *expg;
+		u64 tlba;
 
-		if (rc)
+		if (jrnl->wb[idx] == MZTEV_UNUSED)
+			continue;
+		if (jrnl->wb[idx] == MZTEV_NF)
+			continue;
+
+		tlba = le32_to_cpu(jrnl->wb[idx]);
+		expg = get_map_entry(znd, tlba, gfp);
+		if (!expg)
 			goto out;
+
+		set_bit(IN_WB_JOURNAL, &expg->flags);
+		expg->last_write = idx + WB_JRNL_BASE;
+		pg_toggle_wb_journal(znd, expg);
+		put_map_entry(expg);
 	}
 
 out:
@@ -5016,10 +5173,12 @@ static __always_inline int _maybe_undrop(struct zdm *znd, struct map_pg *pg)
 		}
 		spin_unlock(&znd->lzy_lck);
 
+#if 0
 		if (!pg->data.addr)
-			Z_ERR(znd, "Undrop jrnl'd %"PRIx64, pg->lba);
+			Z_DBG(znd, "Undrop jrnl'd %"PRIx64, pg->lba);
 		else
 			Z_DBG(znd, "Undrop normal'd %"PRIx64, pg->lba);
+#endif
 
 		if (pg->data.addr && pg->hotness < MEM_PURGE_MSECS)
 			pg->hotness += MEM_HOT_BOOST_INC;
@@ -5335,12 +5494,11 @@ static int gc_post_add(struct zdm *znd, u64 addr, u64 lba)
 		return handled;
 
 	if (post->jcount < post->jsize) {
-		u16 idx = ++post->jcount;
+		struct gc_map_cache_data *data = post->mcd;
 
-		WARN_ON(post->jcount > post->jsize);
-
-		post->jdata[idx].tlba = lba48_to_le64(0, addr);
-		post->jdata[idx].bval = lba48_to_le64(0, lba);
+		data->maps[post->jcount].tlba = lba48_to_le64(0, addr);
+		data->maps[post->jcount].bval = lba48_to_le64(0, lba);
+		post->jcount++;
 		handled = 1;
 	} else {
 		Z_ERR(znd, "*CRIT* post overflow L:%" PRIx64 "-> S:%" PRIx64,
@@ -5476,52 +5634,52 @@ static int z_zone_gc_read(struct gc_state *gc_entry)
 	struct zdm *znd = gc_entry->znd;
 	struct io_4k_block *io_buf = znd->gc_io_buf;
 	struct map_cache *post = &znd->gc_postmap;
+	struct gc_map_cache_data *mcd = post->mcd;
 	unsigned long flags;
 	u64 start_lba;
 	int nblks;
 	int rcode = 0;
 	int fill = 0;
 	int jstart;
-	int jentry;
+	int idx;
 
 	spin_lock_irqsave(&znd->gc_lock, flags);
 	jstart = gc_entry->r_ptr;
 	spin_unlock_irqrestore(&znd->gc_lock, flags);
 
-	if (!jstart)
-		jstart++;
-
 	MutexLock(&post->cached_lock);
 
 	/* A discard may have puched holes in the postmap. re-sync lba */
-	jentry = jstart;
-	while (jentry <= post->jcount && (Z_LOWER48 ==
-			le64_to_lba48(post->jdata[jentry].bval, NULL))) {
-		jentry++;
+	idx = jstart;
+	while (idx < post->jcount &&
+	       Z_LOWER48 == le64_to_lba48(mcd->maps[idx].bval, NULL)) {
+		idx++;
 	}
 	/* nothing left to move */
-	if (jentry > post->jcount)
+	if (idx >= post->jcount)
 		goto out_finished;
 
 	/* skip over any discarded blocks */
-	if (jstart != jentry)
-		jstart = jentry;
+	if (jstart != idx)
+		jstart = idx;
 
-	start_lba = le64_to_lba48(post->jdata[jentry].bval, NULL);
-	post->jdata[jentry].bval = lba48_to_le64(GC_READ, start_lba);
+	/* schedule the first block */
+	start_lba = le64_to_lba48(mcd->maps[idx].bval, NULL);
+	mcd->maps[idx].bval = lba48_to_le64(GC_READ, start_lba);
 	nblks = 1;
-	jentry++;
+	idx++;
 
-	while (jentry <= post->jcount && (nblks+fill) < GC_MAX_STRIPE) {
-		u64 dm_s = le64_to_lba48(post->jdata[jentry].tlba, NULL);
-		u64 lba = le64_to_lba48(post->jdata[jentry].bval, NULL);
+	/* add any contiguous blocks */
+	while (idx < post->jcount && (nblks+fill) < GC_MAX_STRIPE) {
+		u64 dm_s = le64_to_lba48(mcd->maps[idx].tlba, NULL);
+		u64 lba = le64_to_lba48(mcd->maps[idx].bval, NULL);
 
 		if (Z_LOWER48 == dm_s || Z_LOWER48 == lba) {
-			jentry++;
+			idx++;
 			continue;
 		}
 
-		post->jdata[jentry].bval = lba48_to_le64(GC_READ, lba);
+		mcd->maps[idx].bval = lba48_to_le64(GC_READ, lba);
 
 		/* if the block is contiguous add it to the read */
 		if (lba == (start_lba + nblks)) {
@@ -5541,7 +5699,7 @@ static int z_zone_gc_read(struct gc_state *gc_entry)
 			start_lba = lba;
 			nblks = 1;
 		}
-		jentry++;
+		idx++;
 	}
 
 	/* Issue a copy of 'nblks' blocks */
@@ -5561,7 +5719,7 @@ out_finished:
 
 	spin_lock_irqsave(&znd->gc_lock, flags);
 	gc_entry->nblks = fill;
-	gc_entry->r_ptr = jentry;
+	gc_entry->r_ptr = idx;
 	if (fill > 0)
 		set_bit(DO_GC_WRITE, &gc_entry->gc_flags);
 	else
@@ -5586,21 +5744,19 @@ static int z_zone_gc_write(struct gc_state *gc_entry, u32 stream_id)
 	struct dm_target *ti = znd->ti;
 	struct io_4k_block *io_buf = znd->gc_io_buf;
 	struct map_cache *post = &znd->gc_postmap;
+	struct gc_map_cache_data *mcd = post->mcd;
 	unsigned long flags;
 	u32 aq_flags = Z_AQ_GC | Z_AQ_STREAM_ID | stream_id;
 	u64 lba;
 	u32 nblks;
 	u32 out = 0;
 	int err = 0;
-	int jentry;
+	int idx;
 
 	spin_lock_irqsave(&znd->gc_lock, flags);
-	jentry = gc_entry->w_ptr;
+	idx = gc_entry->w_ptr;
 	nblks = gc_entry->nblks;
 	spin_unlock_irqrestore(&znd->gc_lock, flags);
-
-	if (!jentry)
-		jentry++;
 
 	MutexLock(&post->cached_lock);
 	while (nblks > 0) {
@@ -5634,15 +5790,13 @@ static int z_zone_gc_write(struct gc_state *gc_entry, u32 stream_id)
 		}
 		out += nfound;
 
-		while ((jentry <= post->jcount) && (added < nfound)) {
+		while ((idx < post->jcount) && (added < nfound)) {
 			u16 rflg;
-			u64 orig = le64_to_lba48(
-					post->jdata[jentry].bval, &rflg);
-			u64 dm_s = le64_to_lba48(
-					post->jdata[jentry].tlba, NULL);
+			u64 orig = le64_to_lba48(mcd->maps[idx].bval, &rflg);
+			u64 dm_s = le64_to_lba48(mcd->maps[idx].tlba, NULL);
 
 			if ((Z_LOWER48 == dm_s || Z_LOWER48 == orig)) {
-				jentry++;
+				idx++;
 
 				if (rflg & GC_READ) {
 					Z_ERR(znd, "ERROR: %" PRIx64
@@ -5654,10 +5808,10 @@ static int z_zone_gc_write(struct gc_state *gc_entry, u32 stream_id)
 				continue;
 			}
 			rflg &= ~GC_READ;
-			post->jdata[jentry].bval = lba48_to_le64(rflg, lba);
+			mcd->maps[idx].bval = lba48_to_le64(rflg, lba);
 			lba++;
 			added++;
-			jentry++;
+			idx++;
 		}
 		nblks -= nfound;
 	}
@@ -5667,7 +5821,7 @@ static int z_zone_gc_write(struct gc_state *gc_entry, u32 stream_id)
 out:
 	spin_lock_irqsave(&znd->gc_lock, flags);
 	gc_entry->nblks = 0;
-	gc_entry->w_ptr = jentry;
+	gc_entry->w_ptr = idx;
 	spin_unlock_irqrestore(&znd->gc_lock, flags);
 	mutex_unlock(&post->cached_lock);
 
@@ -5686,22 +5840,23 @@ static int gc_finalize(struct gc_state *gc_entry)
 	int err = 0;
 	struct zdm *znd = gc_entry->znd;
 	struct map_cache *post = &znd->gc_postmap;
-	int jentry;
+	struct gc_map_cache_data *mcd = post->mcd;
+	int idx;
 
 	MutexLock(&post->cached_lock);
-	for (jentry = post->jcount; jentry > 0; jentry--) {
-		u64 dm_s = le64_to_lba48(post->jdata[jentry].tlba, NULL);
-		u64 lba = le64_to_lba48(post->jdata[jentry].bval, NULL);
+	for (idx = 0; idx < post->jcount; idx++) {
+		u64 dm_s = le64_to_lba48(mcd->maps[idx].tlba, NULL);
+		u64 lba = le64_to_lba48(mcd->maps[idx].bval, NULL);
 
 		if (dm_s != Z_LOWER48 || lba != Z_LOWER48) {
 			Z_ERR(znd, "GC: Failed to move %" PRIx64
 				   " from %"PRIx64" [%d]",
-			      dm_s, lba, jentry);
+			      dm_s, lba, idx);
 			err = -EIO;
 		}
 	}
 	mutex_unlock(&post->cached_lock);
-	post->jcount = jentry;
+	post->jcount = 0;
 	post->jsorted = 0;
 
 	return err;
@@ -5748,16 +5903,17 @@ static int z_zone_gc_metadata_update(struct gc_state *gc_entry)
 {
 	struct zdm *znd = gc_entry->znd;
 	struct map_cache *post = &znd->gc_postmap;
+	struct gc_map_cache_data *mcd = post->mcd;
 	u32 used = post->jcount;
 	int err = 0;
-	int jentry;
+	int idx;
 
-	for (jentry = post->jcount; jentry > 0; jentry--) {
+	for (idx = 0; idx < post->jcount; idx++) {
 		int discard = 0;
 		int mapping = 0;
 		struct map_pg *mapped = NULL;
-		u64 dm_s = le64_to_lba48(post->jdata[jentry].tlba, NULL);
-		u64 lba = le64_to_lba48(post->jdata[jentry].bval, NULL);
+		u64 dm_s = le64_to_lba48(mcd->maps[idx].tlba, NULL);
+		u64 lba = le64_to_lba48(mcd->maps[idx].bval, NULL);
 		struct mpinfo mpi;
 
 		if ((znd->s_base <= dm_s) && (dm_s < znd->md_end)) {
@@ -5799,14 +5955,14 @@ static int z_zone_gc_metadata_update(struct gc_state *gc_entry)
 		MutexLock(&post->cached_lock);
 		if (discard == 1) {
 			Z_ERR(znd, "Dropped: %" PRIx64 " ->  %"PRIx64,
-			      le64_to_cpu(post->jdata[jentry].tlba),
-			      le64_to_cpu(post->jdata[jentry].bval));
+			      le64_to_cpu(mcd->maps[idx].tlba),
+			      le64_to_cpu(mcd->maps[idx].bval));
 
-			post->jdata[jentry].tlba = MC_INVALID;
-			post->jdata[jentry].bval = MC_INVALID;
+			mcd->maps[idx].tlba = MC_INVALID;
+			mcd->maps[idx].bval = MC_INVALID;
 		}
-		if (post->jdata[jentry].tlba  == MC_INVALID &&
-		    post->jdata[jentry].bval == MC_INVALID) {
+		if (mcd->maps[idx].tlba  == MC_INVALID &&
+		    mcd->maps[idx].bval == MC_INVALID) {
 			used--;
 		} else if (lba) {
 			increment_used_blks(znd, lba, 1);
@@ -6726,34 +6882,34 @@ out:
 }
 
 /**
- * cmp_current_lba() - Compare map page on lba.
+ * wset_cmp_wr() - Compare map page on lba.
  * @x1: map page
  * @x2: map page
  *
  * Return -1, 0, or 1 if x1 < x2, equal, or >, respectivly.
  */
-static int cmp_current_lba(const void *x1, const void *x2)
+static int wset_cmp_wr(const void *x1, const void *x2)
 {
 	const struct map_pg *v1 = *(const struct map_pg **)x1;
 	const struct map_pg *v2 = *(const struct map_pg **)x2;
-	int cmp = (v1->last_write < v2->last_write) ? -1
-	        : ((v1->last_write > v2->last_write) ? 1 : 0);
+	int cmp = (v1->lba < v2->lba) ? -1 : ((v1->lba > v2->lba) ? 1 : 0);
 
 	return cmp;
 }
 
 /**
- * compare_lba() - Compare map page on lba.
+ * wset_cmp_rd() - Compare map page on lba.
  * @x1: map page
  * @x2: map page
  *
  * Return -1, 0, or 1 if x1 < x2, equal, or >, respectivly.
  */
-static int compare_lba(const void *x1, const void *x2)
+static int wset_cmp_rd(const void *x1, const void *x2)
 {
 	const struct map_pg *v1 = *(const struct map_pg **)x1;
 	const struct map_pg *v2 = *(const struct map_pg **)x2;
-	int cmp = (v1->lba < v2->lba) ? -1 : ((v1->lba > v2->lba) ? 1 : 0);
+	int cmp = (v1->last_write < v2->last_write) ? -1
+		: ((v1->last_write > v2->last_write) ? 1 : wset_cmp_wr(x1, x2));
 
 	return cmp;
 }
@@ -6789,7 +6945,7 @@ static __always_inline int is_old_and_clean(struct map_pg *expg, int bit_type)
 		if (getref_pg(expg) == 1)
 			is_match = 1;
 		else
-			pr_err("%"PRIu64": dirty, exp, and elev: %d\n",
+			pr_err("%"PRIx64": dirty, exp, and elev: %d\n",
 				expg->lba, getref_pg(expg));
 	}
 
@@ -6818,7 +6974,8 @@ static int _pool_write(struct zdm *znd, struct map_pg **wset, int count)
 	if (count <= 0)
 		goto out;
 
-	sort(wset, count, sizeof(*wset), compare_lba, NULL);
+	if (count > 1)
+		sort(wset, count, sizeof(*wset), wset_cmp_wr, NULL);
 
 	for (iter = 0; iter < count; iter++) {
 		expg = wset[iter];
@@ -6837,6 +6994,7 @@ static int _pool_write(struct zdm *znd, struct map_pg **wset, int count)
 		expg = wset[iter];
 		if (expg) {
 			err = write_if_dirty(znd, expg, use_wq, sync);
+			deref_pg(expg);
 			if (err) {
 				Z_ERR(znd, "Write failed: %d", err);
 				goto out;
@@ -6862,17 +7020,19 @@ static int _pool_read(struct zdm *znd, struct map_pg **wset, int count)
 {
 	int iter;
 	struct map_pg *expg;
+	struct map_pg *prev = NULL;
 	int err = 0;
 
 	/* write dirty table pages */
 	if (count <= 0)
 		goto out;
 
-	sort(wset, count, sizeof(*wset), cmp_current_lba, NULL);
+	if (count > 1)
+		sort(wset, count, sizeof(*wset), wset_cmp_rd, NULL);
 
 	for (iter = 0; iter < count; iter++) {
 		expg = wset[iter];
-		if (expg && test_and_clear_bit(WB_RE_CACHE, &expg->flags)) {
+		if (expg) {
 			if (!expg->data.addr) {
 				gfp_t gfp = GFP_KERNEL;
 				struct mpinfo mpi;
@@ -6883,11 +7043,14 @@ static int _pool_read(struct zdm *znd, struct map_pg **wset, int count)
 				if (rc < 0 && rc != -EBUSY)
 					znd->meta_result = rc;
 			}
-			if (expg->last_write && expg->lba != expg->last_write) {
-				set_bit(IS_DIRTY, &expg->flags);
-				clear_bit(IS_FLUSH, &expg->flags);
-			}
+			set_bit(IS_DIRTY, &expg->flags);
+			clear_bit(IS_FLUSH, &expg->flags);
+			deref_pg(expg);
 		}
+		if (prev && expg == prev)
+			Z_ERR(znd, "Dupe %"PRIx64" in pool_read list.",
+			      expg->lba);
+		prev = expg;
 	}
 
 out:
@@ -6895,17 +7058,96 @@ out:
 }
 
 /**
+ * md_journal_add_map() - Add an entry to the map cache block mapping.
+ * @znd: ZDM Instance
+ * @addr: Address being added to journal.
+ * @lba: bLBA addr is being mapped to (0 to delete the map)
+ *
+ * Add a new journal wb entry.
+ */
+static int md_journal_add_map(struct zdm *znd, u64 addr, u64 lba)
+{
+	struct map_cache *mcache = &znd->jrnl_map;
+	struct jrnl_map_cache_data *mcd = mcache->mcd;
+	struct md_journal *jrnl = &znd->jrnl;
+	int err = 0;
+	int next;
+	int skip;
+	int found = 0;
+	u32 entry;
+
+	if (addr < znd->data_lba) {
+		entry = lba - WB_JRNL_BASE;
+		SpinLock(&jrnl->wb_alloc);
+		for (next = 0; next < jrnl->size; next++) {
+			if (le32_to_cpu(jrnl->wb[next]) == addr) {
+				jrnl->wb[next] = MZTEV_UNUSED;
+				if (jrnl->in_use > 0)
+					jrnl->in_use--;
+			}
+			if (entry == next) {
+				jrnl->wb[entry] = cpu_to_le32((u32)addr);
+			}
+		}
+		spin_unlock(&jrnl->wb_alloc);
+
+		MutexLock(&mcache->cached_lock);
+		found = 0;
+		skip = 0;
+		for (next = 0; next < mcache->jcount; next++) {
+			struct map_cache_entry *mce = &mcd->maps[next];
+			u64 tlba = le64_to_lba48(mce->tlba, NULL);
+			int to = next - skip;
+
+			if (to != next)
+				memcpy(&mcd->maps[to], mce, sizeof(*mce));
+
+			if (tlba == addr) {
+				if (!found && lba)
+					mcd->maps[to].bval =
+						lba48_to_le64(0, lba);
+				else
+					skip++;
+				found++;
+				if (found > 1) {
+					Z_ERR(znd,
+						"WB Journal Map "
+						"... dupe %llx @ %d",
+						addr, to);
+				}
+			}
+		}
+		if (mcache->jsorted == mcache->jcount)
+			mcache->jsorted -= skip;
+		mcache->jcount -= skip;
+
+		if (lba && !found) {
+			/* add a new map */
+			if (mcache->jcount < mcache->jsize) {
+				mcache_insert(znd, mcache, addr, lba);
+			} else {
+				Z_ERR(znd, "WB Journal Map ... out of space");
+			}
+		}
+		mutex_unlock(&mcache->cached_lock);
+	}
+
+	return err;
+}
+
+/**
  * journal_alloc() - Grab the next available LBA for the journal.
  * @znd: ZDM Instance
+ * @addr: Address being reserved.
  * @nblks: Number of blocks desired.
  * @num: Number of blocks allocated.
  *
  * Return: lba or 0 on failure.
  */
-static u64 journal_alloc(struct zdm *znd, u32 nblks, u32 *num)
+static u64 journal_alloc(struct zdm *znd, u64 addr, u32 nblks, u32 *num)
 {
 	struct md_journal *jrnl = &znd->jrnl;
-	u64 tlba = 0ul;
+	u64 blba = 0ul;
 	u32 next;
 	int retry = 2;
 
@@ -6916,7 +7158,7 @@ static u64 journal_alloc(struct zdm *znd, u32 nblks, u32 *num)
 			if (jrnl->wb[next] != MZTEV_UNUSED)
 				continue;
 
-			tlba = WB_JRNL_BASE + next;
+			blba = WB_JRNL_BASE + next;
 			jrnl->wb[next] = MZTEV_NF; /* in flight */
 			jrnl->in_use++;
 			jrnl->wb_next = next + 1;
@@ -6924,15 +7166,24 @@ static u64 journal_alloc(struct zdm *znd, u32 nblks, u32 *num)
 			goto out_unlock;
 		}
 		next = 0;
-	} while (tlba == 0 && --retry > 0);
+	} while (blba == 0 && --retry > 0);
 
 out_unlock:
+
+//	for (next = 0; next < jrnl->size; next++) {
+//		if (le32_to_cpu(jrnl->wb[next]) == addr) {
+//			Z_ERR(znd, "DUPE: %llx at %lx",
+//				addr, next + WB_JRNL_BASE);
+//			jrnl->wb[next] = MZTEV_UNUSED;
+//		}
+//	}
+
 	spin_unlock(&jrnl->wb_alloc);
 
 	if ((jrnl->in_use * 100 / jrnl->size) > 50)
 		set_bit(DO_SYNC, &znd->flags);
 
-	return tlba;
+	return blba;
 }
 
 /**
@@ -6957,7 +7208,7 @@ static u64 z_metadata_lba(struct zdm *znd, struct map_pg *map, u32 *num)
 	if (map->lba < znd->data_lba) {
 		if (test_bit(WB_JRNL_1, &map->flags) ||
 		    test_bit(WB_JRNL_2, &map->flags)) {
-			u64 jrnl_lba = journal_alloc(znd, nblks, num);
+			u64 jrnl_lba = journal_alloc(znd, map->lba, nblks, num);
 
 			if (!jrnl_lba) {
 				Z_ERR(znd, "Out of MD journal space?");
@@ -7029,6 +7280,32 @@ static void pg_update_crc(struct zdm *znd, struct map_pg *pg, __le16 md_crc)
 	}
 }
 
+/**
+ * pg_journal_entry() - Add journal entry and flag in journal status.
+ * @znd: ZDM Instance
+ * @pg: The page of lookup table [or CRC] that was written.
+ */
+static int pg_journal_entry(struct zdm *znd, struct map_pg *pg)
+{
+	int rcode = 0;
+
+	if (pg->lba < znd->data_lba) {
+		u64 blba = 0ul; /* if not in journal clean map entry */
+
+		if (test_bit(WB_JRNL_1, &pg->flags) ||
+		    test_bit(WB_JRNL_2, &pg->flags)) {
+			blba = pg->last_write;
+			set_bit(IN_WB_JOURNAL, &pg->flags);
+		} else {
+			clear_bit(IN_WB_JOURNAL, &pg->flags);
+		}
+
+		rcode = md_journal_add_map(znd, pg->lba, blba);
+		if (rcode)
+			Z_ERR(znd, "%s: MD Journal failed.", __func__);
+	}
+	return rcode;
+}
 
 /**
  * pg_written() - Handle accouting related to lookup table page writes
@@ -7036,7 +7313,6 @@ static void pg_update_crc(struct zdm *znd, struct map_pg *pg, __le16 md_crc)
  * @error: non-zero if an error occurred.
  *
  * callback from dm_io notify.. cannot hold mutex here, cannot sleep.
- *
  */
 static int pg_written(struct map_pg *pg, unsigned long error)
 {
@@ -7067,22 +7343,14 @@ static int pg_written(struct map_pg *pg, unsigned long error)
 	clear_bit(W_IN_FLIGHT, &pg->flags);
 	pg_update_crc(znd, pg, md_crc);
 
+	rcode = pg_journal_entry(znd, pg);
+	if (rcode)
+		goto out;
+
 /*
  * NOTE: If we reach here it's a problem.
  *       TODO: mutex free path for adding a map entry ...
  */
-
-	if (pg->lba < znd->data_lba) {
-		u64 blba = 0ul;
-
-		if (test_bit(WB_JRNL_1, &pg->flags) ||
-		    test_bit(WB_JRNL_2, &pg->flags))
-			blba = pg->last_write;
-
-		rcode = md_journal_add_map(znd, pg->lba, blba, CRIT);
-		if (rcode)
-			goto out;
-	}
 
 	if (pg->last_write < znd->data_lba)
 		goto out;
@@ -7098,7 +7366,6 @@ static int pg_written(struct map_pg *pg, unsigned long error)
 out:
 	return rcode;
 }
-
 
 /**
  * on_pg_written() - A block of map table was written.
@@ -7136,7 +7403,7 @@ static int queue_pg(struct zdm *znd, struct map_pg *pg, u64 lba)
 	mutex_unlock(&pg->md_lock);
 
 	rc = znd_async_io(znd, DM_IO_KMEM, pg->data.addr, block, nDMsect,
-			  REQ_OP_WRITE, 0, use_wq, on_pg_written, pg);
+			  WRITE, 0, use_wq, on_pg_written, pg);
 	if (rc) {
 		Z_ERR(znd, "queue error: %d Q: %" PRIx64 " [%u dm sect] (Q:%d)",
 		      rc, lba, nDMsect, use_wq);
@@ -7221,20 +7488,13 @@ static int write_if_dirty(struct zdm *znd, struct map_pg *pg, int wq, int snc)
 		if (crc_md_le16(pg->data.addr, Z_CRC_4K) == md_crc)
 			clear_bit(IS_DIRTY, &pg->flags);
 		clear_bit(W_IN_FLIGHT, &pg->flags);
-		if (lba < znd->data_lba) {
-			u64 blba = 0ul; /* if not in journal clean map entry */
 
-			if (test_bit(WB_JRNL_1, &pg->flags) ||
-			    test_bit(WB_JRNL_2, &pg->flags))
-				blba = lba;
-
-			rcwrt = md_journal_add_map(znd, dm_s, blba, NORMAL);
-			if (rcwrt) {
-				Z_ERR(znd, "%s: MD Journal failed.", __func__);
-				rcode = rcwrt;
-			}
+		rcode = pg_journal_entry(znd, pg);
+		if (rcode)
 			goto out;
-		}
+
+		if (pg->lba < znd->data_lba)
+			goto out;
 
 		rcwrt = z_mapped_addmany(znd, dm_s, lba, nf, NORMAL);
 		if (rcwrt) {
@@ -7273,7 +7533,6 @@ static int _sync_dirty(struct zdm *znd, int bit_type, int sync, int drop)
 {
 	int err = 0;
 	int entries = 0;
-	int want_flush = 0;
 	struct map_pg *expg = NULL;
 	struct map_pg *_tpg;
 	struct map_pg **wset = NULL;
@@ -7296,8 +7555,17 @@ static int _sync_dirty(struct zdm *znd, int bit_type, int sync, int drop)
 	while (&expg->zltlst != &znd->zltpool) {
 		ref_pg(expg);
 
-		if (sync && (entries < MAX_WSET) && is_dirty(expg, bit_type)) {
-			wset[entries++] = expg;
+		if (test_and_clear_bit(WB_RE_CACHE, &expg->flags)) {
+			set_bit(IS_DIRTY, &expg->flags);
+			clear_bit(IS_FLUSH, &expg->flags);
+		}
+
+		if (sync && is_dirty(expg, bit_type)) {
+			if (entries < MAX_WSET) {
+				ref_pg(expg);
+				wset[entries] = expg;
+				entries++;
+			}
 		} else if ((drop > 0) && is_old_and_clean(expg, bit_type)) {
 			int is_lut = test_bit(IS_LUT, &expg->flags);
 			spinlock_t *lock;
@@ -7313,8 +7581,8 @@ static int _sync_dirty(struct zdm *znd, int bit_type, int sync, int drop)
 					  + msecs_to_jiffies(expg->hotness);
 
 				if (test_bit(IS_LAZY, &expg->flags))
-					Z_ERR(znd, "** Pg is lazy && zlt %"PRIx64"",
-						expg->lba);
+					Z_ERR(znd, "** Pg is lazy && zlt %"
+					      PRIx64, expg->lba);
 
 				if (!test_bit(IS_LAZY, &expg->flags)) {
 					list_add(&expg->lazy, &droplist);
@@ -7351,8 +7619,6 @@ writeback:
 	}
 
 out:
-	if (want_flush)
-		set_bit(DO_FLUSH, &znd->flags);
 	if (!list_empty(&droplist))
 		lazy_pool_splice(znd, &droplist);
 
@@ -7550,6 +7816,7 @@ static int read_pg(struct zdm *znd, struct map_pg *pg, u64 lba48, gfp_t gfp,
 		      pg->lba, lba48,
 		      le16_to_cpu(check),
 		      le16_to_cpu(expect));
+		dump_stack();
 	}
 	rcode = 1;
 
@@ -7735,9 +8002,9 @@ static int move_to_map_tables(struct zdm *znd, struct map_cache *mcache)
 	struct map_pg *rmtbl = NULL;
 	struct map_addr maddr = { .dm_s = 0ul };
 	struct map_addr rev = { .dm_s = 0ul };
+	struct map_cache_data *mcd = get_mcd(mcache);
 	u64 lut_s = BAD_ADDR;
 	u64 lut_r = BAD_ADDR;
-	int jentry;
 	int err = 0;
 	int is_fwd = 1;
 
@@ -7746,12 +8013,15 @@ static int move_to_map_tables(struct zdm *znd, struct map_cache *mcache)
 	 * page the search devolves to a linear lookup.
 	 */
 	mcache_busy(mcache);
-	for (jentry = mcache->jcount; jentry > 0;) {
-		u64 dm_s = le64_to_lba48(mcache->jdata[jentry].tlba, NULL);
-		u64 lba = le64_to_lba48(mcache->jdata[jentry].bval, NULL);
+	while (mcache->jcount > 0) {
+		int idx = mcache->jcount - 1;
+		u64 dm_s = le64_to_lba48(mcd->maps[idx].tlba, NULL);
+		u64 lba = le64_to_lba48(mcd->maps[idx].bval, NULL);
 
 		if (dm_s == Z_LOWER48 || lba == Z_LOWER48) {
-			mcache->jcount = --jentry;
+			if (mcache->jsorted == mcache->jcount)
+				mcache->jsorted--;
+			mcache->jcount--;
 			continue;
 		}
 
@@ -7803,11 +8073,11 @@ static int move_to_map_tables(struct zdm *znd, struct map_cache *mcache)
 		if (err < 0)
 			goto out;
 
-		mcache->jdata[jentry].tlba = MC_INVALID;
-		mcache->jdata[jentry].bval = MC_INVALID;
+		mcd->maps[idx].tlba = MC_INVALID;
+		mcd->maps[idx].bval = MC_INVALID;
 		if (mcache->jsorted == mcache->jcount)
 			mcache->jsorted--;
-		mcache->jcount = --jentry;
+		mcache->jcount--;
 	}
 out:
 	if (smtbl)
@@ -7917,7 +8187,7 @@ static int unused_phy(struct zdm *znd, u64 lba, u64 orig_s, gfp_t gfp)
 		if ((wp & Z_WP_VALUE_MASK) == Z_BLKSZ)
 			znd->discard_count++;
 	} else {
-		Z_DBG(znd, "lba: %" PRIx64 " alread reported as free?", lba);
+		Z_DBG(znd, "lba: %" PRIx64 " already reported as free?", lba);
 	}
 
 out_unlock:

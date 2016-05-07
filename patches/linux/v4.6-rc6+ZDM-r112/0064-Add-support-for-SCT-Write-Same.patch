@@ -1,0 +1,326 @@
+From 3390d6a9207a63510c4cb8924835f0f4b0518283 Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Sat, 7 May 2016 02:16:58 -0500
+Subject: [PATCH 64/64] Add support for SCT Write Same
+
+Since the Write Same command was deprecated and moved to
+an SCT feature ATA drives have not supported Write Same
+in Linux.
+
+On the current SMR drives support is being added to report
+TRIM/DISCARD/UNMAP support via Reset WP. However Reset WP
+is not available for the conventional zones. Write Same is
+the preferred fallback for UNMAP to maintain the
+'Discard returns 0s' contract.
+
+Restore Write Same support by translating SCSI Write Same to
+SCT Write Same for drives which support it.
+
+Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
+---
+ drivers/ata/libata-scsi.c  | 39 ++++++++++++++++++++++++
+ drivers/scsi/sd.c          | 75 +++++++++++++++++++++++++++++++++++++---------
+ include/linux/ata.h        | 43 ++++++++++++++++++++++++++
+ include/scsi/scsi_device.h |  1 +
+ 4 files changed, 144 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/ata/libata-scsi.c b/drivers/ata/libata-scsi.c
+index b86af14..34ae4a0 100644
+--- a/drivers/ata/libata-scsi.c
++++ b/drivers/ata/libata-scsi.c
+@@ -3305,6 +3305,45 @@ static unsigned int ata_scsi_write_same_xlat(struct ata_queued_cmd *qc)
+ 		goto invalid_param_len;
+ 
+ 	buf = page_address(sg_page(scsi_sglist(scmd)));
++
++	if (ata_id_sct_write_same(dev->id))
++	{
++		u16 *sctpg = buf;
++
++		put_unaligned_le16(0x0002,  &sctpg[0]); /* SCT_ACT_WRITE_SAME */
++		put_unaligned_le16(0x0101,  &sctpg[1]); /* WRITE PTRN FG */
++		put_unaligned_le64(block,   &sctpg[2]);
++		put_unaligned_le64(n_block, &sctpg[6]);
++		put_unaligned_le32(0u,      &sctpg[10]);
++
++		tf->hob_feature = 0;
++		tf->feature = 0;
++		tf->hob_nsect = 0;
++		tf->nsect = 1;
++		tf->lbah = 0;
++		tf->lbam = 0;
++		tf->lbal = ATA_CMD_STANDBYNOW1;
++		tf->hob_lbah = 0;
++		tf->hob_lbam = 0;
++		tf->hob_lbal = 0;
++		tf->device = ATA_CMD_STANDBYNOW1;
++		tf->protocol = ATA_PROT_DMA;
++		tf->command = ATA_CMD_WRITE_LOG_DMA_EXT;
++
++#if 0
++		if (ata_ncq_enabled(dev)) {
++			tf->protocol = ATA_PROT_NCQ;
++			tf->command = ATA_CMD_WRITE_LOG_EXT;
++		}
++#endif
++		tf->flags |= ATA_TFLAG_ISADDR | ATA_TFLAG_DEVICE |
++			     ATA_TFLAG_LBA48 | ATA_TFLAG_WRITE;
++
++		ata_qc_set_pc_nbytes(qc);
++
++		return 0;
++	}
++
+ 	size = ata_set_lba_range_entries(buf, 512, block, n_block);
+ 
+ 	if (ata_ncq_enabled(dev) && ata_fpdma_dsm_supported(dev)) {
+diff --git a/drivers/scsi/sd.c b/drivers/scsi/sd.c
+index 2fba4fb..4a26774 100644
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -781,7 +781,6 @@ static int sd_setup_discard_cmnd(struct scsi_cmnd *cmd)
+ 		cmd->cmnd[1] = 0x8; /* UNMAP */
+ 		put_unaligned_be64(sector, &cmd->cmnd[2]);
+ 		put_unaligned_be32(nr_sectors, &cmd->cmnd[10]);
+-
+ 		len = sdkp->device->sector_size;
+ 		break;
+ 
+@@ -801,6 +800,19 @@ static int sd_setup_discard_cmnd(struct scsi_cmnd *cmd)
+ #ifdef CONFIG_SCSI_ZBC
+ 		zone = blk_lookup_zone(rq->q, sector);
+ 		if (!zone) {
++			sd_printk(KERN_INFO, sdkp,
++				  "No zone for sector %zu\n", sector);
++			if (sector && sdkp->zoned == 1) {
++				/* this is the HostAware runt zone */
++				cmd->cmd_len = 16;
++				cmd->cmnd[0] = ZBC_OUT;
++				cmd->cmnd[1] = ZO_RESET_WRITE_POINTER;
++				put_unaligned_be64(sector, &cmd->cmnd[2]);
++				/* Reset Write Pointer doesn't have a payload */
++				len = 0;
++				cmd->sc_data_direction = DMA_NONE;
++				break;
++			}
+ 			ret = BLKPREP_KILL;
+ 			goto out;
+ 		}
+@@ -815,29 +827,47 @@ static int sd_setup_discard_cmnd(struct scsi_cmnd *cmd)
+ 		}
+ 		if (!blk_zone_is_smr(zone)) {
+ 			sd_printk(KERN_INFO, sdkp,
+-				  "Discarding %s zone %zu/%zu\n",
++				  "Discarding %s zone %zx/%zx\n",
+ 				  blk_zone_is_cmr(zone) ? "CMR" : "unknown",
+ 				  zone->start, zone->len);
+ 			spin_unlock_irqrestore(&zone->lock, flags);
+ 
+ 			if (blk_zone_is_cmr(zone) &&
+-			    nr_sectors < sdkp->max_ws_blocks) {
++			    nr_sectors < sdkp->max_ws_blocks &&
++			     (sdp->sct_write_same || !sdp->no_write_same)) {
++				u16 *sctpg;
++
+ 				page = alloc_page(GFP_ATOMIC | __GFP_ZERO);
+ 				if (!page)
+ 					return BLKPREP_DEFER;
+ 
+ 				sd_printk(KERN_INFO, sdkp,
+-					  "Discardi CMR -> Write Same 16\n");
+-				sd_printk(KERN_INFO, sdkp,
+-					  "Write Same Z:%zx/%zx len %zx/%x\n",
+-					  zone->start, zone->len,
++					  "  ... -> Write Same %zx/%x\n",
+ 					  sector, nr_sectors);
+ 
+ 				cmd->cmd_len = 16;
+ 				cmd->cmnd[0] = WRITE_SAME_16;
+ 				put_unaligned_be64(sector, &cmd->cmnd[2]);
+ 				put_unaligned_be32(nr_sectors, &cmd->cmnd[10]);
+-
++				len = sdkp->device->sector_size;
++				ret = BLKPREP_OK;
++				if (!sdp->sct_write_same)
++					break;
++
++				sctpg = page_address(page);
++				memset(&cmd->cmnd[0], 0, 16);
++				cmd->cmnd[0] = ATA_16;
++				cmd->cmnd[1] = (5 << 1);
++				cmd->cmnd[2] = 0x02;
++				cmd->cmnd[6] = 1;
++				cmd->cmnd[8] = ATA_CMD_STANDBYNOW1;
++				cmd->cmnd[13] = ATA_CMD_STANDBYNOW1;
++				cmd->cmnd[14] = ATA_CMD_WRITE_LOG_DMA_EXT;
++				put_unaligned_le16(0x0002, &sctpg[0]);
++				put_unaligned_le16(0x0101, &sctpg[1]);
++				put_unaligned_le64(sector, &sctpg[2]);
++				put_unaligned_le64(nr_sectors, &sctpg[6]);
++				put_unaligned_le32(0u, &sctpg[10]);
+ 				len = sdkp->device->sector_size;
+ 				ret = BLKPREP_OK;
+ 				break;
+@@ -912,7 +942,7 @@ static void sd_config_write_same(struct scsi_disk *sdkp)
+ 	struct request_queue *q = sdkp->disk->queue;
+ 	unsigned int logical_block_size = sdkp->device->sector_size;
+ 
+-	if (sdkp->device->no_write_same) {
++	if (sdkp->device->no_write_same && !sdkp->device->sct_write_same) {
+ 		sdkp->max_ws_blocks = 0;
+ 		goto out;
+ 	}
+@@ -961,7 +991,7 @@ static int sd_setup_write_same_cmnd(struct scsi_cmnd *cmd)
+ 
+ 	BUG_ON(bio_offset(bio) || bio_iovec(bio).bv_len != sdp->sector_size);
+ 
+-	if (sdkp->zoned == 1 || sdp->type == TYPE_ZBC) {
++	if (sdp->type == TYPE_ZBC) {
+ 		/* sd_zbc_lookup_zone lba is in block layer sector units */
+ 		ret = sd_zbc_lookup_zone(sdkp, rq, sector, nr_sectors);
+ 		if (ret != BLKPREP_OK)
+@@ -1087,7 +1117,7 @@ static int sd_setup_read_write_cmnd(struct scsi_cmnd *SCpnt)
+ 	SCSI_LOG_HLQUEUE(2, scmd_printk(KERN_INFO, SCpnt, "block=%llu\n",
+ 					(unsigned long long)block));
+ 
+-	if (sdkp->zoned == 1 || sdp->type == TYPE_ZBC) {
++	if (sdp->type == TYPE_ZBC) {
+ 		/* sd_zbc_lookup_zone lba is in block layer sector units */
+ 		ret = sd_zbc_lookup_zone(sdkp, rq, block, this_count);
+ 		if (ret != BLKPREP_OK)
+@@ -2020,6 +2050,7 @@ static int sd_done(struct scsi_cmnd *SCpnt)
+ 	unsigned int good_bytes = result ? 0 : scsi_bufflen(SCpnt);
+ 	struct scsi_sense_hdr sshdr;
+ 	struct scsi_disk *sdkp = scsi_disk(SCpnt->request->rq_disk);
++	struct scsi_device *sdp = sdkp->device;
+ 	struct request *req = SCpnt->request;
+ 	int sense_valid = 0;
+ 	int sense_deferred = 0;
+@@ -2036,7 +2067,8 @@ static int sd_done(struct scsi_cmnd *SCpnt)
+ 				/* RESET WRITE POINTER failed */
+ 				sd_zbc_update_zones(sdkp,
+ 						    blk_rq_pos(req),
+-						    512, SD_ZBC_RESET_WP_ERR);
++						    (1<<14),
++						    SD_ZBC_RESET_WP_ERR);
+ 
+ 			good_bytes = 0;
+ 			scsi_set_resid(SCpnt, blk_rq_bytes(req));
+@@ -2114,10 +2146,10 @@ static int sd_done(struct scsi_cmnd *SCpnt)
+ 			 * ZBC: Unaligned write command.
+ 			 * Write did not start a write pointer position.
+ 			 */
+-			if (sshdr.ascq == 0x04)
++			if (sshdr.ascq == 0x04 && sdp->type == TYPE_ZBC)
+ 				sd_zbc_update_zones(sdkp,
+ 						    blk_rq_pos(req),
+-						    512, SD_ZBC_WRITE_ERR);
++						    (1<<14), SD_ZBC_WRITE_ERR);
+ 		}
+ 		break;
+ 	default:
+@@ -3162,6 +3194,20 @@ static void sd_read_write_same(struct scsi_disk *sdkp, unsigned char *buffer)
+ 		sdkp->ws10 = 1;
+ }
+ 
++static void sd_read_sct_write_same(struct scsi_disk *sdkp,
++				   unsigned char *buffer)
++{
++	struct scsi_device *sdev = sdkp->device;
++
++	/* buf size is 512, page is 60 + 512, we need page 206 */
++	if (!scsi_get_vpd_page(sdev, 0x89, buffer, SD_BUF_SIZE)) {
++		if (ata_id_sct_write_same((u16 *)&buffer[60])) {
++			sdev->sct_write_same = 1;
++			sdkp->max_ws_blocks = SD_MAX_WS16_BLOCKS;
++		}
++	}
++}
++
+ /**
+  *	sd_revalidate_disk - called the first time a new disk is seen,
+  *	performs disk spin up, read_capacity, etc.
+@@ -3211,6 +3257,7 @@ static int sd_revalidate_disk(struct gendisk *disk)
+ 		sd_read_cache_type(sdkp, buffer);
+ 		sd_read_app_tag_own(sdkp, buffer);
+ 		sd_read_write_same(sdkp, buffer);
++		sd_read_sct_write_same(sdkp, buffer);
+ 	}
+ 
+ 	sdkp->first_scan = 0;
+diff --git a/include/linux/ata.h b/include/linux/ata.h
+index 83e2a99..ccad265 100644
+--- a/include/linux/ata.h
++++ b/include/linux/ata.h
+@@ -104,6 +104,7 @@ enum {
+ 	ATA_ID_CFA_KEY_MGMT	= 162,
+ 	ATA_ID_CFA_MODES	= 163,
+ 	ATA_ID_DATA_SET_MGMT	= 169,
++	ATA_ID_SCT_CMD_XPORT	= 206,
+ 	ATA_ID_ROT_SPEED	= 217,
+ 	ATA_ID_PIO4		= (1 << 1),
+ 
+@@ -777,6 +778,48 @@ static inline bool ata_id_sense_reporting_enabled(const u16 *id)
+ }
+ 
+ /**
++ *
++ * Word: 206 - SCT Command Transport
++ *    15:12 - Vendor Specific
++ *     11:6 - Reserved
++ *        5 - SCT Command Transport Data Tables supported
++ *        4 - SCT Command Transport Features Control supported
++ *        3 - SCT Command Transport Error Recovery Control supported
++ *        2 - SCT Command Transport Write Same supported
++ *        1 - SCT Command Transport Long Sector Access supported
++ *        0 - SCT Command Transport supported
++ */
++static inline bool ata_id_sct_data_tables(const u16 *id)
++{
++	return id[ATA_ID_SCT_CMD_XPORT] & (1 << 5) ? true : false;
++}
++
++static inline bool ata_id_sct_features_ctrl(const u16 *id)
++{
++	return id[ATA_ID_SCT_CMD_XPORT] & (1 << 4) ? true : false;
++}
++
++static inline bool ata_id_sct_error_recovery_ctrl(const u16 *id)
++{
++	return id[ATA_ID_SCT_CMD_XPORT] & (1 << 3) ? true : false;
++}
++
++static inline bool ata_id_sct_write_same(const u16 *id)
++{
++	return id[ATA_ID_SCT_CMD_XPORT] & (1 << 2) ? true : false;
++}
++
++static inline bool ata_id_sct_long_sector_access(const u16 *id)
++{
++	return id[ATA_ID_SCT_CMD_XPORT] & (1 << 1) ? true : false;
++}
++
++static inline bool ata_id_sct_supported(const u16 *id)
++{
++	return id[ATA_ID_SCT_CMD_XPORT] & (1 << 0) ? true : false;
++}
++
++/**
+  *	ata_id_major_version	-	get ATA level of drive
+  *	@id: Identify data
+  *
+diff --git a/include/scsi/scsi_device.h b/include/scsi/scsi_device.h
+index 74d79bd..c6645de 100644
+--- a/include/scsi/scsi_device.h
++++ b/include/scsi/scsi_device.h
+@@ -151,6 +151,7 @@ struct scsi_device {
+ 	unsigned use_10_for_ms:1; /* first try 10-byte mode sense/select */
+ 	unsigned no_report_opcodes:1;	/* no REPORT SUPPORTED OPERATION CODES */
+ 	unsigned no_write_same:1;	/* no WRITE SAME command */
++	unsigned sct_write_same:1;	/* Has WRITE SAME via SCT Command */
+ 	unsigned use_16_for_rw:1; /* Use read/write(16) over read/write(10) */
+ 	unsigned skip_ms_page_8:1;	/* do not use MODE SENSE page 0x08 */
+ 	unsigned skip_ms_page_3f:1;	/* do not use MODE SENSE page 0x3f */
+-- 
+2.8.1
+

@@ -36,9 +36,9 @@ provided the required amount of conventional space is available.
 
 ## Software Requirements
 
-  - Current Linux Kernel v4.1 to v.4.6 with ZDM patches
-  - Recommended: sg3utils (1.41 or later).
-  - Recommended: util-linux with ZDM patches.
+  - Current Linux Kernel v4.1 to v.4.6-rc6 with ZDM patches
+  - Recommended: Util Linux with ZDM patches
+  - Recommended: sg3utils (1.41 or later)
 
 ## Caveat Emptor - Warning
 
@@ -58,7 +58,7 @@ provided the required amount of conventional space is available.
   - 4k page or block size.
   - Host Aware zoned block device, possibly with conventional zones.
   - Host Managed zoned block device with conventional zones.
-  - Currently 64 MiB of RAM per drive is recommended.
+  - Currently 256 MiB of RAM per drive is recommended.
 
 ## Userspace utilities
   - zdm-tools: zdmadm, zdm-status, zdm-zones, zdmon and others ...
@@ -76,7 +76,7 @@ or
 ```
 or
 ```
-      blkzonecmd --ata --reset --zone -1 /dev/sdX
+      blkzonecmd --reset --zone -1 --ata /dev/sdX
 ```
 
   - Partition the drive to start the partition at a WP boundary.
@@ -107,7 +107,8 @@ or
 ```
 
 Building:
-  - Normal kernel build with CONFIG_DM_ZONED and CONFIG_BLK_ZONED_CTRL enabled.
+  - Normal kernel build with CONFIG_DM_ZDM
+  - Additionally CONFIG_SCSI_ZBC and CONFIG_BLK_DEV_ZONED can be used for testing file systmes such as F2FS.
 
 ## Standards Versions Supported
 
@@ -134,21 +135,20 @@ If not, please see http://www.gnu.org/licenses/.
     * 0.94.5 [ceph patch](/patches/ceph)
   - util-linux -- Added: blkreport, blkzonecmd
     * 2.20.1 [For Ubuntu 14.04](/patches/util-linux/2.20.1)
-    * 2.28-rc2 [For Debian sid development](/patches/util-linux/2.27-rc2)
+    * 2.28-rc2 [For Debian sid development](/patches/util-linux/2.28-rc2)
   - util-linux-ng -- Missing: blkreport, blkzonecmd
     * 2.17.2 [For CentOS 6.7](/patches/util-linux-ng)
 
 ## ZDM Linux Kernel
 
   - Patches
-    * v4.6-rc4 [ZDM r110 patches for linux v4.6.0-rc4](/patches/linux/v4.6-rc4+ZDM-r110)
+    * v4.2.8 [ZDM r112 patches for linux v4.2](/patches/linux/v4.2.8+ZDM-r112)
+    * v4.6-rc6 [ZDM r112 patches for linux v4.6-rc6](/patches/linux/v4.6-rc6+ZDM-r112)
 
-## Observations and Known Issues in this release (#110)
+## Observations and Known Issues in this release (#112)
 
-  - Bug: Memory fault during GC lba re-ordering.
-     * Fix is planned for #111.
-  - Bug: GC can deadlock when GC emergency reserves are depleted.
-     * Fix is planned for #111.
+  - Bug: 
+     * Fix
 
 ## Changes from Initial Release
 
@@ -230,3 +230,9 @@ If not, please see http://www.gnu.org/licenses/.
     * Added Hannes caching device mapper (dm-zoned) to being quantitative comparison with ZDM (dm-zdm).
     * Rename circus to accommodate both device mappers (dm-zoned -> dm-zdm then added dm-zoned).
     * Re-Sync zdmadm tools to match name changes and refreshed libzdm code base.
+
+  - ZDM #112
+    * Fix memory corruption due to over writting allocated space for WB Journal tracking
+    * Updated to rc6 and removed pending bio split patch series.
+    * Updated SCSI_ZBC/BLK_DEV_ZONED features to support current HA drives.
+    * Added support for Write Same via SCT for SATA drives.

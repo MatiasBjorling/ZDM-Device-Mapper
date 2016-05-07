@@ -1,0 +1,51 @@
+From 50632e2526947ea9768810da2d38bf047f1983dd Mon Sep 17 00:00:00 2001
+From: Hannes Reinecke <hare@suse.de>
+Date: Mon, 26 Oct 2015 04:43:40 +0100
+Subject: [PATCH 41/64] block: add flag for single-threaded submission
+
+Some devices support only one I/O stream eg for ensuring
+ordered I/O submission. This patch adds a new block queue
+flag 'BLK_QUEUE_SINGLE' to support these devices.
+
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+---
+ block/blk-core.c       | 2 ++
+ include/linux/blkdev.h | 2 ++
+ 2 files changed, 4 insertions(+)
+
+diff --git a/block/blk-core.c b/block/blk-core.c
+index cbd2faa..533d29b 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -320,6 +320,8 @@ inline void __blk_run_queue_uncond(struct request_queue *q)
+ 	 * number of active request_fn invocations such that blk_drain_queue()
+ 	 * can wait until all these request_fn calls have finished.
+ 	 */
++	if (blk_queue_single(q) && q->request_fn_active)
++		return;
+ 	q->request_fn_active++;
+ 	q->request_fn(q);
+ 	q->request_fn_active--;
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 8d41bc5..e5da758 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -538,6 +538,7 @@ struct request_queue {
+ #define QUEUE_FLAG_INIT_DONE   20	/* queue is initialized */
+ #define QUEUE_FLAG_NO_SG_MERGE 21	/* don't attempt to merge SG segments*/
+ #define QUEUE_FLAG_POLL	       22	/* IO polling enabled if set */
++#define QUEUE_FLAG_SINGLE      23	/* single-threaded submission only */
+ 
+ #define QUEUE_FLAG_DEFAULT	((1 << QUEUE_FLAG_IO_STAT) |		\
+ 				 (1 << QUEUE_FLAG_STACKABLE)	|	\
+@@ -627,6 +628,7 @@ static inline void queue_flag_clear(unsigned int flag, struct request_queue *q)
+ #define blk_queue_discard(q)	test_bit(QUEUE_FLAG_DISCARD, &(q)->queue_flags)
+ #define blk_queue_secdiscard(q)	(blk_queue_discard(q) && \
+ 	test_bit(QUEUE_FLAG_SECDISCARD, &(q)->queue_flags))
++#define blk_queue_single(q)	test_bit(QUEUE_FLAG_SINGLE, &(q)->queue_flags)
+ 
+ #define blk_noretry_request(rq) \
+ 	((rq)->cmd_flags & (REQ_FAILFAST_DEV|REQ_FAILFAST_TRANSPORT| \
+-- 
+2.8.1
+

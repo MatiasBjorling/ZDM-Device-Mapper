@@ -667,10 +667,9 @@ static inline void cfqg_put(struct cfq_group *cfqg)
 } while (0)
 
 static inline void cfqg_stats_update_io_add(struct cfq_group *cfqg,
-					    struct cfq_group *curr_cfqg, int op,
-					    int op_flags)
+					    struct cfq_group *curr_cfqg, int rw)
 {
-	blkg_rwstat_add(&cfqg->stats.queued, op, op_flags, 1);
+	blkg_rwstat_add(&cfqg->stats.queued, rw, 1);
 	cfqg_stats_end_empty_time(&cfqg->stats);
 	cfqg_stats_set_start_group_wait_time(cfqg, curr_cfqg);
 }
@@ -684,30 +683,26 @@ static inline void cfqg_stats_update_timeslice_used(struct cfq_group *cfqg,
 #endif
 }
 
-static inline void cfqg_stats_update_io_remove(struct cfq_group *cfqg, int op,
-					       int op_flags)
+static inline void cfqg_stats_update_io_remove(struct cfq_group *cfqg, int rw)
 {
-	blkg_rwstat_add(&cfqg->stats.queued, op, op_flags, -1);
+	blkg_rwstat_add(&cfqg->stats.queued, rw, -1);
 }
 
-static inline void cfqg_stats_update_io_merged(struct cfq_group *cfqg, int op,
-					       int op_flags)
+static inline void cfqg_stats_update_io_merged(struct cfq_group *cfqg, int rw)
 {
-	blkg_rwstat_add(&cfqg->stats.merged, op, op_flags, 1);
+	blkg_rwstat_add(&cfqg->stats.merged, rw, 1);
 }
 
 static inline void cfqg_stats_update_completion(struct cfq_group *cfqg,
-			uint64_t start_time, uint64_t io_start_time, int op,
-			int op_flags)
+			uint64_t start_time, uint64_t io_start_time, int rw)
 {
 	struct cfqg_stats *stats = &cfqg->stats;
 	unsigned long long now = sched_clock();
 
 	if (time_after64(now, io_start_time))
-		blkg_rwstat_add(&stats->service_time, op, op_flags,
-				now - io_start_time);
+		blkg_rwstat_add(&stats->service_time, rw, now - io_start_time);
 	if (time_after64(io_start_time, start_time))
-		blkg_rwstat_add(&stats->wait_time, op, op_flags,
+		blkg_rwstat_add(&stats->wait_time, rw,
 				io_start_time - start_time);
 }
 
@@ -786,16 +781,13 @@ static inline void cfqg_put(struct cfq_group *cfqg) { }
 #define cfq_log_cfqg(cfqd, cfqg, fmt, args...)		do {} while (0)
 
 static inline void cfqg_stats_update_io_add(struct cfq_group *cfqg,
-			struct cfq_group *curr_cfqg, int op, int op_flags) { }
+			struct cfq_group *curr_cfqg, int rw) { }
 static inline void cfqg_stats_update_timeslice_used(struct cfq_group *cfqg,
 			unsigned long time, unsigned long unaccounted_time) { }
-static inline void cfqg_stats_update_io_remove(struct cfq_group *cfqg, int op,
-			int op_flags) { }
-static inline void cfqg_stats_update_io_merged(struct cfq_group *cfqg, int op,
-			int op_flags) { }
+static inline void cfqg_stats_update_io_remove(struct cfq_group *cfqg, int rw) { }
+static inline void cfqg_stats_update_io_merged(struct cfq_group *cfqg, int rw) { }
 static inline void cfqg_stats_update_completion(struct cfq_group *cfqg,
-			uint64_t start_time, uint64_t io_start_time, int op,
-			int op_flags) { }
+			uint64_t start_time, uint64_t io_start_time, int rw) { }
 
 #endif	/* CONFIG_CFQ_GROUP_IOSCHED */
 
@@ -2469,10 +2461,10 @@ static void cfq_reposition_rq_rb(struct cfq_queue *cfqq, struct request *rq)
 {
 	elv_rb_del(&cfqq->sort_list, rq);
 	cfqq->queued[rq_is_sync(rq)]--;
-	cfqg_stats_update_io_remove(RQ_CFQG(rq), rq->op, rq->cmd_flags);
+	cfqg_stats_update_io_remove(RQ_CFQG(rq), rq->cmd_flags);
 	cfq_add_rq_rb(rq);
 	cfqg_stats_update_io_add(RQ_CFQG(rq), cfqq->cfqd->serving_group,
-				 rq->op, rq->cmd_flags);
+				 rq->cmd_flags);
 }
 
 static struct request *
@@ -2525,7 +2517,7 @@ static void cfq_remove_request(struct request *rq)
 	cfq_del_rq_rb(rq);
 
 	cfqq->cfqd->rq_queued--;
-	cfqg_stats_update_io_remove(RQ_CFQG(rq), rq->op, rq->cmd_flags);
+	cfqg_stats_update_io_remove(RQ_CFQG(rq), rq->cmd_flags);
 	if (rq->cmd_flags & REQ_PRIO) {
 		WARN_ON(!cfqq->prio_pending);
 		cfqq->prio_pending--;
@@ -2560,7 +2552,7 @@ static void cfq_merged_request(struct request_queue *q, struct request *req,
 static void cfq_bio_merged(struct request_queue *q, struct request *req,
 				struct bio *bio)
 {
-	cfqg_stats_update_io_merged(RQ_CFQG(req), bio->bi_op, bio->bi_rw);
+	cfqg_stats_update_io_merged(RQ_CFQG(req), bio->bi_rw);
 }
 
 static void
@@ -2583,7 +2575,7 @@ cfq_merged_requests(struct request_queue *q, struct request *rq,
 	if (cfqq->next_rq == next)
 		cfqq->next_rq = rq;
 	cfq_remove_request(next);
-	cfqg_stats_update_io_merged(RQ_CFQG(rq), next->op, next->cmd_flags);
+	cfqg_stats_update_io_merged(RQ_CFQG(rq), next->cmd_flags);
 
 	cfqq = RQ_CFQQ(next);
 	/*
@@ -4116,7 +4108,7 @@ static void cfq_insert_request(struct request_queue *q, struct request *rq)
 	rq->fifo_time = jiffies + cfqd->cfq_fifo_expire[rq_is_sync(rq)];
 	list_add_tail(&rq->queuelist, &cfqq->fifo);
 	cfq_add_rq_rb(rq);
-	cfqg_stats_update_io_add(RQ_CFQG(rq), cfqd->serving_group, rq->op,
+	cfqg_stats_update_io_add(RQ_CFQG(rq), cfqd->serving_group,
 				 rq->cmd_flags);
 	cfq_rq_enqueued(cfqd, cfqq, rq);
 }
@@ -4214,8 +4206,7 @@ static void cfq_completed_request(struct request_queue *q, struct request *rq)
 	cfqq->dispatched--;
 	(RQ_CFQG(rq))->dispatched--;
 	cfqg_stats_update_completion(cfqq->cfqg, rq_start_time_ns(rq),
-				     rq_io_start_time_ns(rq), rq->op,
-				     rq->cmd_flags);
+				     rq_io_start_time_ns(rq), rq->cmd_flags);
 
 	cfqd->rq_in_flight[cfq_cfqq_sync(cfqq)]--;
 
@@ -4294,7 +4285,7 @@ static inline int __cfq_may_queue(struct cfq_queue *cfqq)
 	return ELV_MQUEUE_MAY;
 }
 
-static int cfq_may_queue(struct request_queue *q, int op, int op_flags)
+static int cfq_may_queue(struct request_queue *q, u64 rw)
 {
 	struct cfq_data *cfqd = q->elevator->elevator_data;
 	struct task_struct *tsk = current;
@@ -4311,7 +4302,7 @@ static int cfq_may_queue(struct request_queue *q, int op, int op_flags)
 	if (!cic)
 		return ELV_MQUEUE_MAY;
 
-	cfqq = cic_to_cfqq(cic, rw_is_sync(op, op_flags));
+	cfqq = cic_to_cfqq(cic, rw_is_sync(rw));
 	if (cfqq) {
 		cfq_init_prio_data(cfqq, cic);
 

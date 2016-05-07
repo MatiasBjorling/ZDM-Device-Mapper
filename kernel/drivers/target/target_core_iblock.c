@@ -312,8 +312,7 @@ static void iblock_bio_done(struct bio *bio)
 }
 
 static struct bio *
-iblock_get_bio(struct se_cmd *cmd, sector_t lba, u32 sg_num, int op,
-	       int op_flags)
+iblock_get_bio(struct se_cmd *cmd, sector_t lba, u32 sg_num)
 {
 	struct iblock_dev *ib_dev = IBLOCK_DEV(cmd->se_dev);
 	struct bio *bio;
@@ -335,20 +334,18 @@ iblock_get_bio(struct se_cmd *cmd, sector_t lba, u32 sg_num, int op,
 	bio->bi_private = cmd;
 	bio->bi_end_io = &iblock_bio_done;
 	bio->bi_iter.bi_sector = lba;
-	bio->bi_op = op;
-	bio->bi_rw = op_flags;
 
 	return bio;
 }
 
-static void iblock_submit_bios(struct bio_list *list)
+static void iblock_submit_bios(struct bio_list *list, int rw)
 {
 	struct blk_plug plug;
 	struct bio *bio;
 
 	blk_start_plug(&plug);
 	while ((bio = bio_list_pop(list)))
-		submit_bio(bio);
+		submit_bio(rw, bio);
 	blk_finish_plug(&plug);
 }
 
@@ -390,10 +387,9 @@ iblock_execute_sync_cache(struct se_cmd *cmd)
 	bio = bio_alloc(GFP_KERNEL, 0);
 	bio->bi_end_io = iblock_end_io_flush;
 	bio->bi_bdev = ib_dev->ibd_bd;
-	bio->bi_rw = WRITE_FLUSH;
 	if (!immed)
 		bio->bi_private = cmd;
-	submit_bio(bio);
+	submit_bio(WRITE_FLUSH, bio);
 	return 0;
 }
 
@@ -482,7 +478,7 @@ iblock_execute_write_same(struct se_cmd *cmd)
 		goto fail;
 	cmd->priv = ibr;
 
-	bio = iblock_get_bio(cmd, block_lba, 1, REQ_OP_WRITE, 0);
+	bio = iblock_get_bio(cmd, block_lba, 1);
 	if (!bio)
 		goto fail_free_ibr;
 
@@ -495,8 +491,7 @@ iblock_execute_write_same(struct se_cmd *cmd)
 		while (bio_add_page(bio, sg_page(sg), sg->length, sg->offset)
 				!= sg->length) {
 
-			bio = iblock_get_bio(cmd, block_lba, 1, REQ_OP_WRITE,
-					     0);
+			bio = iblock_get_bio(cmd, block_lba, 1);
 			if (!bio)
 				goto fail_put_bios;
 
@@ -509,7 +504,7 @@ iblock_execute_write_same(struct se_cmd *cmd)
 		sectors -= 1;
 	}
 
-	iblock_submit_bios(&list);
+	iblock_submit_bios(&list, WRITE);
 	return 0;
 
 fail_put_bios:
@@ -682,7 +677,8 @@ iblock_execute_rw(struct se_cmd *cmd, struct scatterlist *sgl, u32 sgl_nents,
 	struct scatterlist *sg;
 	u32 sg_num = sgl_nents;
 	unsigned bio_cnt;
-	int i, op, op_flags = 0;
+	int rw = 0;
+	int i;
 
 	if (data_direction == DMA_TO_DEVICE) {
 		struct iblock_dev *ib_dev = IBLOCK_DEV(dev);
@@ -691,15 +687,18 @@ iblock_execute_rw(struct se_cmd *cmd, struct scatterlist *sgl, u32 sgl_nents,
 		 * Force writethrough using WRITE_FUA if a volatile write cache
 		 * is not enabled, or if initiator set the Force Unit Access bit.
 		 */
-		op = REQ_OP_WRITE;
 		if (q->flush_flags & REQ_FUA) {
 			if (cmd->se_cmd_flags & SCF_FUA)
-				op_flags = WRITE_FUA;
-			else if (!(q->flush_flags & REQ_PREFLUSH))
-				op_flags = WRITE_FUA;
+				rw = WRITE_FUA;
+			else if (!(q->flush_flags & REQ_FLUSH))
+				rw = WRITE_FUA;
+			else
+				rw = WRITE;
+		} else {
+			rw = WRITE;
 		}
 	} else {
-		op = REQ_OP_READ;
+		rw = READ;
 	}
 
 	ibr = kzalloc(sizeof(struct iblock_req), GFP_KERNEL);
@@ -713,7 +712,7 @@ iblock_execute_rw(struct se_cmd *cmd, struct scatterlist *sgl, u32 sgl_nents,
 		return 0;
 	}
 
-	bio = iblock_get_bio(cmd, block_lba, sgl_nents, op, op_flags);
+	bio = iblock_get_bio(cmd, block_lba, sgl_nents);
 	if (!bio)
 		goto fail_free_ibr;
 
@@ -733,12 +732,11 @@ iblock_execute_rw(struct se_cmd *cmd, struct scatterlist *sgl, u32 sgl_nents,
 		while (bio_add_page(bio, sg_page(sg), sg->length, sg->offset)
 				!= sg->length) {
 			if (bio_cnt >= IBLOCK_MAX_BIO_PER_TASK) {
-				iblock_submit_bios(&list);
+				iblock_submit_bios(&list, rw);
 				bio_cnt = 0;
 			}
 
-			bio = iblock_get_bio(cmd, block_lba, sg_num, op,
-					     op_flags);
+			bio = iblock_get_bio(cmd, block_lba, sg_num);
 			if (!bio)
 				goto fail_put_bios;
 
@@ -758,7 +756,7 @@ iblock_execute_rw(struct se_cmd *cmd, struct scatterlist *sgl, u32 sgl_nents,
 			goto fail_put_bios;
 	}
 
-	iblock_submit_bios(&list);
+	iblock_submit_bios(&list, rw);
 	iblock_complete_cmd(cmd);
 	return 0;
 
@@ -838,7 +836,7 @@ static bool iblock_get_write_cache(struct se_device *dev)
 	struct block_device *bd = ib_dev->ibd_bd;
 	struct request_queue *q = bdev_get_queue(bd);
 
-	return q->flush_flags & REQ_PREFLUSH;
+	return q->flush_flags & REQ_FLUSH;
 }
 
 static const struct target_backend_ops iblock_ops = {

@@ -144,7 +144,7 @@ const char *libata_trace_parse_qc_flags(struct trace_seq *, unsigned int);
 
 const char *libata_trace_parse_subcmd(struct trace_seq *, unsigned char,
 				      unsigned char, unsigned char);
-#define __parse_subcmd(c, f, h) libata_trace_parse_subcmd(p, c, f, h)
+#define __parse_subcmd(c,f,h) libata_trace_parse_subcmd(p, c, f, h)
 
 TRACE_EVENT(ata_qc_issue,
 
@@ -197,8 +197,7 @@ TRACE_EVENT(ata_qc_issue,
 		  __entry->ata_port, __entry->ata_dev, __entry->tag,
 		  show_protocol_name(__entry->proto),
 		  show_opcode_name(__entry->cmd),
-		  __parse_subcmd(__entry->cmd, __entry->feature,
-				 __entry->hob_nsect),
+		  __parse_subcmd(__entry->cmd, __entry->feature, __entry->hob_nsect),
 		  __entry->cmd, __entry->feature, __entry->nsect,
 		  __entry->lbal, __entry->lbam, __entry->lbah,
 		  __entry->hob_feature, __entry->hob_nsect,

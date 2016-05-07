@@ -151,6 +151,7 @@ struct scsi_device {
 	unsigned use_10_for_ms:1; /* first try 10-byte mode sense/select */
 	unsigned no_report_opcodes:1;	/* no REPORT SUPPORTED OPERATION CODES */
 	unsigned no_write_same:1;	/* no WRITE SAME command */
+	unsigned sct_write_same:1;	/* Has WRITE SAME via SCT Command */
 	unsigned use_16_for_rw:1; /* Use read/write(16) over read/write(10) */
 	unsigned skip_ms_page_8:1;	/* do not use MODE SENSE page 0x08 */
 	unsigned skip_ms_page_3f:1;	/* do not use MODE SENSE page 0x3f */
@@ -177,7 +178,6 @@ struct scsi_device {
 	unsigned broken_fua:1;		/* Don't set FUA bit */
 	unsigned lun_in_cdb:1;		/* Store LUN bits in CDB[1] */
 	unsigned synchronous_alua:1;	/* Synchronous ALUA commands */
-	unsigned zabc:1;		/* ZBC/ZAC zoned device */
 
 	atomic_t disk_events_disable_depth; /* disable depth for disk events */
 

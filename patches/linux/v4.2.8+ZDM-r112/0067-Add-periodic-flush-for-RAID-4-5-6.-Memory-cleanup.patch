@@ -1,0 +1,228 @@
+From 609a33f0d5047204188558d7dc7e0426e72c3816 Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Mon, 2 May 2016 12:46:34 -0500
+Subject: [PATCH 67/71] Add periodic flush for RAID 4/5/6. Memory cleanup.
+
+---
+ drivers/md/dm-zdm.c | 25 +++++++++++++----
+ drivers/md/dm-zdm.h |  1 +
+ drivers/md/libzdm.c | 79 ++++++++++++++++++++++++++++-------------------------
+ 3 files changed, 62 insertions(+), 43 deletions(-)
+
+diff --git a/drivers/md/dm-zdm.c b/drivers/md/dm-zdm.c
+index 519dc2f..44d03ec 100644
+--- a/drivers/md/dm-zdm.c
++++ b/drivers/md/dm-zdm.c
+@@ -1615,7 +1615,7 @@ static int zoned_bio(struct zdm *znd, struct bio *bio)
+ 	u64 s_zdm = (bio->bi_iter.bi_sector >> Z_SHFT4K) + znd->md_end;
+ 	int rcode = DM_MAPIO_SUBMITTED;
+ 	struct request_queue *q;
+-	int sync_op = 0;
++	int flush_op = 0;
+ 	int do_end_bio = 0;
+ 	int op = -1;
+ 
+@@ -1636,15 +1636,15 @@ static int zoned_bio(struct zdm *znd, struct bio *bio)
+ 	if (bio->bi_rw & REQ_FLUSH) {
+ 		set_bit(DO_SYNC, &znd->flags);
+ 		set_bit(DO_FLUSH, &znd->flags);
+-		sync_op = 1;
++		flush_op = 1;
+ 	} else if (bio->bi_rw & REQ_CHECKPOINT) {
+ 		bio->bi_rw &= ~REQ_CHECKPOINT;
+ 		set_bit(DO_SYNC, &znd->flags);
+ 		set_bit(DO_FLUSH, &znd->flags);
+-		sync_op = 1;
++		flush_op = 1;
+ 	}
+ 
+-	op = sync_op ? REQ_FLUSH : (is_write ? WRITE : READ);
++	op = flush_op ? REQ_FLUSH : (is_write ? WRITE : READ);
+ 	if (op == REQ_FLUSH && op == znd->last_op &&
+ 	    bio->bi_iter.bi_size == 0) {
+ 		do_end_bio = 1;
+@@ -1653,7 +1653,7 @@ static int zoned_bio(struct zdm *znd, struct bio *bio)
+ 
+ 	Z_DBG(znd, "%s: s:%"PRIx64" sz:%u -> %s", __func__, s_zdm,
+ 	      bio->bi_iter.bi_size,
+-	      sync_op ? "F" : (is_write ? "W" : "R"));
++	      flush_op ? "F" : (is_write ? "W" : "R"));
+ 
+ 	if (bio->bi_iter.bi_size) {
+ 		if (bio->bi_rw & REQ_DISCARD) {
+@@ -1687,7 +1687,7 @@ static int zoned_bio(struct zdm *znd, struct bio *bio)
+ 		}
+ 	}
+ 
+-	if (sync_op && work_pending(&znd->meta_work))
++	if (flush_op && work_pending(&znd->meta_work))
+ 		flush_workqueue(znd->meta_wq);
+ 
+ out:
+@@ -1749,6 +1749,19 @@ static void on_timeout_activity(struct zdm *znd, int delay)
+ 	if (test_bit(ZF_FREEZE, &znd->flags))
+ 		return;
+ 
++
++	if (is_expired_msecs(znd->flush_age, 30000)) {
++		Z_ERR(znd, "Periodic FLUSH");
++
++		set_bit(DO_SYNC, &znd->flags);
++		set_bit(DO_FLUSH, &znd->flags);
++		if (!test_bit(DO_METAWORK_QD, &znd->flags) &&
++		    !work_pending(&znd->meta_work)) {
++			set_bit(DO_METAWORK_QD, &znd->flags);
++			queue_work(znd->meta_wq, &znd->meta_work);
++		}
++	}
++
+ 	if (is_expired_msecs(znd->age, DISCARD_IDLE_MSECS))
+ 		max_tries = 20;
+ 
+diff --git a/drivers/md/dm-zdm.h b/drivers/md/dm-zdm.h
+index ba6ef9f..30ea11a 100644
+--- a/drivers/md/dm-zdm.h
++++ b/drivers/md/dm-zdm.h
+@@ -717,6 +717,7 @@ struct zdm {
+ 	struct io_4k_block *io_vcache[32];
+ 	unsigned long io_vcache_flags;
+ 	u64 age;
++	u64 flush_age;
+ 	struct workqueue_struct *meta_wq;
+ 	struct map_cache gc_postmap;
+ 	struct dm_io_client *io_client;
+diff --git a/drivers/md/libzdm.c b/drivers/md/libzdm.c
+index 89e20ac..a301264 100644
+--- a/drivers/md/libzdm.c
++++ b/drivers/md/libzdm.c
+@@ -728,38 +728,39 @@ static inline int is_ready_for_gc(struct zdm *znd, u32 z_id)
+ #define GET_KM		0x080000
+ #define GET_VM		0x100000
+ 
+-#define PG_01    (GET_ZPG |  1)
+-#define PG_02    (GET_ZPG |  2)
+-#define PG_05    (GET_ZPG |  5)
+-#define PG_06    (GET_ZPG |  6)
+-#define PG_08    (GET_ZPG |  8)
+-#define PG_09    (GET_ZPG |  9)
+-#define PG_10    (GET_ZPG | 10)
+-#define PG_11    (GET_ZPG | 11)
+-#define PG_13    (GET_ZPG | 13)
+-#define PG_17    (GET_ZPG | 17)
+-#define PG_27    (GET_ZPG | 27)
+-
+-#define KM_00    (GET_KM  |  0)
+-#define KM_07    (GET_KM  |  7)
+-#define KM_14    (GET_KM  | 14)
+-#define KM_15    (GET_KM  | 15)
+-#define KM_16    (GET_KM  | 16)
+-#define KM_18    (GET_KM  | 18)
+-#define KM_19    (GET_KM  | 19)
+-#define KM_20    (GET_KM  | 20)
+-#define KM_25    (GET_KM  | 25)
+-#define KM_26    (GET_KM  | 26)
+-#define KM_28    (GET_KM  | 28)
+-#define KM_29    (GET_KM  | 29)
+-#define KM_30    (GET_KM  | 30)
+-
+-#define VM_03    (GET_VM  |  3)
+-#define VM_04    (GET_VM  |  4)
+-#define VM_12    (GET_VM  | 12)
+-#define VM_21    (GET_VM  | 21)
+-#define MP_22    (GET_PGS | 22)
+-#define MP_23    (GET_PGS | 23)
++#define xx_01    (GET_ZPG |  1) /* unused */
++#define xx_09    (GET_ZPG |  9) /* unused */
++#define xx_13    (GET_ZPG | 13) /* unused */
++#define xx_17    (GET_ZPG | 17) /* unused */
++#define xx_14    (GET_KM  | 14) /* unused */
++#define xx_15    (GET_KM  | 15) /* unused */
++#define xx_25    (GET_KM  | 25) /* unused */
++#define xx_26    (GET_KM  | 26) /* unused */
++#define xx_28    (GET_KM  | 28) /* unused */
++#define xx_29    (GET_KM  | 29) /* unused */
++#define xx_30    (GET_KM  | 30) /* unused */
++
++#define PG_02    (GET_ZPG |  2) /* CoW [RMW] block */
++#define PG_05    (GET_ZPG |  5) /* superblock */
++#define PG_06    (GET_ZPG |  6) /* WP: Alloc, Used, Shadow */
++#define PG_08    (GET_ZPG |  8) /* mcache data block */
++#define PG_10    (GET_ZPG | 10) /* superblock: temporary */
++#define PG_11    (GET_ZPG | 11) /* superblock: temporary */
++#define PG_27    (GET_ZPG | 27) /* map_pg data block */
++
++#define KM_00    (GET_KM  |  0)  /* ZDM: Instance */
++#define KM_07    (GET_KM  |  7)  /* mcache struct */
++#define KM_16    (GET_KM  | 16)  /* gc descriptor */
++#define KM_18    (GET_KM  | 18) /* wset : sync */
++#define KM_19    (GET_KM  | 19) /* wset */
++#define KM_20    (GET_KM  | 20) /* map_pg struct */
++
++#define VM_03    (GET_VM  |  3) /* gc postmap */
++#define VM_04    (GET_VM  |  4) /* gc io buffer */
++#define VM_12    (GET_VM  | 12) /* vm io cache */
++#define VM_21    (GET_VM  | 21) /* wp array (of ptrs) */
++#define MP_22    (GET_PGS | 22) /* Metadata CRCs */
++#define MP_23    (GET_PGS | 23) /* WB Journal map */
+ 
+ #define ZDM_FREE(z, _p, sz, id) \
+ 	do { zdm_free((z), (_p), (sz), (id)); (_p) = NULL; } while (0)
+@@ -3556,7 +3557,8 @@ static int manage_lazy_activity(struct zdm *znd)
+ 			if (expg->last_write && expg->lba != expg->last_write) {
+ 				if (entries < MAX_WSET) {
+ 					ref_pg(expg);
+-					wset[entries++] = expg;
++					wset[entries] = expg;
++					entries++;
+ 					clear_bit(WB_RE_CACHE, &expg->flags);
+ 				}
+ 			} else {
+@@ -3646,6 +3648,7 @@ static void mark_clean_flush_zlt(struct zdm *znd, int wb_toggle)
+ 	struct map_pg *_tpg;
+ 
+ 	spin_lock(&znd->zlt_lck);
++	znd->flush_age = jiffies_64;
+ 	if (list_empty(&znd->zltpool))
+ 		goto out;
+ 
+@@ -4383,7 +4386,7 @@ static int z_mapped_sync(struct zdm *znd)
+ 	u64 modulo = CACHE_COPIES;
+ 	u64 incr = MAX_SB_INCR_SZ;
+ 
+-	wset = ZDM_CALLOC(znd, sizeof(*wset), SYNC_MAX, KM_19, NORMAL);
++	wset = ZDM_CALLOC(znd, sizeof(*wset), SYNC_MAX, KM_18, NORMAL);
+ 	if (!wset)
+ 		return -ENOMEM;
+ 
+@@ -4467,7 +4470,8 @@ static int z_mapped_sync(struct zdm *znd)
+ 				idx++;
+ 				bio_add_km(bio, mc->jdata, 1);
+ 				if (wset_count < SYNC_MAX) {
+-					wset[wset_count++] = mc;
++					wset[wset_count] = mc;
++					wset_count++;
+ 					mcache_ref(mc);
+ 				}
+ 				cached++;
+@@ -4546,7 +4550,7 @@ static int z_mapped_sync(struct zdm *znd)
+ 	Z_DBG(znd, "Sync/Flush: %d writes / %d blocks written", n_writes, n_blocks);
+ out:
+ 	if (wset)
+-		ZDM_FREE(znd, wset, sizeof(*wset) * SYNC_MAX, KM_19);
++		ZDM_FREE(znd, wset, sizeof(*wset) * SYNC_MAX, KM_18);
+ 
+ 	return rc;
+ }
+@@ -7449,7 +7453,8 @@ static int _sync_dirty(struct zdm *znd, int bit_type, int sync, int drop)
+ 		if (sync && is_dirty(expg, bit_type)) {
+ 			if (entries < MAX_WSET) {
+ 				ref_pg(expg);
+-				wset[entries++] = expg;
++				wset[entries] = expg;
++				entries++;
+ 			}
+ 		} else if ((drop > 0) && is_old_and_clean(expg, bit_type)) {
+ 			int is_lut = test_bit(IS_LUT, &expg->flags);
+-- 
+2.8.1
+

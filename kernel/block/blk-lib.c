@@ -43,8 +43,8 @@ int blkdev_issue_discard(struct block_device *bdev, sector_t sector,
 {
 	DECLARE_COMPLETION_ONSTACK(wait);
 	struct request_queue *q = bdev_get_queue(bdev);
-	int type = 0;
-	unsigned int granularity;
+	int type = REQ_WRITE | REQ_DISCARD;
+	unsigned int max_discard_sectors, granularity;
 	int alignment;
 	struct bio_batch bb;
 	struct bio *bio;
@@ -60,6 +60,17 @@ int blkdev_issue_discard(struct block_device *bdev, sector_t sector,
 	/* Zero-sector (unknown) and one-sector granularities are the same.  */
 	granularity = max(q->limits.discard_granularity >> 9, 1U);
 	alignment = (bdev_discard_alignment(bdev) >> 9) % granularity;
+
+	/*
+	 * Ensure that max_discard_sectors is of the proper
+	 * granularity, so that requests stay aligned after a split.
+	 */
+	max_discard_sectors = min(q->limits.max_discard_sectors, UINT_MAX >> 9);
+	max_discard_sectors -= max_discard_sectors % granularity;
+	if (unlikely(!max_discard_sectors)) {
+		/* Avoid infinite loop below. Being cautious never hurts. */
+		return -EOPNOTSUPP;
+	}
 
 	if (flags & BLKDEV_DISCARD_SECURE) {
 		if (!blk_queue_secdiscard(q))
@@ -103,15 +114,13 @@ int blkdev_issue_discard(struct block_device *bdev, sector_t sector,
 		bio->bi_end_io = bio_batch_end_io;
 		bio->bi_bdev = bdev;
 		bio->bi_private = &bb;
-		bio->bi_op = REQ_OP_DISCARD;
-		bio->bi_rw = type;
 
 		bio->bi_iter.bi_size = req_sects << 9;
 		nr_sects -= req_sects;
 		sector = end_sect;
 
 		atomic_inc(&bb.done);
-		submit_bio(bio);
+		submit_bio(type, bio);
 
 		/*
 		 * We can loop for a long time in here, if someone does
@@ -180,7 +189,6 @@ int blkdev_issue_write_same(struct block_device *bdev, sector_t sector,
 		bio->bi_io_vec->bv_page = page;
 		bio->bi_io_vec->bv_offset = 0;
 		bio->bi_io_vec->bv_len = bdev_logical_block_size(bdev);
-		bio->bi_op = REQ_OP_WRITE_SAME;
 
 		if (nr_sects > max_write_same_sectors) {
 			bio->bi_iter.bi_size = max_write_same_sectors << 9;
@@ -192,7 +200,7 @@ int blkdev_issue_write_same(struct block_device *bdev, sector_t sector,
 		}
 
 		atomic_inc(&bb.done);
-		submit_bio(bio);
+		submit_bio(REQ_WRITE | REQ_WRITE_SAME, bio);
 	}
 
 	/* Wait for bios in-flight */
@@ -242,7 +250,6 @@ static int __blkdev_issue_zeroout(struct block_device *bdev, sector_t sector,
 		bio->bi_bdev   = bdev;
 		bio->bi_end_io = bio_batch_end_io;
 		bio->bi_private = &bb;
-		bio->bi_op = REQ_OP_WRITE;
 
 		while (nr_sects != 0) {
 			sz = min((sector_t) PAGE_SIZE >> 9 , nr_sects);
@@ -254,7 +261,7 @@ static int __blkdev_issue_zeroout(struct block_device *bdev, sector_t sector,
 		}
 		ret = 0;
 		atomic_inc(&bb.done);
-		submit_bio(bio);
+		submit_bio(WRITE, bio);
 	}
 
 	/* Wait for bios in-flight */
@@ -321,9 +328,7 @@ int blkdev_issue_zone_report(struct block_device *bdev, unsigned int bi_rw,
 			     sector_t sector, u8 opt, struct page *page,
 			     size_t pgsz, gfp_t gfp_mask)
 {
-	DECLARE_COMPLETION_ONSTACK(wait);
 	struct bdev_zone_report *conv = page_address(page);
-	struct bio_batch bb;
 	struct bio *bio;
 	unsigned int nr_iovecs = 1;
 	int ret = 0;
@@ -332,38 +337,27 @@ int blkdev_issue_zone_report(struct block_device *bdev, unsigned int bi_rw,
 		    sizeof(struct bdev_zone_descriptor)))
 		return -EINVAL;
 
-	conv->descriptor_count = 0;
-	atomic_set(&bb.done, 1);
-	bb.error = 0;
-	bb.wait = &wait;
-
 	bio = bio_alloc(gfp_mask, nr_iovecs);
 	if (!bio)
 		return -ENOMEM;
 
+	conv->descriptor_count = 0;
 	bio->bi_iter.bi_sector = sector;
-	bio->bi_end_io = bio_batch_end_io;
 	bio->bi_bdev = bdev;
-	bio->bi_private = &bb;
 	bio->bi_vcnt = 0;
 	bio->bi_iter.bi_size = 0;
-	bio->bi_op = REQ_OP_READ;
-	bio->bi_rw = bi_rw | REQ_REPORT_ZONES;
+
+	bi_rw |= REQ_REPORT_ZONES;
 
 	bio_set_streamid(bio, opt);
 	bio_add_page(bio, page, pgsz, 0);
-	atomic_inc(&bb.done);
-	submit_bio(bio);
-
-	/* Wait for bios in-flight */
-	if (!atomic_dec_and_test(&bb.done))
-		wait_for_completion_io(&wait);
+	ret = submit_bio_wait(READ | bi_rw, bio);
 
 	/*
 	 * When our request it nak'd the underlying device maybe conventional
 	 * so ... report a single conventional zone the size of the device.
 	 */
-	if (bb.error == -EIO && conv->descriptor_count) {
+	if (ret == -EIO && conv->descriptor_count) {
 		/* Adjust the conventional to the size of the partition ... */
 		__be64 blksz = cpu_to_be64(bdev->bd_part->nr_sects);
 
@@ -375,8 +369,6 @@ int blkdev_issue_zone_report(struct block_device *bdev, unsigned int bi_rw,
 		conv->descriptors[0].lba_wptr = blksz;
 		return 0;
 	}
-	if (bb.error)
-		return bb.error;
 	return ret;
 }
 EXPORT_SYMBOL(blkdev_issue_zone_report);
@@ -394,37 +386,17 @@ EXPORT_SYMBOL(blkdev_issue_zone_report);
 int blkdev_issue_zone_action(struct block_device *bdev, unsigned int bi_rw,
 			     sector_t sector, gfp_t gfp_mask)
 {
-	DECLARE_COMPLETION_ONSTACK(wait);
-	struct bio_batch bb;
 	struct bio *bio;
-	int ret = 0;
-
-	atomic_set(&bb.done, 1);
-	bb.error = 0;
-	bb.wait = &wait;
 
 	bio = bio_alloc(gfp_mask, 1);
 	if (!bio)
 		return -ENOMEM;
 
 	bio->bi_iter.bi_sector = sector;
-	bio->bi_end_io = bio_batch_end_io;
 	bio->bi_bdev = bdev;
-	bio->bi_private = &bb;
 	bio->bi_vcnt = 0;
 	bio->bi_iter.bi_size = 0;
-	bio->bi_op = REQ_OP_WRITE;
-	bio->bi_rw = bi_rw;
 
-	atomic_inc(&bb.done);
-	submit_bio(bio);
-
-	/* Wait for bios in-flight */
-	if (!atomic_dec_and_test(&bb.done))
-		wait_for_completion_io(&wait);
-
-	if (bb.error)
-		return bb.error;
-	return ret;
+	return submit_bio_wait(WRITE | bi_rw, bio);
 }
 EXPORT_SYMBOL(blkdev_issue_zone_action);

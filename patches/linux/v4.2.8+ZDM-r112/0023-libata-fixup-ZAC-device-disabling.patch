@@ -1,0 +1,40 @@
+From 7d719910628fa3de8fec5ae83b7dfc64cc159764 Mon Sep 17 00:00:00 2001
+From: Hannes Reinecke <hare@suse.de>
+Date: Thu, 7 Apr 2016 10:45:46 +0200
+Subject: [PATCH 23/65] libata: fixup ZAC device disabling
+
+libata device disabling is ... curious. So add the correct
+definitions that we can disable ZAC devices properly.
+
+Signed-off-by: Hannes Reinecke <hare@suse.com>
+---
+ include/linux/libata.h | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/include/linux/libata.h b/include/linux/libata.h
+index 1e2f793..2e32bf4 100644
+--- a/include/linux/libata.h
++++ b/include/linux/libata.h
+@@ -192,7 +192,8 @@ enum {
+ 	ATA_DEV_SEMB		= 7,	/* SEMB */
+ 	ATA_DEV_SEMB_UNSUP	= 8,	/* SEMB (unsupported) */
+ 	ATA_DEV_ZAC		= 9,	/* ZAC device */
+-	ATA_DEV_NONE		= 10,	/* no device */
++	ATA_DEV_ZAC_UNSUP	= 10,	/* ZAC device (unsupported) */
++	ATA_DEV_NONE		= 11,	/* no device */
+ 
+ 	/* struct ata_link flags */
+ 	ATA_LFLAG_NO_HRST	= (1 << 1), /* avoid hardreset */
+@@ -1520,7 +1521,8 @@ static inline unsigned int ata_class_enabled(unsigned int class)
+ static inline unsigned int ata_class_disabled(unsigned int class)
+ {
+ 	return class == ATA_DEV_ATA_UNSUP || class == ATA_DEV_ATAPI_UNSUP ||
+-		class == ATA_DEV_PMP_UNSUP || class == ATA_DEV_SEMB_UNSUP;
++		class == ATA_DEV_PMP_UNSUP || class == ATA_DEV_SEMB_UNSUP ||
++		class == ATA_DEV_ZAC_UNSUP;
+ }
+ 
+ static inline unsigned int ata_class_absent(unsigned int class)
+-- 
+2.8.1
+

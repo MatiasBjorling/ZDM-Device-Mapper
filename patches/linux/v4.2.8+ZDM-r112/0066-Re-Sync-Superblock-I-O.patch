@@ -1,0 +1,50 @@
+From 1b319bcf240b49421f449654d46098e2ff553952 Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Sun, 1 May 2016 17:58:10 -0500
+Subject: [PATCH 66/71] Re-Sync Superblock I/O
+
+Fixup superblock write and read so zdmadm -r <device> works again.
+
+Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
+---
+ drivers/md/libzdm.c | 5 +----
+ 1 file changed, 1 insertion(+), 4 deletions(-)
+
+diff --git a/drivers/md/libzdm.c b/drivers/md/libzdm.c
+index d48afa1..89e20ac 100644
+--- a/drivers/md/libzdm.c
++++ b/drivers/md/libzdm.c
+@@ -4371,7 +4371,6 @@ static int z_mapped_sync(struct zdm *znd)
+ 	int rc = 1;
+ 	int discards = 0;
+ 	int maps = 0;
+-	int jwrote = 0;
+ 	int cached = 0;
+ 	int idx = 0;
+ 	int no;
+@@ -4495,21 +4494,19 @@ static int z_mapped_sync(struct zdm *znd)
+ 
+ 				n_writes++, n_blocks += cached;
+ 				idx = 0;
+-				jwrote += cached;
+ 				cached  = 0;
+ 			}
+ 			mc = mcache_put_get_next(znd, mc, no);
+ 		}
+ 	}
+-	jwrote += cached;
+ 	if (discards > 40)
+ 		Z_ERR(znd, "**WARNING** large discard cache %d", discards);
+ 	if (maps > 40)
+ 		Z_ERR(znd, "**WARNING** large map cache %d", maps);
+ 
+ 	znd->bmkeys->md_crc = crc_md_le16(znd->md_crcs, Z_CRC_4K << 1);
+-	znd->bmkeys->n_crcs = cpu_to_le16(jwrote);
+ 	znd->bmkeys->discards = cpu_to_le16(discards);
++	znd->bmkeys->n_crcs = cpu_to_le16(maps + discards);
+ 	znd->bmkeys->maps = cpu_to_le16(maps);
+ 	znd->bmkeys->crc32 = 0;
+ 	znd->bmkeys->crc32 = cpu_to_le32(crc32c(~0u, znd->bmkeys, Z_CRC_4K));
+-- 
+2.8.1
+

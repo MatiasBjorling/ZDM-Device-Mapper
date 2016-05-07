@@ -1,0 +1,393 @@
+From 276307a1a759fecf06ac25cae8c9ff278b39df09 Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Sun, 1 May 2016 15:54:38 -0500
+Subject: [PATCH 65/71] Re-Sync Superblock I/O
+
+Fixup superblock write and read so zdmadm -r <device> works again.
+
+Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
+---
+ drivers/md/dm-zdm.c |   2 -
+ drivers/md/libzdm.c | 193 ++++++++++++++++++++++++++--------------------------
+ 2 files changed, 96 insertions(+), 99 deletions(-)
+
+diff --git a/drivers/md/dm-zdm.c b/drivers/md/dm-zdm.c
+index 74774c4..519dc2f 100644
+--- a/drivers/md/dm-zdm.c
++++ b/drivers/md/dm-zdm.c
+@@ -664,8 +664,6 @@ static void zoned_dtr(struct dm_target *ti)
+ 	kthread_stop(znd->bio_kthread);
+ 	kfifo_free(&znd->bio_fifo);
+ #endif
+-	if (znd->bio_set)
+-		bioset_free(znd->bio_set);
+ 	zdm_remove_proc_entries(znd);
+ 	zoned_destroy(znd);
+ }
+diff --git a/drivers/md/libzdm.c b/drivers/md/libzdm.c
+index 06d0157..d48afa1 100644
+--- a/drivers/md/libzdm.c
++++ b/drivers/md/libzdm.c
+@@ -758,8 +758,8 @@ static inline int is_ready_for_gc(struct zdm *znd, u32 z_id)
+ #define VM_04    (GET_VM  |  4)
+ #define VM_12    (GET_VM  | 12)
+ #define VM_21    (GET_VM  | 21)
+-#define VM_22    (GET_VM  | 22)
+ #define MP_22    (GET_PGS | 22)
++#define MP_23    (GET_PGS | 23)
+ 
+ #define ZDM_FREE(z, _p, sz, id) \
+ 	do { zdm_free((z), (_p), (sz), (id)); (_p) = NULL; } while (0)
+@@ -836,10 +836,6 @@ static void zdm_free(struct zdm *znd, void *p, size_t sz, u32 code)
+ 			free_page((unsigned long)p);
+ 			break;
+ 		case GET_PGS:
+-			{
+-				int order = ilog2(sz >> PAGE_SHIFT);
+-				pr_err("SZ: %lu -> ORDER: %u\n", sz, order);
+-			}
+ 			free_pages((unsigned long)p, ilog2(sz >> PAGE_SHIFT));
+ 			break;
+ 		case GET_KM:
+@@ -940,8 +936,6 @@ static void *zdm_alloc(struct zdm *znd, size_t sz, int code, gfp_t gfp)
+ 			struct page *pgs = alloc_pages(gfp_mask, order);
+ 			if (pgs)
+ 				pmem = page_address(pgs);
+-
+-			pr_err("SZ: %lu -> ORDER: %u\n", sz, order);
+ 		}
+ 		break;
+ 	case GET_KM:
+@@ -1318,7 +1312,7 @@ static void _free_md_journal(struct zdm *znd)
+ 	u32 avail = jrnl->size;
+ 
+ 	if (znd->jrnl.wb && avail)
+-		ZDM_FREE(znd, jrnl->wb, avail * sizeof(*jrnl->wb), VM_03);
++		ZDM_FREE(znd, jrnl->wb, avail * sizeof(*jrnl->wb), MP_23);
+ 	jrnl->size = 0;
+ }
+ 
+@@ -1393,6 +1387,13 @@ static void zoned_destroy(struct zdm *znd)
+ 
+ 	_free_md_journal(znd);
+ 
++	if (znd->bio_set) {
++		struct bio_set *bs = znd->bio_set;
++
++		znd->bio_set = NULL;
++		bioset_free(bs);
++	}
++
+ 	ZDM_FREE(NULL, znd, sizeof(*znd), KM_00);
+ }
+ 
+@@ -1405,8 +1406,8 @@ static void zoned_destroy(struct zdm *znd)
+ static int _init_md_journal(struct zdm *znd)
+ {
+ 	struct md_journal *jrnl = &znd->jrnl;
+-	u32 blks = (znd->md_start - WB_JRNL_BASE) >> 12;
+-	u32 avail = (blks << 12) / sizeof(*jrnl->wb);
++	u32 blks = (znd->md_start - WB_JRNL_BASE) >> PAGE_SHIFT;
++	u32 avail = (blks << PAGE_SHIFT) / sizeof(*jrnl->wb);
+ 	u32 iter;
+ 
+ 	Z_ERR(znd, "MD journal space: %u [%u]", avail, blks);
+@@ -1418,7 +1419,7 @@ static int _init_md_journal(struct zdm *znd)
+ 	if (avail > WB_JRNL_MIN)
+ 		avail = WB_JRNL_MIN;
+ 
+-	jrnl->wb = ZDM_ALLOC(znd, avail * sizeof(*jrnl->wb), VM_03, NORMAL);
++	jrnl->wb = ZDM_ALLOC(znd, avail * sizeof(*jrnl->wb), MP_23, NORMAL);
+ 	jrnl->size = avail;
+ 
+ 	if (!jrnl->wb) {
+@@ -4298,44 +4299,63 @@ static struct bio *next_bio(struct bio *bio, gfp_t gfp, unsigned int nr_pages,
+ 	return new;
+ }
+ 
++static unsigned int bio_add_km(struct bio *bio, void *kmem, int pgs)
++{
++	unsigned int added = 0;
++	unsigned int len = pgs << PAGE_SHIFT;
++	struct page *pg;
++	unsigned long addr = (unsigned long)kmem;
++	if (addr && bio) {
++		pg = virt_to_page((void*)addr);
++		if (pg) {
++			added = bio_add_page(bio, pg, len, 0);
++			if (added != len)
++				pr_err("Failed to add %u to bio\n", len);
++		} else {
++			pr_err("Invalid pg ? \n");
++		}
++	} else {
++		pr_err("Invalid addr / bio ? \n");
++	}
++	return added;
++}
++
+ static int bio_add_wp(struct bio *bio, struct zdm *znd, int idx)
+ {
+ 	int len;
+ 	struct meta_pg *wpg = &znd->wp[idx];
+ 
+ 	znd->bmkeys->wp_crc[idx] = crc_md_le16(wpg->wp_alloc, Z_CRC_4K);
+-	len = bio_add_page(bio, virt_to_page(wpg->wp_alloc), Z_C4K, 0);
++	len = bio_add_km(bio, wpg->wp_alloc, 1);
+ 	znd->bmkeys->zf_crc[idx] = crc_md_le16(wpg->zf_est, Z_CRC_4K);
+-	len += bio_add_page(bio, virt_to_page(wpg->zf_est), Z_C4K, 0);
++	len += bio_add_km(bio, wpg->zf_est, 1);
+ 
+ 	return len;
+ }
+ 
+-static int bio_add_vm(struct bio *bio, void *vm, int pgs)
++/**
++ * is_key_page() - Probe block for magic and crc to see if it is recognized.
++ * @_data: ZDM instance
++ */
++static inline int is_key_page(void *_data)
+ {
+-	u8 *mem = vm;
+-	unsigned long len = pgs << PAGE_SHIFT;
+-	struct page *pg;
+-	unsigned int offset = 0;
+-	unsigned int pg_len = 0;
+-	unsigned int added;
+-
+-	flush_kernel_vmap_range(vm, len);
+-	offset = offset_in_page(mem);
+-	while (len) {
+-		pg = vmalloc_to_page(mem);
+-		pg_len = PAGE_SIZE - offset;
+-		if (pg_len > len)
+-			pg_len = len;
+-
+-		added = bio_add_page(bio, pg, pg_len, offset);
+-		if (added != pg_len) {
+-			return -EIO;
+-		}
+-		mem += PAGE_SIZE - offset;
+-		len -= pg_len;
++	int is_key = 0;
++	struct mz_superkey *data = _data;
++
++	/* Starts with Z_KEY_SIG and ends with magic */
++
++	if (le64_to_cpu(data->sig1) == Z_KEY_SIG &&
++	    le64_to_cpu(data->magic) == Z_TABLE_MAGIC) {
++		__le32 orig = data->crc32;
++		__le32 crc_check;
++
++		data->crc32 = 0;
++		crc_check = cpu_to_le32(crc32c(~0u, data, Z_CRC_4K));
++		data->crc32 = orig;
++		if (crc_check == orig)
++			is_key = 1;
+ 	}
+-	return 0;
++	return is_key;
+ }
+ 
+ /**
+@@ -4399,23 +4419,13 @@ static int z_mapped_sync(struct zdm *znd)
+ 		}
+ 		lba += 2;
+ 	}
+-
+ 	lba = (generation % modulo) * incr;
+ 	if (lba == 0)
+ 		lba++;
+-
+-	cached = jrnl->size >> 10;
+-	znd->bmkeys->generation = cpu_to_le64(generation);
+-	znd->bmkeys->wb_blocks = cpu_to_le32(cached);
+-	znd->bmkeys->wb_next = cpu_to_le32(jrnl->wb_next);
+-	znd->bmkeys->wb_crc32 = crc32c_le32(~0u, jrnl->wb, jrnl->size);
+-	znd->bmkeys->gc_resv = cpu_to_le32(znd->z_gc_resv);
+-	znd->bmkeys->meta_resv = cpu_to_le32(znd->z_meta_resv);
+-
+ 	if (bio)
+ 		n_writes++, n_blocks += 2;
+ 
+-	bio = next_bio(bio, GFP_KERNEL, cached, znd->bio_set);
++	bio = next_bio(bio, GFP_KERNEL, BIO_MAX_PAGES, znd->bio_set);
+ 	if (!bio) {
+ 		Z_ERR(znd, "%s: alloc bio.", __func__);
+ 		rc = -ENOMEM;
+@@ -4425,9 +4435,20 @@ static int z_mapped_sync(struct zdm *znd)
+ 	bio->bi_bdev = znd->dev->bdev;
+ 	bio->bi_rw = WRITE;
+ 	bio->bi_iter.bi_size = 0;
+-	rc = bio_add_vm(bio, jrnl->wb, cached);
+-	if (rc)
++
++	cached = jrnl->size >> 10;
++	if (!bio_add_km(bio, jrnl->wb, cached)) {
++		rc = -EIO;
++		Z_ERR(znd, "%s: bio_add_km -> %d", __func__, rc);
+ 		goto out;
++	}
++
++	znd->bmkeys->generation = cpu_to_le64(generation);
++	znd->bmkeys->wb_blocks = cpu_to_le32(cached);
++	znd->bmkeys->wb_next = cpu_to_le32(jrnl->wb_next);
++	znd->bmkeys->wb_crc32 = crc32c_le32(~0u, jrnl->wb, jrnl->size);
++	znd->bmkeys->gc_resv = cpu_to_le32(znd->z_gc_resv);
++	znd->bmkeys->meta_resv = cpu_to_le32(znd->z_meta_resv);
+ 
+ 	lba += cached;
+ 	idx = 0;
+@@ -4445,8 +4466,7 @@ static int z_mapped_sync(struct zdm *znd)
+ 				znd->bmkeys->crcs[idx] = crc_md_le16(mc->jdata,
+ 								     Z_CRC_4K);
+ 				idx++;
+-				bio_add_page(bio, virt_to_page(mc->jdata),
+-					     Z_C4K, 0);
++				bio_add_km(bio, mc->jdata, 1);
+ 				if (wset_count < SYNC_MAX) {
+ 					wset[wset_count++] = mc;
+ 					mcache_ref(mc);
+@@ -4487,15 +4507,15 @@ static int z_mapped_sync(struct zdm *znd)
+ 	if (maps > 40)
+ 		Z_ERR(znd, "**WARNING** large map cache %d", maps);
+ 
+-	znd->bmkeys->md_crc = crc_md_le16(znd->md_crcs, 2 * Z_CRC_4K);
++	znd->bmkeys->md_crc = crc_md_le16(znd->md_crcs, Z_CRC_4K << 1);
+ 	znd->bmkeys->n_crcs = cpu_to_le16(jwrote);
+ 	znd->bmkeys->discards = cpu_to_le16(discards);
+ 	znd->bmkeys->maps = cpu_to_le16(maps);
+ 	znd->bmkeys->crc32 = 0;
+ 	znd->bmkeys->crc32 = cpu_to_le32(crc32c(~0u, znd->bmkeys, Z_CRC_4K));
+ 	if (cached < (BIO_MAX_PAGES - 3)) {
+-		bio_add_page(bio, virt_to_page(znd->bmkeys), Z_C4K, 0);
+-		bio_add_page(bio, virt_to_page(znd->md_crcs), Z_C4K << 1, 0);
++		bio_add_km(bio, znd->z_sballoc, 1);
++		bio_add_km(bio, znd->md_crcs, 2);
+ 		more_data = 0;
+ 	}
+ 
+@@ -4509,8 +4529,8 @@ static int z_mapped_sync(struct zdm *znd)
+ 		n_writes++, n_blocks += cached;
+ 		cached = 0;
+ 
+-		bio_add_page(bio, virt_to_page(znd->bmkeys), Z_C4K, 0);
+-		bio_add_page(bio, virt_to_page(znd->md_crcs), Z_C4K << 1, 0);
++		bio_add_km(bio, znd->z_sballoc, 1);
++		bio_add_km(bio, znd->md_crcs, 2);
+ 	}
+ 	cached += 3;
+ 
+@@ -4535,31 +4555,6 @@ out:
+ }
+ 
+ /**
+- * is_key_page() - Probe block for magic and crc to see if it is recognized.
+- * @_data: ZDM instance
+- */
+-static inline int is_key_page(void *_data)
+-{
+-	int is_key = 0;
+-	struct mz_superkey *data = _data;
+-
+-	/* Starts with Z_KEY_SIG and ends with magic */
+-
+-	if (le64_to_cpu(data->sig1) == Z_KEY_SIG &&
+-	    le64_to_cpu(data->magic) == Z_TABLE_MAGIC) {
+-		__le32 orig = data->crc32;
+-		__le32 crc_check;
+-
+-		data->crc32 = 0;
+-		crc_check = cpu_to_le32(crc32c(~0u, data, Z_CRC_4K));
+-		data->crc32 = orig;
+-		if (crc_check == orig)
+-			is_key = 1;
+-	}
+-	return is_key;
+-}
+-
+-/**
+  * zoned_personality() - Update zdstart value from superblock
+  * @znd: ZDM instance
+  * @sblock: Lba to start scanning for superblock.
+@@ -4593,6 +4588,8 @@ int find_superblock_at(struct zdm *znd, u64 lba, int use_wq, int do_init)
+ 	}
+ 	if (lba == 0)
+ 		lba++;
++
++	lba += WB_JRNL_BLKS;
+ 	do {
+ 		rc = read_block(ti, DM_IO_KMEM, data, lba, nblks, use_wq);
+ 		if (rc) {
+@@ -4615,7 +4612,8 @@ int find_superblock_at(struct zdm *znd, u64 lba, int use_wq, int do_init)
+ 		if (data[0] == 0 && data[1] == 0) {
+ 			/* No SB here. */
+ 			Z_ERR(znd, "FGen: Invalid block %" PRIx64 "?", lba);
+-			goto out;
++			if (count > 16)
++				goto out;
+ 		}
+ 		lba++;
+ 		count++;
+@@ -4918,6 +4916,21 @@ static int z_mapped_init(struct zdm *znd)
+ 
+ 	memcpy(znd->bmkeys, io_vcache, sizeof(*znd->bmkeys));
+ 
++	/* read WB Journal map */
++	nblks = le32_to_cpu(znd->bmkeys->wb_blocks);
++	jrnl->size = nblks << 10;
++	rc = read_block(ti, DM_IO_KMEM, jrnl->wb, lba, nblks, wq);
++	if (rc)
++		goto out;
++
++	lba += nblks;
++	jrnl->wb_next = le32_to_cpu(znd->bmkeys->wb_next);
++	if (znd->bmkeys->wb_crc32 != crc32c_le32(~0u, jrnl->wb, jrnl->size)) {
++		rc = -EIO;
++		Z_ERR(znd, "WB Journal corrupt.");
++		goto out;
++	}
++
+ 	/* read in map cache */
+ 	for (idx = 0; idx < le16_to_cpu(znd->bmkeys->maps); idx++) {
+ 		rc = do_load_map_cache(znd, lba++, jcount++, wq);
+@@ -4937,7 +4950,7 @@ static int z_mapped_init(struct zdm *znd)
+ 		lba++;
+ 
+ 	/* read in CRC pgs */
+-	rc = read_block(ti, DM_IO_VMA, znd->md_crcs, lba, 2, wq);
++	rc = read_block(ti, DM_IO_KMEM, znd->md_crcs, lba, 2, wq);
+ 	if (rc)
+ 		goto out;
+ 
+@@ -5007,18 +5020,6 @@ static int z_mapped_init(struct zdm *znd)
+ 	znd->z_gc_resv   = le32_to_cpu(znd->bmkeys->gc_resv);
+ 	znd->z_meta_resv = le32_to_cpu(znd->bmkeys->meta_resv);
+ 
+-	lba = WB_JRNL_IDX;
+-	nblks = jrnl->size >> 10;
+-	rc = read_block(ti, DM_IO_VMA, jrnl->wb, lba, nblks, wq);
+-	if (rc)
+-		goto out;
+-
+-	jrnl->wb_next = le32_to_cpu(znd->bmkeys->wb_next);
+-	if (znd->bmkeys->wb_crc32 != crc32c_le32(~0u, jrnl->wb, jrnl->size)) {
+-		Z_ERR(znd, "WB Journal corrupt.");
+-		goto out;
+-	}
+-
+ 	for (idx = 0; idx < jrnl->size; idx++) {
+ 		u64 blba;
+ 		u64 tlba;
+@@ -5062,8 +5063,6 @@ static int z_mapped_init(struct zdm *znd)
+ 		put_map_entry(expg);
+ 	}
+ 
+-
+-
+ out:
+ 	put_io_vcache(znd, io_vcache);
+ 	mutex_unlock(&znd->vcio_lock);
+-- 
+2.8.1
+

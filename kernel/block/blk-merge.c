@@ -172,9 +172,9 @@ void blk_queue_split(struct request_queue *q, struct bio **bio,
 	struct bio *split, *res;
 	unsigned nsegs;
 
-	if ((*bio)->bi_op == REQ_OP_DISCARD)
+	if ((*bio)->bi_rw & REQ_DISCARD)
 		split = blk_bio_discard_split(q, *bio, bs, &nsegs);
-	else if ((*bio)->bi_op == REQ_OP_WRITE_SAME)
+	else if ((*bio)->bi_rw & REQ_WRITE_SAME)
 		split = blk_bio_write_same_split(q, *bio, bs, &nsegs);
 	else
 		split = blk_bio_segment_split(q, *bio, q->bio_split, &nsegs);
@@ -213,10 +213,10 @@ static unsigned int __blk_recalc_rq_segments(struct request_queue *q,
 	 * This should probably be returning 0, but blk_add_request_payload()
 	 * (Christoph!!!!)
 	 */
-	if (bio->bi_op == REQ_OP_DISCARD)
+	if (bio->bi_rw & REQ_DISCARD)
 		return 1;
 
-	if (bio->bi_op == REQ_OP_WRITE_SAME)
+	if (bio->bi_rw & REQ_WRITE_SAME)
 		return 1;
 
 	fbio = bio;
@@ -385,7 +385,7 @@ static int __blk_bios_map_sg(struct request_queue *q, struct bio *bio,
 	nsegs = 0;
 	cluster = blk_queue_cluster(q);
 
-	if (bio->bi_op == REQ_OP_DISCARD) {
+	if (bio->bi_rw & REQ_DISCARD) {
 		/*
 		 * This is a hack - drivers should be neither modifying the
 		 * biovec, nor relying on bi_vcnt - but because of
@@ -400,7 +400,7 @@ static int __blk_bios_map_sg(struct request_queue *q, struct bio *bio,
 		return 0;
 	}
 
-	if (bio->bi_op == REQ_OP_WRITE_SAME) {
+	if (bio->bi_rw & REQ_WRITE_SAME) {
 single_segment:
 		*sg = sglist;
 		bvec = bio_iovec(bio);
@@ -439,7 +439,7 @@ int blk_rq_map_sg(struct request_queue *q, struct request *rq,
 	}
 
 	if (q->dma_drain_size && q->dma_drain_needed(rq)) {
-		if (op_is_write(rq->op))
+		if (rq->cmd_flags & REQ_WRITE)
 			memset(q->dma_drain_buffer, 0, q->dma_drain_size);
 
 		sg_unmark_end(sg);
@@ -500,7 +500,7 @@ int ll_back_merge_fn(struct request_queue *q, struct request *req,
 	    integrity_req_gap_back_merge(req, bio))
 		return 0;
 	if (blk_rq_sectors(req) + bio_sectors(bio) >
-	    blk_rq_get_max_sectors(req)) {
+	    blk_rq_get_max_sectors(req, blk_rq_pos(req))) {
 		req->cmd_flags |= REQ_NOMERGE;
 		if (req == q->last_merge)
 			q->last_merge = NULL;
@@ -524,7 +524,7 @@ int ll_front_merge_fn(struct request_queue *q, struct request *req,
 	    integrity_req_gap_front_merge(req, bio))
 		return 0;
 	if (blk_rq_sectors(req) + bio_sectors(bio) >
-	    blk_rq_get_max_sectors(req)) {
+	    blk_rq_get_max_sectors(req, bio->bi_iter.bi_sector)) {
 		req->cmd_flags |= REQ_NOMERGE;
 		if (req == q->last_merge)
 			q->last_merge = NULL;
@@ -570,7 +570,7 @@ static int ll_merge_requests_fn(struct request_queue *q, struct request *req,
 	 * Will it become too large?
 	 */
 	if ((blk_rq_sectors(req) + blk_rq_sectors(next)) >
-	    blk_rq_get_max_sectors(req))
+	    blk_rq_get_max_sectors(req, blk_rq_pos(req)))
 		return 0;
 
 	total_phys_segments = req->nr_phys_segments + next->nr_phys_segments;
@@ -604,7 +604,7 @@ static int ll_merge_requests_fn(struct request_queue *q, struct request *req,
  */
 void blk_rq_set_mixed_merge(struct request *rq)
 {
-	unsigned int ff = rq->cmd_flags & REQ_FAILFAST_MASK;
+	u64 ff = rq->cmd_flags & REQ_FAILFAST_MASK;
 	struct bio *bio;
 
 	if (rq->cmd_flags & REQ_MIXED_MERGE)
@@ -649,8 +649,7 @@ static int attempt_merge(struct request_queue *q, struct request *req,
 	if (!rq_mergeable(req) || !rq_mergeable(next))
 		return 0;
 
-	if (!blk_check_merge_flags(req->cmd_flags, req->op, next->cmd_flags,
-				   next->op))
+	if (!blk_check_merge_flags(req->cmd_flags, next->cmd_flags))
 		return 0;
 
 	/*
@@ -664,7 +663,7 @@ static int attempt_merge(struct request_queue *q, struct request *req,
 	    || req_no_special_merge(next))
 		return 0;
 
-	if (req->op == REQ_OP_WRITE_SAME &&
+	if (req->cmd_flags & REQ_WRITE_SAME &&
 	    !blk_write_same_mergeable(req->bio, next->bio))
 		return 0;
 
@@ -752,8 +751,7 @@ bool blk_rq_merge_ok(struct request *rq, struct bio *bio)
 	if (!rq_mergeable(rq) || !bio_mergeable(bio))
 		return false;
 
-	if (!blk_check_merge_flags(rq->cmd_flags, rq->op, bio->bi_rw,
-				   bio->bi_op))
+	if (!blk_check_merge_flags(rq->cmd_flags, bio->bi_rw))
 		return false;
 
 	/* different data direction or already started, don't merge */
@@ -769,7 +767,7 @@ bool blk_rq_merge_ok(struct request *rq, struct bio *bio)
 		return false;
 
 	/* must be using the same buffer */
-	if (rq->op == REQ_OP_WRITE_SAME &&
+	if (rq->cmd_flags & REQ_WRITE_SAME &&
 	    !blk_write_same_mergeable(rq->bio, bio))
 		return false;
 

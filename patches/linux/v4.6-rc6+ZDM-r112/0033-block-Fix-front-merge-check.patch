@@ -1,0 +1,72 @@
+From c65085dc50f66969d5a41cde1c741054241d7183 Mon Sep 17 00:00:00 2001
+From: Damien Le Moal <damien.lemoal@hgst.com>
+Date: Wed, 13 Apr 2016 03:31:36 +0900
+Subject: [PATCH 33/64] block: Fix front merge check
+
+For a front merge, the maximum number of sectors of the
+request must be checked against the front merge BIO sector,
+not the current sector of the request.
+
+Signed-off-by: Damien Le Moal <damien.lemoal@hgst.com>
+---
+ block/blk-merge.c      | 6 +++---
+ include/linux/blkdev.h | 5 +++--
+ 2 files changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/block/blk-merge.c b/block/blk-merge.c
+index 2613531..b736569 100644
+--- a/block/blk-merge.c
++++ b/block/blk-merge.c
+@@ -500,7 +500,7 @@ int ll_back_merge_fn(struct request_queue *q, struct request *req,
+ 	    integrity_req_gap_back_merge(req, bio))
+ 		return 0;
+ 	if (blk_rq_sectors(req) + bio_sectors(bio) >
+-	    blk_rq_get_max_sectors(req)) {
++	    blk_rq_get_max_sectors(req, blk_rq_pos(req))) {
+ 		req->cmd_flags |= REQ_NOMERGE;
+ 		if (req == q->last_merge)
+ 			q->last_merge = NULL;
+@@ -524,7 +524,7 @@ int ll_front_merge_fn(struct request_queue *q, struct request *req,
+ 	    integrity_req_gap_front_merge(req, bio))
+ 		return 0;
+ 	if (blk_rq_sectors(req) + bio_sectors(bio) >
+-	    blk_rq_get_max_sectors(req)) {
++	    blk_rq_get_max_sectors(req, bio->bi_iter.bi_sector)) {
+ 		req->cmd_flags |= REQ_NOMERGE;
+ 		if (req == q->last_merge)
+ 			q->last_merge = NULL;
+@@ -570,7 +570,7 @@ static int ll_merge_requests_fn(struct request_queue *q, struct request *req,
+ 	 * Will it become too large?
+ 	 */
+ 	if ((blk_rq_sectors(req) + blk_rq_sectors(next)) >
+-	    blk_rq_get_max_sectors(req))
++	    blk_rq_get_max_sectors(req, blk_rq_pos(req)))
+ 		return 0;
+ 
+ 	total_phys_segments = req->nr_phys_segments + next->nr_phys_segments;
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 669e419..ec5b53f 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -892,7 +892,8 @@ static inline unsigned int blk_max_size_offset(struct request_queue *q,
+ 			(offset & (q->limits.chunk_sectors - 1));
+ }
+ 
+-static inline unsigned int blk_rq_get_max_sectors(struct request *rq)
++static inline unsigned int blk_rq_get_max_sectors(struct request *rq,
++						  sector_t offset)
+ {
+ 	struct request_queue *q = rq->q;
+ 
+@@ -902,7 +903,7 @@ static inline unsigned int blk_rq_get_max_sectors(struct request *rq)
+ 	if (!q->limits.chunk_sectors || (rq->cmd_flags & REQ_DISCARD))
+ 		return blk_queue_get_max_sectors(q, rq->cmd_flags);
+ 
+-	return min(blk_max_size_offset(q, blk_rq_pos(rq)),
++	return min(blk_max_size_offset(q, offset),
+ 			blk_queue_get_max_sectors(q, rq->cmd_flags));
+ }
+ 
+-- 
+2.8.1
+

@@ -293,7 +293,7 @@ void ata_scsi_set_sense_information(struct ata_device *dev,
 		return;
 
 	information = ata_tf_read_block(tf, dev);
-	if (information == (u64)-1)
+	if (information == U64_MAX)
 		return;
 
 	scsi_set_sense_information(cmd->sense_buffer,
@@ -1147,12 +1147,12 @@ static void ata_gen_ata_sense(struct ata_queued_cmd *qc)
 		ata_scsi_set_sense(dev, cmd, ABORTED_COMMAND, 0, 0);
 		return;
 	}
+
 	block = ata_tf_read_block(&qc->result_tf, dev);
-	if (block == (u64)-1)
+	if (block == U64_MAX)
 		return;
 
-	scsi_set_sense_information(cmd->sense_buffer, SCSI_SENSE_BUFFERSIZE,
-				   block);
+	scsi_set_sense_information(sb, SCSI_SENSE_BUFFERSIZE, block);
 }
 
 static void ata_scsi_sdev_config(struct scsi_device *sdev)
@@ -1190,7 +1190,7 @@ static int atapi_drain_needed(struct request *rq)
 	if (likely(rq->cmd_type != REQ_TYPE_BLOCK_PC))
 		return 0;
 
-	if (!blk_rq_bytes(rq) || op_is_write(rq->op))
+	if (!blk_rq_bytes(rq) || (rq->cmd_flags & REQ_WRITE))
 		return 0;
 
 	return atapi_cmd_type(rq->cmd[0]) == ATAPI_MISC;
@@ -2433,6 +2433,7 @@ static unsigned int ata_msense_caching(u16 *id, u8 *buf, bool changeable)
 
 /**
  *	ata_msense_ctl_mode - Simulate MODE SENSE control mode page
+ *	@dev: ATA device of interest
  *	@buf: output buffer
  *	@changeable: whether changeable parameters are requested
  *
@@ -3304,6 +3305,45 @@ static unsigned int ata_scsi_write_same_xlat(struct ata_queued_cmd *qc)
 		goto invalid_param_len;
 
 	buf = page_address(sg_page(scsi_sglist(scmd)));
+
+	if (ata_id_sct_write_same(dev->id))
+	{
+		u16 *sctpg = buf;
+
+		put_unaligned_le16(0x0002,  &sctpg[0]); /* SCT_ACT_WRITE_SAME */
+		put_unaligned_le16(0x0101,  &sctpg[1]); /* WRITE PTRN FG */
+		put_unaligned_le64(block,   &sctpg[2]);
+		put_unaligned_le64(n_block, &sctpg[6]);
+		put_unaligned_le32(0u,      &sctpg[10]);
+
+		tf->hob_feature = 0;
+		tf->feature = 0;
+		tf->hob_nsect = 0;
+		tf->nsect = 1;
+		tf->lbah = 0;
+		tf->lbam = 0;
+		tf->lbal = ATA_CMD_STANDBYNOW1;
+		tf->hob_lbah = 0;
+		tf->hob_lbam = 0;
+		tf->hob_lbal = 0;
+		tf->device = ATA_CMD_STANDBYNOW1;
+		tf->protocol = ATA_PROT_DMA;
+		tf->command = ATA_CMD_WRITE_LOG_DMA_EXT;
+
+#if 0
+		if (ata_ncq_enabled(dev)) {
+			tf->protocol = ATA_PROT_NCQ;
+			tf->command = ATA_CMD_WRITE_LOG_EXT;
+		}
+#endif
+		tf->flags |= ATA_TFLAG_ISADDR | ATA_TFLAG_DEVICE |
+			     ATA_TFLAG_LBA48 | ATA_TFLAG_WRITE;
+
+		ata_qc_set_pc_nbytes(qc);
+
+		return 0;
+	}
+
 	size = ata_set_lba_range_entries(buf, 512, block, n_block);
 
 	if (ata_ncq_enabled(dev) && ata_fpdma_dsm_supported(dev)) {
@@ -3456,7 +3496,7 @@ static unsigned int ata_scsi_zbc_in_xlat(struct ata_queued_cmd *qc)
 	options = cdb[14];
 
 	if (ata_ncq_enabled(qc->dev) &&
-	    (qc->dev->flags & ATA_DFLAG_NCQ_SEND_RECV)) {
+	    ata_fpdma_zac_mgmt_in_supported(qc->dev)) {
 		tf->protocol = ATA_PROT_NCQ;
 		tf->command = ATA_CMD_FPDMA_RECV;
 		tf->hob_nsect = ATA_SUBCMD_FPDMA_RECV_ZAC_MGMT_IN & 0x1f;
@@ -3576,6 +3616,7 @@ invalid_param_len:
  *	@qc: Storage for translated ATA taskfile
  *	@buf: input buffer
  *	@len: number of valid bytes in the input buffer
+ *	@fp: out parameter for the failed field on error
  *
  *	Prepare a taskfile to modify caching information for the device.
  *
@@ -3632,6 +3673,7 @@ static int ata_mselect_caching(struct ata_queued_cmd *qc,
  *	@qc: Storage for translated ATA taskfile
  *	@buf: input buffer
  *	@len: number of valid bytes in the input buffer
+ *	@fp: out parameter for the failed field on error
  *
  *	Prepare a taskfile to modify caching information for the device.
  *

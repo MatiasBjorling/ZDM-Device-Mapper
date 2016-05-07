@@ -428,7 +428,6 @@ int ext4_encrypted_zeroout(struct inode *inode, ext4_lblk_t lblk,
 		bio->bi_bdev = inode->i_sb->s_bdev;
 		bio->bi_iter.bi_sector =
 			pblk << (inode->i_sb->s_blocksize_bits - 9);
-		bio->bi_op = REQ_OP_WRITE;
 		ret = bio_add_page(bio, ciphertext_page,
 				   inode->i_sb->s_blocksize, 0);
 		if (ret != inode->i_sb->s_blocksize) {
@@ -440,7 +439,7 @@ int ext4_encrypted_zeroout(struct inode *inode, ext4_lblk_t lblk,
 			err = -EIO;
 			goto errout;
 		}
-		err = submit_bio_wait(bio);
+		err = submit_bio_wait(WRITE, bio);
 		if ((err == 0) && bio->bi_error)
 			err = -EIO;
 		bio_put(bio);

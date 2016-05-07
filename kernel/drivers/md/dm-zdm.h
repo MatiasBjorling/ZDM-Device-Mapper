@@ -59,7 +59,8 @@
 #define Z_AQ_META_STREAM	(Z_AQ_META | Z_AQ_STREAM_ID | 0xFE)
 
 #define Z_C4K			(4096ul)
-#define Z_UNSORTED		(Z_C4K / sizeof(struct map_sect_to_lba))
+#define Z_UNSORTED		(Z_C4K / sizeof(struct map_cache_entry))
+#define Z_MAP_MAX		(Z_UNSORTED - 1)
 #define Z_BLOCKS_PER_DM_SECTOR	(Z_C4K/512)
 #define MZ_METADATA_ZONES	(8ul)
 #define Z_SHFT4K		(3)
@@ -71,6 +72,11 @@
 #define MIN_ZONED_VERSION	1
 #define Z_VERSION		1
 #define MAX_ZONED_VERSION	1
+
+#define ZONE_SECT_BITS		19
+#define Z_BLKBITS		16
+#define Z_BLKSZ			(1ul << Z_BLKBITS)
+#define Z_SMR_SZ_BYTES		(Z_C4K << Z_BLKBITS)
 
 #define UUID_LEN		16
 
@@ -114,7 +120,7 @@
 #define FWD_KEY_BASE		(WP_ZF_BASE + (MAX_WP_BLKS * 2))
 
 #define WB_JRNL_MIN		4096u
-#define WB_JRNL_MAX		16384u
+#define WB_JRNL_MAX		WB_JRNL_MIN /* 16384u */
 #define WB_JRNL_BLKS		(WB_JRNL_MAX >> 10)
 #define WB_JRNL_IDX		(FWD_KEY_BASE + FWD_KEY_BLOCKS)
 #define WB_JRNL_BASE		(WB_JRNL_IDX + WB_JRNL_BLKS)
@@ -183,6 +189,7 @@ enum pg_flag_enum {
 	WB_JRNL_2,
 	WB_DIRECT,
 	WB_RE_CACHE,
+	IN_WB_JOURNAL,
 
 	R_IN_FLIGHT,
 	W_IN_FLIGHT,
@@ -279,15 +286,30 @@ struct map_addr {
 };
 
 /**
- * struct map_sect_to_lba - Sector to LBA mapping.
+ * struct map_cache_entry - Sector to LBA mapping.
  * @tlba: tlba
  * @physical: blba or number of blocks
  *
  * Longer description of this structure.
  */
-struct map_sect_to_lba {
+struct map_cache_entry {
 	__le64 tlba;		/* record type [16 bits] + logical sector # */
 	__le64 bval;	/* csum 16 [16 bits] + 'physical' block lba */
+} __packed;
+
+struct map_cache_data {
+	struct map_cache_entry header;
+	struct map_cache_entry maps[Z_MAP_MAX];
+} __packed;
+
+struct gc_map_cache_data {
+	struct map_cache_entry header;
+	struct map_cache_entry maps[Z_BLKSZ];
+} __packed;
+
+struct jrnl_map_cache_data {
+	struct map_cache_entry header;
+	struct map_cache_entry maps[WB_JRNL_MAX];
 } __packed;
 
 /**
@@ -299,8 +321,9 @@ struct map_sect_to_lba {
 enum map_type_enum {
 	IS_MAP,
 	IS_DISCARD,
-	IS_JRNL_PG,
 	MAP_COUNT,
+	IS_JRNL_PG,
+	IS_POST_MAP,
 };
 
 /**
@@ -319,14 +342,14 @@ enum map_type_enum {
  */
 struct map_cache {
 	struct list_head mclist;
-	struct map_sect_to_lba *jdata;
+	void *mcd;
 	atomic_t refcount;
-	struct mutex cached_lock;
 	atomic_t busy_locked;
-	u32 jcount;
-	u32 jsorted;
-	u32 jsize;
-	u32 map_content; /* IS_MAP / IS_DISCARD / IS_JOURNAL */
+	struct mutex cached_lock;
+	int jcount;
+	int jsorted;
+	int jsize;
+	int map_content;
 };
 
 /**
@@ -382,6 +405,7 @@ struct map_pg {
 /**
  * struct map_crc - Map to backing crc16.
  *
+ * @lba:	Backing CRC's LBA
  * @pg_no:	Page [index] of table entry if applicable.
  * @pg_idx:	Offset within page (From: zdm::md_crcs when table is null)
  *
@@ -517,7 +541,8 @@ struct mz_superkey {
 	__le16 zf_crc[64];
 	__le16 discards;
 	__le16 maps;
-	u8 reserved[1900];
+	u8 reserved[1896];
+	__le32 wb_blocks;
 	__le32 wb_next;
 	__le32 wb_crc32;
 	__le32 crc32;
@@ -602,6 +627,7 @@ struct stale_tracking {
  * @z_mega:
  * @meta_wq:
  * @gc_postmap:
+ * @jrnl_map:
  * @io_client:
  * @io_wq:
  * @zone_action_wq:
@@ -714,12 +740,15 @@ struct zdm {
 	struct io_4k_block *io_vcache[32];
 	unsigned long io_vcache_flags;
 	u64 age;
+	u64 flush_age;
 	struct workqueue_struct *meta_wq;
 	struct map_cache gc_postmap;
+	struct map_cache jrnl_map;
 	struct dm_io_client *io_client;
 	struct workqueue_struct *io_wq;
 	struct workqueue_struct *zone_action_wq;
 	struct timer_list timer;
+	int last_op;
 
 	u32 bins[40];
 	char bdev_name[BDEVNAME_SIZE];

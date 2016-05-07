@@ -1,0 +1,249 @@
+From a18c5e305c07ca047f088abddb5071cca4b2a6a4 Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Thu, 5 May 2016 09:48:43 -0500
+Subject: [PATCH 69/71] Simplify journal writeback map handling
+
+A less efficient and also less buggy version.
+
+Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
+---
+ drivers/md/libzdm.c | 152 ++++++++++++++++++++++++----------------------------
+ 1 file changed, 70 insertions(+), 82 deletions(-)
+
+diff --git a/drivers/md/libzdm.c b/drivers/md/libzdm.c
+index ffd27d6..0fbe4ee 100644
+--- a/drivers/md/libzdm.c
++++ b/drivers/md/libzdm.c
+@@ -2236,26 +2236,26 @@ out:
+ /* Perform a binary search for KEY in BASE which has NMEMB elements
+    of SIZE bytes each.  The comparisons are done by (*COMPAR)().  */
+ 
+-static void *gnu_bsearch(const void *key, const void *base,
++static void *bsearchg(const void *key, const void *base,
+ 			 size_t nmemb, size_t size,
+ 			 int (*compar) (const void *, const void *))
+ {
+-	size_t l, u, idx;
++	size_t lower, upper, idx;
+ 	const void *p;
+ 	int comparison;
+ 
+-	l = 0;
+-	u = nmemb;
+-	while (l < u)
++	lower = 0;
++	upper = nmemb;
++	while (lower < upper)
+ 	{
+-		idx = (l + u) / 2;
++		idx = (lower + upper) / 2;
+ 		p = (void *) (((const char *) base) + (idx * size));
+ 
+ 		comparison = (*compar) (key, p);
+ 		if (comparison < 0)
+-			u = idx;
++			upper = idx;
+ 		else if (comparison > 0)
+-			l = idx + 1;
++			lower = idx + 1;
+ 		else
+ 			return (void *) p;
+ 	}
+@@ -2283,29 +2283,37 @@ static int _bsrch_tlba(struct map_cache *mcache, u64 tlba)
+ 	if (mcache->jcount < 0 || mcache->jcount > mcache->jsize)
+ 		goto out;
+ 
+-	map = gnu_bsearch(&find, base, mcache->jcount, sizeof(find), mcache_cmp);
++	map = bsearchg(&find, base, mcache->jcount, sizeof(find), mcache_cmp);
+ 	if (map)
+ 		at = (map - base) / sizeof(find);
+ out:
+ 
+ #if 1
+ 	{
+-	int cmp = _lsearch_tlba(mcache, tlba);
++	int kbsrc = -1;
++	int cmp;
+ 
+-	if (cmp != at) {
+-		int kbsrc = -1;
+-
+-		map = bsearch(&find, base, mcache->jcount,
+-			      sizeof(find), mcache_cmp);
+-		if (map)
+-			kbsrc = (map - base) / sizeof(find);
++	map = bsearch(&find, base, mcache->jcount,
++		      sizeof(find), mcache_cmp);
++	if (map) {
++		kbsrc = (map - base) / sizeof(find);
++	}
+ 
+-		pr_err("_bsrch_tlba is failing got %d need %d [%d] "
++	if (kbsrc != at) {
++		pr_err("bsearch() is failing got %d need %d "
+ 		       "[items: %d, sorted %s.\n",
+-			at, cmp, kbsrc, mcache->jcount,
++			at, kbsrc, mcache->jcount,
+ 			(mcache->jcount == mcache->jsorted)
+ 				? "yes" : "no");
++	}
+ 
++	cmp = _lsearch_tlba(mcache, tlba);
++	if (cmp != at) {
++		pr_err("_bsrch_tlba is failing got %d need %d "
++		       "[items: %d, sorted %s.\n",
++			at, cmp, mcache->jcount,
++			(mcache->jcount == mcache->jsorted)
++				? "yes" : "no");
+ 		at = cmp;
+ 	}
+ 	}
+@@ -2381,7 +2389,7 @@ static int _bsrch_extent(struct map_cache *mcache, u64 tlba)
+ 	struct map_cache_entry find;
+ 
+ 	find.tlba = lba48_to_le64(0, tlba);
+-	map = gnu_bsearch(&find, base, mcache->jcount, sizeof(find), compare_ext);
++	map = bsearchg(&find, base, mcache->jcount, sizeof(find), compare_ext);
+ 	if (map)
+ 		at = (map - base) / sizeof(find);
+ 
+@@ -3009,7 +3017,7 @@ static void mcache_insert(struct zdm *znd, struct map_cache *mcache,
+ 	struct map_cache_data *mcd = get_mcd(mcache);
+ 	u16 top = mcache->jcount;
+ 
+-	WARN_ON(mcache->jcount >= mcache->jsize);
++	BUG_ON(mcache->jcount >= mcache->jsize);
+ 
+ 	mcd->maps[top].tlba = lba48_to_le64(0, tlba);
+ 	mcd->maps[top].bval = lba48_to_le64(0, blba);
+@@ -7063,12 +7071,13 @@ static int md_journal_add_map(struct zdm *znd, u64 addr, u64 lba)
+ 	struct jrnl_map_cache_data *mcd = mcache->mcd;
+ 	struct md_journal *jrnl = &znd->jrnl;
+ 	int err = 0;
++	int next;
++	int skip;
++	int found = 0;
+ 	u32 entry;
+-	int at;
+ 
+ 	if (addr < znd->data_lba) {
+-		int next;
+-
++		entry = lba - WB_JRNL_BASE;
+ 		SpinLock(&jrnl->wb_alloc);
+ 		for (next = 0; next < jrnl->size; next++) {
+ 			if (le32_to_cpu(jrnl->wb[next]) == addr) {
+@@ -7076,73 +7085,52 @@ static int md_journal_add_map(struct zdm *znd, u64 addr, u64 lba)
+ 				if (jrnl->in_use > 0)
+ 					jrnl->in_use--;
+ 			}
++			if (entry == next) {
++				jrnl->wb[entry] = cpu_to_le32((u32)addr);
++					jrnl->in_use++;
++			}
+ 		}
+ 		spin_unlock(&jrnl->wb_alloc);
+ 
+-		/* lba 0 => find addr and delete it */
+-		if (lba == 0) {
+-			MutexLock(&mcache->cached_lock);
+-			memcache_sort(znd, mcache);
+-			at = _bsrch_tlba(mcache, addr);
+-			if (at != -1) {
+-				struct map_cache_entry *mce = &mcd->maps[at];
+-				u64 tlba = le64_to_lba48(mce->tlba, NULL);
+-				u64 blba = le64_to_lba48(mce->bval, NULL);
+-
+-				mc_delete_entry_locked(mcache, at);
+-				lba = blba;
+-				addr = 0u;
++		MutexLock(&mcache->cached_lock);
++		found = 0;
++		skip = 0;
++		for (next = 0; next < mcache->jcount; next++) {
++			struct map_cache_entry *mce = &mcd->maps[next];
++			u64 tlba = le64_to_lba48(mce->tlba, NULL);
++			int to = next - skip;
++
++			if (to != next)
++				memcpy(&mcd->maps[to], mce, sizeof(*mce));
++
++			if (tlba == addr) {
++				if (!found && lba)
++					mcd->maps[to].bval =
++						lba48_to_le64(0, lba);
++				else
++					skip++;
++				found++;
++				if (found > 1) {
++					Z_ERR(znd,
++						"WB Journal Map "
++						"... dupe %llx @ %d",
++						addr, to);
++				}
+ 			}
+-			mutex_unlock(&mcache->cached_lock);
+-		}
+-		entry = lba - WB_JRNL_BASE;
+-
+-		/* record the entry in the WB Journal */
+-		if (entry < jrnl->size) {
+-			SpinLock(&jrnl->wb_alloc);
+-			if (jrnl->wb[entry] != MZTEV_UNUSED && addr == 0u &&
+-			    jrnl->in_use > 0)
+-				jrnl->in_use--;
+-
+-			if (addr == 0u)
+-				jrnl->wb[entry] = MZTEV_UNUSED;
+-			else
+-				jrnl->wb[entry] = cpu_to_le32((u32)addr);
+-
+-			set_bit(IS_DIRTY, &jrnl->flags);
+-			spin_unlock(&jrnl->wb_alloc);
+-		} else {
+-			lba = 0;
+ 		}
++		if (mcache->jsorted == mcache->jcount)
++			mcache->jsorted -= skip;
++		mcache->jcount -= skip;
+ 
+-		/* Add a mapping addr -> lba for quick lookups */
+-		if (lba != 0 && addr != 0u) {
+-			MutexLock(&mcache->cached_lock);
+-			memcache_sort(znd, mcache);
+-			at = _bsrch_tlba(mcache, addr);
+-			if (at != -1) {
+-				struct map_cache_entry *mce = &mcd->maps[at];
+-				u64 tlba = le64_to_lba48(mce->tlba, NULL);
+-				u64 blba = le64_to_lba48(mce->bval, NULL);
+-				u32 again = blba - WB_JRNL_BASE;
+-
+-				if (again < jrnl->size) {
+-					SpinLock(&jrnl->wb_alloc);
+-					if (jrnl->wb[entry] != MZTEV_UNUSED &&
+-					    jrnl->in_use > 0)
+-						jrnl->in_use--;
+-					jrnl->wb[entry] = MZTEV_UNUSED;
+-					set_bit(IS_DIRTY, &jrnl->flags);
+-					spin_unlock(&jrnl->wb_alloc);
+-				}
+-				/* update existing map */
+-				mce->bval = lba48_to_le64(0, lba);
+-			} else {
+-				/* add a new map */
++		if (lba && !found) {
++			/* add a new map */
++			if (mcache->jcount < mcache->jsize) {
+ 				mcache_insert(znd, mcache, addr, lba);
++			} else {
++				Z_ERR(znd, "WB Journal Map ... out of space");
+ 			}
+-			mutex_unlock(&mcache->cached_lock);
+ 		}
++		mutex_unlock(&mcache->cached_lock);
+ 	}
+ 
+ 	return err;
+-- 
+2.8.1
+

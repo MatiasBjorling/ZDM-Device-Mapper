@@ -366,7 +366,8 @@ void elv_dispatch_sort(struct request_queue *q, struct request *rq)
 	list_for_each_prev(entry, &q->queue_head) {
 		struct request *pos = list_entry_rq(entry);
 
-		if ((rq->op == REQ_OP_DISCARD) != (pos->op == REQ_OP_DISCARD))
+		if ((rq->cmd_flags & REQ_DISCARD) !=
+		    (pos->cmd_flags & REQ_DISCARD))
 			break;
 		if (rq_data_dir(rq) != rq_data_dir(pos))
 			break;
@@ -510,7 +511,7 @@ void elv_merge_requests(struct request_queue *q, struct request *rq,
 			     struct request *next)
 {
 	struct elevator_queue *e = q->elevator;
-	const int next_sorted = next->cmd_flags & REQ_SORTED;
+	const int next_sorted = !!(next->cmd_flags & REQ_SORTED);
 
 	if (next_sorted && e->type->ops.elevator_merge_req_fn)
 		e->type->ops.elevator_merge_req_fn(q, rq, next);
@@ -716,12 +717,12 @@ void elv_put_request(struct request_queue *q, struct request *rq)
 		e->type->ops.elevator_put_req_fn(rq);
 }
 
-int elv_may_queue(struct request_queue *q, int op, int op_flags)
+int elv_may_queue(struct request_queue *q, u64 rw)
 {
 	struct elevator_queue *e = q->elevator;
 
 	if (e->type->ops.elevator_may_queue_fn)
-		return e->type->ops.elevator_may_queue_fn(q, op, op_flags);
+		return e->type->ops.elevator_may_queue_fn(q, rw);
 
 	return ELV_MQUEUE_MAY;
 }

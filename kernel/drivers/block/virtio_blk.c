@@ -172,7 +172,7 @@ static int virtio_queue_rq(struct blk_mq_hw_ctx *hctx,
 	BUG_ON(req->nr_phys_segments + 2 > vblk->sg_elems);
 
 	vbr->req = req;
-	if (req->op == REQ_OP_FLUSH) {
+	if (req->cmd_flags & REQ_FLUSH) {
 		vbr->out_hdr.type = cpu_to_virtio32(vblk->vdev, VIRTIO_BLK_T_FLUSH);
 		vbr->out_hdr.sector = 0;
 		vbr->out_hdr.ioprio = cpu_to_virtio32(vblk->vdev, req_get_ioprio(vbr->req));
@@ -494,7 +494,7 @@ static void virtblk_update_cache_mode(struct virtio_device *vdev)
 	struct virtio_blk *vblk = vdev->priv;
 
 	if (writeback)
-		blk_queue_flush(vblk->disk->queue, REQ_PREFLUSH);
+		blk_queue_flush(vblk->disk->queue, REQ_FLUSH);
 	else
 		blk_queue_flush(vblk->disk->queue, 0);
 
