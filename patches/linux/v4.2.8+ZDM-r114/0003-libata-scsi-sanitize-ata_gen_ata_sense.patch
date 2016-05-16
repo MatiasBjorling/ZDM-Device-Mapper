@@ -1,0 +1,34 @@
+From 36646501ab9f7560288270a7c2f6350633500fdf Mon Sep 17 00:00:00 2001
+From: Hannes Reinecke <hare@suse.de>
+Date: Mon, 4 Apr 2016 11:43:56 +0200
+Subject: [PATCH 03/66] libata-scsi: sanitize ata_gen_ata_sense()
+
+ata_to_sense_error() is called conditionally, so we should be
+generating a default sense if the condition is not met.
+
+Signed-off-by: Hannes Reinecke <hare@suse.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+---
+ drivers/ata/libata-scsi.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/drivers/ata/libata-scsi.c b/drivers/ata/libata-scsi.c
+index 422e6f4..bc62769 100644
+--- a/drivers/ata/libata-scsi.c
++++ b/drivers/ata/libata-scsi.c
+@@ -1075,6 +1075,12 @@ static void ata_gen_ata_sense(struct ata_queued_cmd *qc)
+ 		ata_to_sense_error(qc->ap->print_id, tf->command, tf->feature,
+ 				   &sb[1], &sb[2], &sb[3], verbose);
+ 		sb[1] &= 0x0f;
++	} else {
++		/* Could not decode error */
++		ata_dev_warn(dev, "could not decode error status 0x%x err_mask 0x%x\n",
++			     tf->command, qc->err_mask);
++		ata_scsi_set_sense(cmd, ABORTED_COMMAND, 0, 0);
++		return;
+ 	}
+ 
+ 	block = ata_tf_read_block(&qc->result_tf, dev);
+-- 
+2.8.1
+

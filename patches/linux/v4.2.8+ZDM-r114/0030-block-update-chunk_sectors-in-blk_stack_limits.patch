@@ -1,0 +1,28 @@
+From 2d2a3a225cb7d403ae717ee51de45b8e2aa4b7f6 Mon Sep 17 00:00:00 2001
+From: Hannes Reinecke <hare@suse.de>
+Date: Tue, 28 Jul 2015 08:26:16 +0200
+Subject: [PATCH 30/66] block: update chunk_sectors in blk_stack_limits()
+
+Signed-off-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-settings.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/block/blk-settings.c b/block/blk-settings.c
+index e0057d0..5aaaba8 100644
+--- a/block/blk-settings.c
++++ b/block/blk-settings.c
+@@ -647,6 +647,10 @@ int blk_stack_limits(struct queue_limits *t, struct queue_limits *b,
+ 			t->discard_granularity;
+ 	}
+ 
++	if (b->chunk_sectors)
++		t->chunk_sectors = min_not_zero(t->chunk_sectors,
++						b->chunk_sectors);
++
+ 	return ret;
+ }
+ EXPORT_SYMBOL(blk_stack_limits);
+-- 
+2.8.1
+

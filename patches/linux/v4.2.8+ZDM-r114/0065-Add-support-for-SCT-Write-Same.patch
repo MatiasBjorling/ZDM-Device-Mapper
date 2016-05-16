@@ -1,7 +1,7 @@
-From 99e2bbea4dc77cafb2528b329a2ea65ac93d655f Mon Sep 17 00:00:00 2001
+From 806af07eff2c691694ec8cfebb09a1c655e0ddc8 Mon Sep 17 00:00:00 2001
 From: Shaun Tancheff <shaun@tancheff.com>
 Date: Sat, 7 May 2016 00:25:02 -0500
-Subject: [PATCH 71/71] Add support for SCT Write Same
+Subject: [PATCH 65/66] Add support for SCT Write Same
 
 Since the Write Same command was deprecated and moved to
 an SCT feature ATA drives have not supported Write Same

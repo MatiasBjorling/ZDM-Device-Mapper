@@ -1,0 +1,44 @@
+From 676b3727175a593c6ab22494df118be49a208b89 Mon Sep 17 00:00:00 2001
+From: Hannes Reinecke <hare@suse.de>
+Date: Sun, 20 Mar 2016 10:36:27 +0100
+Subject: [PATCH 40/66] dm-io: use on-stack plugging
+
+Add a plug to dispatch_io() to avoid having the submitted
+I/O broken up during submission.
+
+Signed-off-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/md/dm-io.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/drivers/md/dm-io.c b/drivers/md/dm-io.c
+index 74adcd2..630e0af 100644
+--- a/drivers/md/dm-io.c
++++ b/drivers/md/dm-io.c
+@@ -290,6 +290,7 @@ static void do_region(int rw, unsigned region, struct dm_io_region *where,
+ 	unsigned short logical_block_size = queue_logical_block_size(q);
+ 	sector_t num_sectors;
+ 	unsigned int uninitialized_var(special_cmd_max_sectors);
++	struct blk_plug plug;
+ 
+ 	/*
+ 	 * Reject unsupported discard and write same requests.
+@@ -303,6 +304,7 @@ static void do_region(int rw, unsigned region, struct dm_io_region *where,
+ 		return;
+ 	}
+ 
++	blk_start_plug(&plug);
+ 	/*
+ 	 * where->count may be zero if rw holds a flush and we need to
+ 	 * send a zero-sized flush.
+@@ -356,6 +358,7 @@ static void do_region(int rw, unsigned region, struct dm_io_region *where,
+ 		atomic_inc(&io->count);
+ 		submit_bio(rw, bio);
+ 	} while (remaining);
++	blk_finish_plug(&plug);
+ }
+ 
+ static void dispatch_io(int rw, unsigned int num_regions,
+-- 
+2.8.1
+

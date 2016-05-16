@@ -1,0 +1,74 @@
+From 46446658f1deaa7e22883a66a0996bf068cd3a7b Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Sat, 30 Apr 2016 12:26:54 -0500
+Subject: [PATCH 36/66] block: Introduce BLKPREP_DONE
+
+Add a new blkprep return code BLKPREP_DONE to signal completion
+without I/O error.
+
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+
+Backported to v4.2.8
+Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
+---
+ block/blk-core.c        | 10 ++++++++--
+ drivers/scsi/scsi_lib.c |  1 +
+ include/linux/blkdev.h  |  3 +++
+ 3 files changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 57b7006..4a3590f 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -2351,14 +2351,20 @@ struct request *blk_peek_request(struct request_queue *q)
+ 
+ 			rq = NULL;
+ 			break;
+-		} else if (ret == BLKPREP_KILL) {
++		} else if (ret == BLKPREP_KILL || ret == BLKPREP_INVALID ||
++			   ret == BLKPREP_DONE) {
++			int err = (ret == BLKPREP_INVALID) ? -EREMOTEIO : -EIO;
++
++			if (ret == BLKPREP_DONE)
++				err = 0;
++
+ 			rq->cmd_flags |= REQ_QUIET;
+ 			/*
+ 			 * Mark this request as started so we don't trigger
+ 			 * any debug logic in the end I/O path.
+ 			 */
+ 			blk_start_request(rq);
+-			__blk_end_request_all(rq, -EIO);
++			__blk_end_request_all(rq, err);
+ 		} else {
+ 			printk(KERN_ERR "%s: bad return=%d\n", __func__, ret);
+ 			break;
+diff --git a/drivers/scsi/scsi_lib.c b/drivers/scsi/scsi_lib.c
+index 448ebda..09039ed 100644
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@ -1344,6 +1344,7 @@ scsi_prep_return(struct request_queue *q, struct request *req, int ret)
+ 	switch (ret) {
+ 	case BLKPREP_KILL:
+ 		req->errors = DID_NO_CONNECT << 16;
++	case BLKPREP_DONE:
+ 		/* release the command and kill it */
+ 		if (req->special) {
+ 			struct scsi_cmnd *cmd = req->special;
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index eb3b3cb..6cdf511 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -728,6 +728,9 @@ static inline bool blk_write_same_mergeable(struct bio *a, struct bio *b)
+ #define BLKPREP_OK		0	/* serve it */
+ #define BLKPREP_KILL		1	/* fatal error, kill */
+ #define BLKPREP_DEFER		2	/* leave on queue */
++#define BLKPREP_INVALID		3	/* invalid command, kill,
++					   return -EREMOTEIO */
++#define BLKPREP_DONE		4	/* complete w/o error */
+ 
+ extern unsigned long blk_max_low_pfn, blk_max_pfn;
+ 
+-- 
+2.8.1
+

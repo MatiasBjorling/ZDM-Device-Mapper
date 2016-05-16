@@ -1,0 +1,43 @@
+From 8b31390dbed3600fc8c941c53f2f423f8a2eac32 Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Sat, 30 Apr 2016 19:17:28 -0500
+Subject: [PATCH 64/66] Configure discard granularity and max sectors (fixup)
+
+Fixup dependancies for SCSI_ZBC.
+Build fix when SCSI_ZBC not enabled.
+
+Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
+---
+ drivers/md/Kconfig | 2 ++
+ drivers/scsi/sd.h  | 2 +-
+ 2 files changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/md/Kconfig b/drivers/md/Kconfig
+index d0405b6..d53748c 100644
+--- a/drivers/md/Kconfig
++++ b/drivers/md/Kconfig
+@@ -338,6 +338,8 @@ config DM_ERA
+ config DM_ZONED
+ 	tristate "Zoned cache write target support (EXPERIMENTAL)"
+ 	depends on BLK_DEV_DM
++	depends on BLK_DEV_ZONED
++	depends on SCSI_ZBC
+ 	---help---
+ 	 This device-mapper target implements a caching layer for
+ 	 zoned block devices (ZBC).
+diff --git a/drivers/scsi/sd.h b/drivers/scsi/sd.h
+index bbe7a83..22b67c3 100644
+--- a/drivers/scsi/sd.h
++++ b/drivers/scsi/sd.h
+@@ -306,7 +306,7 @@ static inline int sd_zbc_report_zones(struct scsi_disk *sdkp,
+ 	return -EOPNOTSUPP;
+ }
+ 
+-static inline int sd_zbc_setup(struct scsi_disk *sdkp,
++static inline int sd_zbc_setup(struct scsi_disk *sdkp, u64 zlen,
+ 			       unsigned char *buf, int buf_len)
+ {
+ 	return 0;
+-- 
+2.8.1
+
