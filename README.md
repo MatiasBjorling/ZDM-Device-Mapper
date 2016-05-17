@@ -108,7 +108,7 @@ or
 
 Building:
   - Normal kernel build with CONFIG_DM_ZDM
-  - Additionally CONFIG_SCSI_ZBC and CONFIG_BLK_DEV_ZONED can be used for testing file systmes such as F2FS.
+  - Additionally CONFIG_SCSI_ZBC and CONFIG_BLK_DEV_ZONED can be used for testing file systmes such as NILFS2 and F2FS.
 
 ## Standards Versions Supported
 
@@ -142,13 +142,13 @@ If not, please see http://www.gnu.org/licenses/.
 ## ZDM Linux Kernel
 
   - Patches
-    * v4.2.8 [ZDM r112 patches for linux v4.2](/patches/linux/v4.2.8+ZDM-r112)
-    * v4.6-rc6 [ZDM r112 patches for linux v4.6-rc6](/patches/linux/v4.6-rc6+ZDM-r112)
+    * v4.2.8 [ZDM r114 patches for linux v4.2.8](/patches/linux/v4.2.8+ZDM-r114)
+    * v4.4 [ZDM r114 patches for linux v4.4](/patches/linux/v4.4+ZDM-r114)
+    * v4.6 [ZDM r114 patches for linux v4.6-rc6](/patches/linux/v4.6+ZDM-r114)
 
-## Observations and Known Issues in this release (#112)
+## Observations and Known Issues in this release (#114)
 
-  - Bug: 
-     * Fix
+  - Bug: mkfs segfaulting with 4.6 kernel on (some) embedded platforms.
 
 ## Changes from Initial Release
 
@@ -236,3 +236,8 @@ If not, please see http://www.gnu.org/licenses/.
     * Updated to rc6 and removed pending bio split patch series.
     * Updated SCSI_ZBC/BLK_DEV_ZONED features to support current HA drives.
     * Added support for Write Same via SCT for SATA drives.
+
+  - ZDM #114
+    * Disabled WB journal path by default.
+    * Expanded de-dupe to include any 4k aligned bio.
+    * Updated to 4.6 kerenl.
