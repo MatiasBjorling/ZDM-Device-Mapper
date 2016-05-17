@@ -116,6 +116,7 @@ config BLK_DEV_THROTTLING
 config BLK_DEV_ZONED
 	bool "Zoned block device support"
 	default n
+	select SCSI_ZBC
 	---help---
 	Block layer zoned block device support. This option enables
 	support for zoned block (ZAC/ZBC) devices.

@@ -1,0 +1,29 @@
+From 9b757dfe4c08d41d6242425eed881ce55f41ba63 Mon Sep 17 00:00:00 2001
+From: Hannes Reinecke <hare@suse.de>
+Date: Mon, 26 Oct 2015 04:46:53 +0100
+Subject: [PATCH 43/65] sd: enable single-threaded I/O submission for zoned
+ devices
+
+zoned devices require single-thread I/O submission to guarantee
+sequential I/O, so enable the block layer flag for it.
+
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+---
+ drivers/scsi/sd.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/scsi/sd.c b/drivers/scsi/sd.c
+index a0aacb1..72320a3 100644
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -2194,6 +2194,7 @@ static void sd_read_zones(struct scsi_disk *sdkp, unsigned char *buffer)
+ 				      get_unaligned_be64(&desc[8]));
+ 	blk_queue_chunk_sectors(sdkp->disk->queue, zone_len);
+ 	sd_config_discard(sdkp, SD_ZBC_RESET_WP);
++	queue_flag_set_unlocked(QUEUE_FLAG_SINGLE, sdkp->disk->queue);
+ 
+ 	sd_zbc_setup(sdkp, buffer, SD_BUF_SIZE);
+ }
+-- 
+2.8.1
+

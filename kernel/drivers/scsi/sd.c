@@ -706,12 +706,16 @@ static void sd_config_discard(struct scsi_disk *sdkp, unsigned int mode)
 
 	case SD_ZBC_RESET_WP:
 		q->limits.discard_zeroes_data = 1;
+		q->limits.discard_alignment = 
 		q->limits.discard_granularity =
 			sd_zbc_discard_granularity(sdkp);
 
 		max_blocks = min_not_zero(sdkp->max_unmap_blocks,
 					  q->limits.discard_granularity >>
 						ilog2(logical_block_size));
+
+		if (sdkp->device->sct_write_same)
+			sdkp->max_ws_blocks = max_blocks;
 		break;
 
 	case SD_LBP_ZERO:
@@ -862,7 +866,7 @@ static int sd_setup_discard_cmnd(struct scsi_cmnd *cmd)
 				cmd->cmnd[6] = 1;
 				cmd->cmnd[8] = ATA_CMD_STANDBYNOW1;
 				cmd->cmnd[13] = ATA_CMD_STANDBYNOW1;
-				cmd->cmnd[14] = ATA_CMD_WRITE_LOG_DMA_EXT;
+				cmd->cmnd[14] = ATA_CMD_WRITE_LOG_EXT;
 				put_unaligned_le16(0x0002, &sctpg[0]);
 				put_unaligned_le16(0x0101, &sctpg[1]);
 				put_unaligned_le64(sector, &sctpg[2]);
@@ -991,7 +995,7 @@ static int sd_setup_write_same_cmnd(struct scsi_cmnd *cmd)
 
 	BUG_ON(bio_offset(bio) || bio_iovec(bio).bv_len != sdp->sector_size);
 
-	if (sdp->type == TYPE_ZBC) {
+	if (sdkp->zoned == 1 || sdp->type == TYPE_ZBC) {
 		/* sd_zbc_lookup_zone lba is in block layer sector units */
 		ret = sd_zbc_lookup_zone(sdkp, rq, sector, nr_sectors);
 		if (ret != BLKPREP_OK)
@@ -1117,7 +1121,7 @@ static int sd_setup_read_write_cmnd(struct scsi_cmnd *SCpnt)
 	SCSI_LOG_HLQUEUE(2, scmd_printk(KERN_INFO, SCpnt, "block=%llu\n",
 					(unsigned long long)block));
 
-	if (sdp->type == TYPE_ZBC) {
+	if (sdkp->zoned == 1 || sdp->type == TYPE_ZBC) {
 		/* sd_zbc_lookup_zone lba is in block layer sector units */
 		ret = sd_zbc_lookup_zone(sdkp, rq, block, this_count);
 		if (ret != BLKPREP_OK)

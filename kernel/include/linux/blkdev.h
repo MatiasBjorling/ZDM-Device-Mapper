@@ -278,9 +278,9 @@ struct blk_zone {
 	void *private_data;
 };
 
-#define blk_zone_is_smr(z) ((z)->type == BLK_ZONE_TYPE_SEQWRITE_REQ ||	\
-			    (z)->type == BLK_ZONE_TYPE_SEQWRITE_PREF)
-
+#define blk_zone_is_seq_req(z) ((z)->type == BLK_ZONE_TYPE_SEQWRITE_REQ)
+#define blk_zone_is_seq_pref(z) ((z)->type == BLK_ZONE_TYPE_SEQWRITE_PREF)
+#define blk_zone_is_smr(z) (blk_zone_is_seq_req(z) || blk_zone_is_seq_pref(z))
 #define blk_zone_is_cmr(z) ((z)->type == BLK_ZONE_TYPE_CONVENTIONAL)
 #define blk_zone_is_full(z) ((z)->wp == (z)->start + (z)->len)
 #define blk_zone_is_empty(z) ((z)->wp == (z)->start)

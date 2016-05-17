@@ -1,0 +1,193 @@
+From 7ae5c535591d0574ec145c64d60201cc8459d0cb Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Mon, 16 May 2016 16:41:16 -0500
+Subject: [PATCH 48/64] Add support for bdi tracking of stream ID
+
+We can now allocate and free host assigned stream IDs through the
+backing device. Add support for a hook for virtual backing devices,
+that map to a bunch of real backing devices (btrfs, raid, etc).
+
+Signed-off-by: Jens Axboe <axboe@fb.com>
+
+Backported to v4.4
+Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
+---
+ arch/x86/entry/syscalls/syscall_32.tbl |  1 +
+ arch/x86/entry/syscalls/syscall_64.tbl |  2 +-
+ include/linux/backing-dev-defs.h       |  7 +++++
+ include/linux/backing-dev.h            |  3 ++
+ include/linux/streamid.h               |  4 +++
+ mm/backing-dev.c                       | 53 ++++++++++++++++++++++++++++++++++
+ 6 files changed, 69 insertions(+), 1 deletion(-)
+
+diff --git a/arch/x86/entry/syscalls/syscall_32.tbl b/arch/x86/entry/syscalls/syscall_32.tbl
+index f17705e..12eb46f 100644
+--- a/arch/x86/entry/syscalls/syscall_32.tbl
++++ b/arch/x86/entry/syscalls/syscall_32.tbl
+@@ -383,3 +383,4 @@
+ 374	i386	userfaultfd		sys_userfaultfd
+ 375	i386	membarrier		sys_membarrier
+ 376	i386	mlock2			sys_mlock2
++380	i386	streamid		sys_streamid
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index 314a90b..7492b37 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -332,7 +332,7 @@
+ 323	common	userfaultfd		sys_userfaultfd
+ 324	common	membarrier		sys_membarrier
+ 325	common	mlock2			sys_mlock2
+-
++329	64	streamid		sys_streamid
+ #
+ # x32-specific system call numbers start at 512 to avoid cache impact
+ # for native 64-bit operation.
+diff --git a/include/linux/backing-dev-defs.h b/include/linux/backing-dev-defs.h
+index 1b4d69f..8c1914b 100644
+--- a/include/linux/backing-dev-defs.h
++++ b/include/linux/backing-dev-defs.h
+@@ -10,6 +10,7 @@
+ #include <linux/flex_proportions.h>
+ #include <linux/timer.h>
+ #include <linux/workqueue.h>
++#include <linux/idr.h>
+ 
+ struct page;
+ struct device;
+@@ -30,6 +31,7 @@ enum wb_congested_state {
+ };
+ 
+ typedef int (congested_fn)(void *, int);
++typedef int (streamid_fn)(void *, unsigned int);
+ 
+ enum wb_stat_item {
+ 	WB_RECLAIMABLE,
+@@ -170,6 +172,11 @@ struct backing_dev_info {
+ 	struct dentry *debug_dir;
+ 	struct dentry *debug_stats;
+ #endif
++
++	struct ida stream_ids;
++	streamid_fn *streamid_open;
++	streamid_fn *streamid_close;
++	void *streamid_data;
+ };
+ 
+ enum {
+diff --git a/include/linux/backing-dev.h b/include/linux/backing-dev.h
+index c82794f..b20e33b 100644
+--- a/include/linux/backing-dev.h
++++ b/include/linux/backing-dev.h
+@@ -514,4 +514,7 @@ static inline int bdi_rw_congested(struct backing_dev_info *bdi)
+ 				  (1 << WB_async_congested));
+ }
+ 
++int bdi_streamid_open(struct backing_dev_info *bdi, unsigned int id);
++int bdi_streamid_close(struct backing_dev_info *bdi, unsigned int id);
++
+ #endif	/* _LINUX_BACKING_DEV_H */
+diff --git a/include/linux/streamid.h b/include/linux/streamid.h
+index ea1f8e7..c7ba477 100644
+--- a/include/linux/streamid.h
++++ b/include/linux/streamid.h
+@@ -6,8 +6,12 @@ enum {
+ 	STREAMID_CLOSE	= 2,		/* close stream */
+ 	STREAMID_GET	= 3,		/* get file/inode stream ID */
+ 
++	STREAMID_MAX	= 65535,
++
+ 	STREAMID_F_INODE	= 1,	/* set streamid on the inode */
+ 	STREAMID_F_FILE		= 2,	/* set streamid on the file */
+ };
+ 
++ssize_t bdi_streamid(struct inode *inode, int cmd, int streamid);
++
+ #endif
+diff --git a/mm/backing-dev.c b/mm/backing-dev.c
+index 7340353..a37aeca 100644
+--- a/mm/backing-dev.c
++++ b/mm/backing-dev.c
+@@ -10,6 +10,7 @@
+ #include <linux/module.h>
+ #include <linux/writeback.h>
+ #include <linux/device.h>
++#include <linux/streamid.h>
+ #include <trace/events/writeback.h>
+ 
+ static atomic_long_t bdi_seq = ATOMIC_LONG_INIT(0);
+@@ -809,6 +810,7 @@ int bdi_register(struct backing_dev_info *bdi, struct device *parent,
+ 
+ 	bdi_debug_register(bdi, dev_name(dev));
+ 	set_bit(WB_registered, &bdi->wb.state);
++	ida_init(&bdi->stream_ids);
+ 
+ 	spin_lock_bh(&bdi_lock);
+ 	list_add_tail_rcu(&bdi->bdi_list, &bdi_list);
+@@ -843,6 +845,7 @@ void bdi_unregister(struct backing_dev_info *bdi)
+ 	bdi_remove_from_list(bdi);
+ 	wb_shutdown(&bdi->wb);
+ 	cgwb_bdi_destroy(bdi);
++	ida_destroy(&bdi->stream_ids);
+ 
+ 	if (bdi->dev) {
+ 		bdi_debug_unregister(bdi);
+@@ -1014,6 +1017,56 @@ out:
+ }
+ EXPORT_SYMBOL(wait_iff_congested);
+ 
++/*
++ * Get a new stream ID for backing device 'bdi'. If 'id' is zero, then get
++ * any new ID. If 'id' is non-zero, attempt to get that specific ID. If
++ * the bdi has a streamid_fn assigned, use that.
++ */
++int bdi_streamid_open(struct backing_dev_info *bdi, unsigned int id)
++{
++	if (bdi->streamid_open)
++		return bdi->streamid_open(bdi->streamid_data, id);
++
++	if (id)
++		return ida_simple_get(&bdi->stream_ids, id, id + 1, GFP_NOIO);
++
++	return ida_simple_get(&bdi->stream_ids, 1, STREAMID_MAX, GFP_NOIO);
++}
++EXPORT_SYMBOL(bdi_streamid_open);
++
++/*
++ * Close stream ID 'id' on bdi 'bdi'.
++ */
++int bdi_streamid_close(struct backing_dev_info *bdi, unsigned int id)
++{
++	if (bdi->streamid_close)
++		return bdi->streamid_close(bdi->streamid_data, id);
++
++	/*
++	 * If we don't have a specific open, free the ID we allocated
++	 */
++	if (!bdi->streamid_open)
++		return ida_simple_remove(&bdi->stream_ids, id);
++
++	return 0;
++}
++EXPORT_SYMBOL(bdi_streamid_close);
++
++ssize_t bdi_streamid(struct inode *inode, int cmd, int streamid)
++{
++	struct backing_dev_info *bdi = inode_to_bdi(inode);
++
++	if (bdi == &noop_backing_dev_info)
++		return -ENXIO;
++
++	if (cmd == STREAMID_OPEN)
++		return bdi_streamid_open(bdi, streamid);
++	else if (cmd == STREAMID_CLOSE)
++		return bdi_streamid_close(bdi, streamid);
++
++	return -EINVAL;
++}
++
+ int pdflush_proc_obsolete(struct ctl_table *table, int write,
+ 			void __user *buffer, size_t *lenp, loff_t *ppos)
+ {
+-- 
+2.8.1
+

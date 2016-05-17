@@ -1,0 +1,111 @@
+From 3002ee82cfcdd49df3d74ff83c2df7f1402840b1 Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Mon, 16 May 2016 15:42:32 -0500
+Subject: [PATCH 38/64] ZBC backport fixes
+
+Some defined values and include functions are out-of-sync
+with 4.7 planned changes.
+
+Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
+---
+ block/blk-core.c          |  3 ++-
+ drivers/scsi/sd.c         |  5 -----
+ drivers/scsi/sd.h         | 10 ++++++++++
+ include/linux/blkdev.h    |  2 ++
+ include/scsi/scsi_proto.h |  9 +++++++++
+ 5 files changed, 23 insertions(+), 6 deletions(-)
+
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 9dd4b91..99efab2 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -2451,7 +2451,8 @@ struct request *blk_peek_request(struct request_queue *q)
+ 
+ 			rq = NULL;
+ 			break;
+-		} else if (ret == BLKPREP_KILL || ret == BLKPREP_DONE) {
++		} else if (ret == BLKPREP_KILL || ret == BLKPREP_INVALID ||
++			   ret == BLKPREP_DONE) {
+ 			int err = (ret == BLKPREP_INVALID) ? -EREMOTEIO : -EIO;
+ 
+ 			if (ret == BLKPREP_DONE)
+diff --git a/drivers/scsi/sd.c b/drivers/scsi/sd.c
+index 413a07f..6d055b3 100644
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -2957,11 +2957,6 @@ static int sd_try_extended_inquiry(struct scsi_device *sdp)
+ 	return 0;
+ }
+ 
+-static inline u32 logical_to_sectors(struct scsi_device *sdev, u32 blocks)
+-{
+-	return blocks << (ilog2(sdev->sector_size) - 9);
+-}
+-
+ /**
+  *	sd_revalidate_disk - called the first time a new disk is seen,
+  *	performs disk spin up, read_capacity, etc.
+diff --git a/drivers/scsi/sd.h b/drivers/scsi/sd.h
+index ef16fe3..9c61f85 100644
+--- a/drivers/scsi/sd.h
++++ b/drivers/scsi/sd.h
+@@ -149,6 +149,16 @@ static inline int scsi_medium_access_command(struct scsi_cmnd *scmd)
+ 	return 0;
+ }
+ 
++static inline sector_t logical_to_sectors(struct scsi_device *sdev, sector_t blocks)
++{
++	return blocks << (ilog2(sdev->sector_size) - 9);
++}
++
++static inline sector_t sectors_to_logical(struct scsi_device *sdev, sector_t sector)
++{
++	return sector >> (ilog2(sdev->sector_size) - 9);
++}
++
+ /*
+  * A DIF-capable target device can be formatted with different
+  * protection schemes.  Currently 0 through 3 are defined:
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 9d8cb2b..737e774 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -730,6 +730,8 @@ static inline bool blk_write_same_mergeable(struct bio *a, struct bio *b)
+ #define BLKPREP_OK		0	/* serve it */
+ #define BLKPREP_KILL		1	/* fatal error, kill */
+ #define BLKPREP_DEFER		2	/* leave on queue */
++#define BLKPREP_INVALID		3	/* invalid command, kill,
++					   return -EREMOTEIO */
+ #define BLKPREP_DONE		4	/* complete w/o error */
+ 
+ extern unsigned long blk_max_low_pfn, blk_max_pfn;
+diff --git a/include/scsi/scsi_proto.h b/include/scsi/scsi_proto.h
+index d61ca9e..926f02b 100644
+--- a/include/scsi/scsi_proto.h
++++ b/include/scsi/scsi_proto.h
+@@ -115,6 +115,8 @@
+ #define VERIFY_16	      0x8f
+ #define SYNCHRONIZE_CACHE_16  0x91
+ #define WRITE_SAME_16	      0x93
++#define ZBC_OUT		      0x94
++#define ZBC_IN		      0x95
+ #define SERVICE_ACTION_BIDIRECTIONAL 0x9d
+ #define SERVICE_ACTION_IN_16  0x9e
+ #define SERVICE_ACTION_OUT_16 0x9f
+@@ -143,6 +145,13 @@
+ #define MO_SET_PRIORITY       0x0e
+ #define MO_SET_TIMESTAMP      0x0f
+ #define MO_MANAGEMENT_PROTOCOL_OUT 0x10
++/* values for ZBC_IN */
++#define ZI_REPORT_ZONES	      0x00
++/* values for ZBC_OUT */
++#define ZO_CLOSE_ZONE	      0x01
++#define ZO_FINISH_ZONE	      0x02
++#define ZO_OPEN_ZONE	      0x03
++#define ZO_RESET_WRITE_POINTER 0x04
+ /* values for variable length command */
+ #define XDREAD_32	      0x03
+ #define XDWRITE_32	      0x04
+-- 
+2.8.1
+

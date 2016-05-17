@@ -109,14 +109,14 @@ struct blk_zone *zbc_desc_to_zone(struct scsi_disk *sdkp, unsigned char *rec)
 	if (zone_cond == ZBC_ZONE_COND_EMPTY &&
 	    zone->wp != zone->start) {
 		sd_zbc_debug(sdkp,
-			     "zone %zu state EMPTY wp %zu: adjust wp\n",
+			     "zone %zx state EMPTY wp %zx: adjust wp\n",
 			     zone->start, zone->wp);
 		zone->wp = zone->start;
 	}
 	if (zone_cond == ZBC_ZONE_COND_FULL &&
 	    zone->wp != zone->start + zone->len) {
 		sd_zbc_debug(sdkp,
-			     "zone %zu state FULL wp %zu: adjust wp\n",
+			     "zone %zx state FULL wp %zx: adjust wp\n",
 			     zone->start, zone->wp);
 		zone->wp = zone->start + zone->len;
 	}
@@ -173,7 +173,7 @@ sector_t zbc_parse_zones(struct scsi_disk *sdkp, u64 zlen, unsigned char *buf,
 	}
 
 	sd_zbc_debug(sdkp,
-		     "Inserted %d zones, next sector %zu len %d\n",
+		     "Inserted %d zones, next sector %zx len %d\n",
 		     rec_no, next_sector, list_length);
 
 	return next_sector;
@@ -345,7 +345,7 @@ retry:
 		}
 		if (zone_num && (zone_num == zone_busy)) {
 			sd_zbc_debug(sdkp,
-				     "zone update for %zu in progress\n",
+				     "zone update for %zx in progress\n",
 				     sector);
 			kfree(zbc_work);
 			return;
@@ -383,7 +383,7 @@ int sd_zbc_report_zones(struct scsi_disk *sdkp, unsigned char *buffer,
 	if (!scsi_device_online(sdp))
 		return -ENODEV;
 
-	sd_zbc_debug(sdkp, "REPORT ZONES lba %zu len %d\n", start_lba, bufflen);
+	sd_zbc_debug(sdkp, "REPORT ZONES lba %zx len %d\n", start_lba, bufflen);
 
 	memset(cmd, 0, 16);
 	cmd[0] = ZBC_IN;
@@ -399,7 +399,7 @@ int sd_zbc_report_zones(struct scsi_disk *sdkp, unsigned char *buffer,
 
 	if (result) {
 		sd_zbc_debug(sdkp,
-			     "REPORT ZONES lba %zu failed with %d/%d\n",
+			     "REPORT ZONES lba %zx failed with %d/%d\n",
 			     start_lba, host_byte(result), driver_byte(result));
 		return -EIO;
 	}
@@ -425,16 +425,17 @@ int sd_zbc_lookup_zone(struct scsi_disk *sdkp, struct request *rq,
 	zone = blk_lookup_zone(q, sector);
 	/* Might happen during zone initialization */
 	if (!zone) {
-		sd_zbc_debug_ratelimit(sdkp,
-				       "zone for sector %zu not found, skipping\n",
-				       sector);
+		if (sdkp->zoned != 1)
+			sd_zbc_debug_ratelimit(sdkp,
+				"zone for sector %zx not found, skipping\n",
+				sector);
 		return BLKPREP_OK;
 	}
 	spin_lock_irqsave(&zone->lock, flags);
 	if (zone->state == BLK_ZONE_UNKNOWN ||
 	    zone->state == BLK_ZONE_BUSY) {
 		sd_zbc_debug_ratelimit(sdkp,
-				       "zone %zu state %x, deferring\n",
+				       "zone %zx state %x, deferring\n",
 				       zone->start, zone->state);
 		ret = BLKPREP_DEFER;
 	} else if (zone->state == BLK_ZONE_OFFLINE) {
@@ -442,28 +443,30 @@ int sd_zbc_lookup_zone(struct scsi_disk *sdkp, struct request *rq,
 		goto out;
 	} else {
 		if (rq->cmd_flags & (REQ_WRITE | REQ_WRITE_SAME)) {
+			if (zone->type == BLK_ZONE_TYPE_SEQWRITE_PREF)
+				zone->wp += num_sectors;
 			if (zone->type != BLK_ZONE_TYPE_SEQWRITE_REQ)
 				goto out;
 			if (zone->state == BLK_ZONE_READONLY)
 				goto out;
 			if (blk_zone_is_full(zone)) {
 				sd_zbc_debug(sdkp,
-					     "Write to full zone %zu/%zu\n",
+					     "Write to full zone %zx/%zx\n",
 					     sector, zone->wp);
 				ret = BLKPREP_KILL;
 				goto out;
 			}
 			if (zone->wp != sector) {
 				sd_zbc_debug(sdkp,
-					     "Misaligned write %zu/%zu\n",
+					     "Misaligned write %zx/%zx\n",
 					     sector, zone->wp);
 				ret = BLKPREP_KILL;
 				goto out;
 			}
 			zone->wp += num_sectors;
-		} else if (blk_zone_is_smr(zone) && (zone->wp <= sector)) {
+		} else if (blk_zone_is_seq_req(zone) && (zone->wp <= sector)) {
 			sd_zbc_debug(sdkp,
-				     "Read beyond wp %zu/%zu\n",
+				     "Read beyond wp %zx/%zx\n",
 				     sector, zone->wp);
 			if (zone->type == BLK_ZONE_TYPE_SEQWRITE_REQ)
 				ret = BLKPREP_DONE;

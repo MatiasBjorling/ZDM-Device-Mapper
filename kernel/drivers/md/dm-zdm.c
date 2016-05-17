@@ -1753,7 +1753,7 @@ static void on_timeout_activity(struct zdm *znd, int delay)
 
 
 	if (is_expired_msecs(znd->flush_age, 30000)) {
-		Z_ERR(znd, "Periodic FLUSH");
+		Z_DBG(znd, "Periodic FLUSH");
 
 		set_bit(DO_SYNC, &znd->flags);
 		set_bit(DO_FLUSH, &znd->flags);

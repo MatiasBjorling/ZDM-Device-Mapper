@@ -1,0 +1,60 @@
+From 131dbff9a117e0db8638559ed66cced01916cb97 Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Thu, 5 May 2016 11:06:54 -0500
+Subject: [PATCH 38/65] ZBC backport fixes
+
+Some defined values and include functions are out-of-sync
+with 4.7 planned changes.
+
+Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
+---
+ drivers/scsi/sd.h         | 5 +++++
+ include/scsi/scsi_proto.h | 9 +++++++++
+ 2 files changed, 14 insertions(+)
+
+diff --git a/drivers/scsi/sd.h b/drivers/scsi/sd.h
+index 5debd49..1d3a80c 100644
+--- a/drivers/scsi/sd.h
++++ b/drivers/scsi/sd.h
+@@ -154,6 +154,11 @@ static inline sector_t logical_to_sectors(struct scsi_device *sdev, sector_t blo
+ 	return blocks << (ilog2(sdev->sector_size) - 9);
+ }
+ 
++static inline sector_t sectors_to_logical(struct scsi_device *sdev, sector_t sector)
++{
++	return sector >> (ilog2(sdev->sector_size) - 9);
++}
++
+ /*
+  * A DIF-capable target device can be formatted with different
+  * protection schemes.  Currently 0 through 3 are defined:
+diff --git a/include/scsi/scsi_proto.h b/include/scsi/scsi_proto.h
+index b470b49..6ba66e0 100644
+--- a/include/scsi/scsi_proto.h
++++ b/include/scsi/scsi_proto.h
+@@ -115,6 +115,8 @@
+ #define VERIFY_16	      0x8f
+ #define SYNCHRONIZE_CACHE_16  0x91
+ #define WRITE_SAME_16	      0x93
++#define ZBC_OUT		      0x94
++#define ZBC_IN		      0x95
+ #define SERVICE_ACTION_BIDIRECTIONAL 0x9d
+ #define SERVICE_ACTION_IN_16  0x9e
+ #define SERVICE_ACTION_OUT_16 0x9f
+@@ -143,6 +145,13 @@
+ #define MO_SET_PRIORITY       0x0e
+ #define MO_SET_TIMESTAMP      0x0f
+ #define MO_MANAGEMENT_PROTOCOL_OUT 0x10
++/* values for ZBC_IN */
++#define ZI_REPORT_ZONES	      0x00
++/* values for ZBC_OUT */
++#define ZO_CLOSE_ZONE	      0x01
++#define ZO_FINISH_ZONE	      0x02
++#define ZO_OPEN_ZONE	      0x03
++#define ZO_RESET_WRITE_POINTER 0x04
+ /* values for variable length command */
+ #define XDREAD_32	      0x03
+ #define XDWRITE_32	      0x04
+-- 
+2.8.1
+

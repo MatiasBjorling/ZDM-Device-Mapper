@@ -1,0 +1,100 @@
+From 0ce03bc549cf82c11ab9f85608ff7e2941873192 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@fb.com>
+Date: Wed, 2 Mar 2016 08:24:20 -0700
+Subject: [PATCH 46/64] Add support for per-file/inode stream ID
+
+Writing on flash devices can be much more efficient, if we can
+inform the device what kind of data can be grouped together. If
+the device is able to group data together with similar lifetimes,
+then it can be more efficient in garbage collection. This, in turn,
+leads to lower write amplification, which is a win on both device
+wear and performance.
+
+Signed-off-by: Jens Axboe <axboe@fb.com>
+---
+ fs/inode.c         |  1 +
+ fs/open.c          |  1 +
+ include/linux/fs.h | 22 ++++++++++++++++++++++
+ 3 files changed, 24 insertions(+)
+
+diff --git a/fs/inode.c b/fs/inode.c
+index 1be5f90..2389476 100644
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@ -147,6 +147,7 @@ int inode_init_always(struct super_block *sb, struct inode *inode)
+ 	inode->i_blocks = 0;
+ 	inode->i_bytes = 0;
+ 	inode->i_generation = 0;
++	inode->i_streamid = 0;
+ 	inode->i_pipe = NULL;
+ 	inode->i_bdev = NULL;
+ 	inode->i_cdev = NULL;
+diff --git a/fs/open.c b/fs/open.c
+index b6f1e96..1f4938a 100644
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -749,6 +749,7 @@ static int do_dentry_open(struct file *f,
+ 	f->f_flags &= ~(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC);
+ 
+ 	file_ra_state_init(&f->f_ra, f->f_mapping->host->i_mapping);
++	f->f_streamid = 0;
+ 
+ 	return 0;
+ 
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 3aa5142..3092f82 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -658,6 +658,7 @@ struct inode {
+ #ifdef CONFIG_IMA
+ 	atomic_t		i_readcount; /* struct files open RO */
+ #endif
++	unsigned int		i_streamid;
+ 	const struct file_operations	*i_fop;	/* former ->i_op->default_file_ops */
+ 	struct file_lock_context	*i_flctx;
+ 	struct address_space	i_data;
+@@ -679,6 +680,14 @@ struct inode {
+ 	void			*i_private; /* fs or device private pointer */
+ };
+ 
++static inline unsigned int inode_streamid(struct inode *inode)
++{
++	if (inode)
++		return inode->i_streamid;
++
++	return 0;
++}
++
+ static inline int inode_unhashed(struct inode *inode)
+ {
+ 	return hlist_unhashed(&inode->i_hash);
+@@ -850,6 +859,7 @@ struct file {
+ 	 * Must not be taken from IRQ context.
+ 	 */
+ 	spinlock_t		f_lock;
++	unsigned int		f_streamid;
+ 	atomic_long_t		f_count;
+ 	unsigned int 		f_flags;
+ 	fmode_t			f_mode;
+@@ -881,6 +891,18 @@ struct file_handle {
+ 	unsigned char f_handle[0];
+ };
+ 
++/*
++ * If the file doesn't have a stream ID set, return the inode stream ID
++ * in case that has been set.
++ */
++static inline unsigned int file_streamid(struct file *f)
++{
++	if (f->f_streamid)
++		return f->f_streamid;
++
++	return inode_streamid(f->f_inode);
++}
++
+ static inline struct file *get_file(struct file *f)
+ {
+ 	atomic_long_inc(&f->f_count);
+-- 
+2.8.1
+
