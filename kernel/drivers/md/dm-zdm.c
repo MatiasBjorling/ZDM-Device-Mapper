@@ -884,6 +884,7 @@ static int zoned_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	BUILD_BUG_ON(Z_C4K != (sizeof(struct map_cache_page)));
 	BUILD_BUG_ON(Z_C4K != (sizeof(struct io_4k_block)));
 	BUILD_BUG_ON(Z_C4K != (sizeof(struct mz_superkey)));
+	BUILD_BUG_ON(PAGE_SIZE != sizeof(struct map_pool));
 
 	znd = ZDM_ALLOC(NULL, sizeof(*znd), KM_00, GFP_KERNEL);
 	if (!znd) {

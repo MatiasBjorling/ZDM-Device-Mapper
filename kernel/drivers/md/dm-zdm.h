@@ -70,12 +70,17 @@
 
 #define Z_C4K			(4096ul)
 #define Z_SHFT_SEC		(9)
-#define Z_UNSORTED		(Z_C4K / sizeof(struct map_cache_entry))
-#define Z_MAP_MAX		(Z_UNSORTED - 1)
 #define Z_BLOCKS_PER_DM_SECTOR	(Z_C4K/512)
 #define MZ_METADATA_ZONES	(8ul)
 #define Z_SHFT4K		(3)
 
+#define Z_UNSORTED		(Z_C4K / sizeof(struct map_cache_entry))
+#define Z_MAP_MAX		(Z_UNSORTED - 1)
+
+#define Z_MCE_MAX	((PAGE_SIZE - sizeof(struct zdm *) - sizeof(int) * 4) \
+				/ sizeof(void*))
+#define MCE_SHIFT	(ilog2(PAGE_SIZE/sizeof(struct map_cache_entry)))
+#define MCE_MASK	((1 << MCE_SHIFT) - 1)
 
 #define LBA_SB_START		1
 #define SUPERBLOCK_MAGIC	0x5a6f4e65ul	/* ZoNe */
@@ -130,7 +135,6 @@
 #define FWD_KEY_BLOCKS		8
 #define FWD_KEY_BASE		(WP_ZF_BASE + (MAX_WP_BLKS * 2))
 
-#define MC_POOL_SZ		(4 * 4096u)
 #define MC_HIGH_WM		4096
 #define MC_MOVE_SZ		512
 
@@ -307,14 +311,6 @@ struct map_cache_entry {
 #define MCE_NO_ENTRY	0x4000
 #define MCE_NO_MERGE	0x8000
 
-/*
- * 2 copies for ingress, 2 copies for discard(unused)
- */
-struct map_cache_pool {
-	struct map_cache_entry header;
-	struct map_cache_entry maps[MC_POOL_SZ];
-} __packed;
-
 /* 1 temporary buffer for each for overlay/split/mergeback
  */
 struct map_cache_page {
@@ -325,11 +321,6 @@ struct map_cache_page {
 struct gc_map_cache_data {
 	struct map_cache_entry header;
 	struct map_cache_entry maps[Z_BLKSZ];
-} __packed;
-
-struct jrnl_map_cache_data {
-	struct map_cache_entry header;
-	struct map_cache_entry maps[WB_JRNL_MAX];
 } __packed;
 
 /**
@@ -359,8 +350,8 @@ enum map_type_enum {
  *
  * Longer description of this structure.
  */
-struct map_cache {
-	void *mcd;
+struct gc_map_cache {
+	struct gc_map_cache_data *gc_mcd;
 	spinlock_t cached_lock;
 	int jcount;
 	int jsorted;
@@ -369,11 +360,12 @@ struct map_cache {
 };
 
 struct map_pool {
-	struct map_cache_pool mcd;
 	int count;
 	int sorted;
 	int size;
 	int isa;
+	struct zdm *znd;
+	struct map_cache_entry *pgs[Z_MCE_MAX];
 };
 
 /**
@@ -770,23 +762,20 @@ struct zdm {
 
 	/* Primary ingress cache */
 	struct map_pool *ingress;
-	struct map_pool in[2];  /* active and update */
+	struct map_pool *in[2];  /* active and update */
 	spinlock_t in_rwlck;
 
 	/* unused blocks cache */
 	struct map_pool *unused;
-	struct map_pool _use[2]; /* active and update */
-	struct map_cache_page unused_pg;
+	struct map_pool *_use[2]; /* active and update */
 	spinlock_t unused_rwlck;
 
 	struct map_pool *trim;
-	struct map_pool trim_mp[2]; /* active and update */
-	struct map_cache_page trim_pg;
+	struct map_pool *trim_mp[2]; /* active and update */
 	spinlock_t trim_rwlck;
 
 	struct map_pool *wbjrnl;
-	struct map_pool _wbj[2]; /* active and update */
-	struct map_cache_page wbjrnl_pg;
+	struct map_pool *_wbj[2]; /* active and update */
 	spinlock_t wbjrnl_rwlck;
 
 	mempool_t *mempool_pages;
@@ -883,8 +872,7 @@ struct zdm {
 	u64 age;
 	u64 flush_age;
 	struct workqueue_struct *meta_wq;
-	struct map_cache gc_postmap;
-	struct map_cache jrnl_map;
+	struct gc_map_cache gc_postmap;
 	struct dm_io_client *io_client;
 	struct workqueue_struct *io_wq;
 	struct workqueue_struct *zone_action_wq;
@@ -896,11 +884,6 @@ struct zdm {
 	char bdev_name[BDEVNAME_SIZE];
 	char bdev_metaname[BDEVNAME_SIZE];
 	char proc_name[BDEVNAME_SIZE+4];
-	char meta_wq_name[BDEVNAME_SIZE+16];
-	char gc_wq_name[BDEVNAME_SIZE+16];
-	char bg_wq_name[BDEVNAME_SIZE+16];
-	char io_wq_name[BDEVNAME_SIZE+16];
-	char za_wq_name[BDEVNAME_SIZE+16];
 	struct proc_dir_entry *proc_fs;
 	loff_t wp_proc_at;
 	loff_t used_proc_at;
