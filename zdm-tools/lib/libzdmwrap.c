@@ -183,17 +183,17 @@ int zdm_zone_ctrl(struct zdm * znd, u64 z_id, int command_id)
 
 int zdm_reset_wp(struct zdm * znd, u64 z_id)
 {
-	return zdm_zone_ctrl(znd, z_id, BLKRESETZONE);
+	return zdm_zone_ctrl(znd, z_id, ZONE_ACTION_RESET);
 }
 
 int zdm_close(struct zdm * znd, u64 z_id)
 {
-	return zdm_zone_ctrl(znd, z_id, BLKCLOSEZONE);
+	return zdm_zone_ctrl(znd, z_id, ZONE_ACTION_CLOSE);
 }
 
 int zdm_open(struct zdm * znd, u64 z_id)
 {
-	return zdm_zone_ctrl(znd, z_id, BLKOPENZONE);
+	return zdm_zone_ctrl(znd, z_id, ZONE_ACTION_OPEN);
 }
 
 int zdm_zoned_inq(struct zdm *znd)

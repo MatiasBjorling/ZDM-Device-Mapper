@@ -50,6 +50,12 @@ enum scsi_device_state {
 	SDEV_CREATED_BLOCK,	/* same as above but for created devices */
 };
 
+enum scsi_scan_mode {
+	SCSI_SCAN_INITIAL = 0,
+	SCSI_SCAN_RESCAN,
+	SCSI_SCAN_MANUAL,
+};
+
 enum scsi_device_event {
 	SDEV_EVT_MEDIA_CHANGE	= 1,	/* media has changed */
 	SDEV_EVT_INQUIRY_CHANGE_REPORTED,		/* 3F 03  UA reported */
@@ -88,7 +94,6 @@ struct scsi_device {
 	spinlock_t list_lock;
 	struct list_head cmd_list;	/* queue of in use SCSI Command structures */
 	struct list_head starved_entry;
-	struct scsi_cmnd *current_cmnd;	/* currently active command */
 	unsigned short queue_depth;	/* How deep of a queue we want */
 	unsigned short max_queue_depth;	/* max queue depth */
 	unsigned short last_queue_full_depth; /* These two are used by */
@@ -151,7 +156,7 @@ struct scsi_device {
 	unsigned use_10_for_ms:1; /* first try 10-byte mode sense/select */
 	unsigned no_report_opcodes:1;	/* no REPORT SUPPORTED OPERATION CODES */
 	unsigned no_write_same:1;	/* no WRITE SAME command */
-	unsigned sct_write_same:1;	/* Has WRITE SAME via SCT Command */
+	unsigned use_ata16_for_zbc:1;	/* HBA blocks ZBC -> ZAC use ata16 */
 	unsigned use_16_for_rw:1; /* Use read/write(16) over read/write(10) */
 	unsigned skip_ms_page_8:1;	/* do not use MODE SENSE page 0x08 */
 	unsigned skip_ms_page_3f:1;	/* do not use MODE SENSE page 0x3f */
@@ -178,6 +183,7 @@ struct scsi_device {
 	unsigned broken_fua:1;		/* Don't set FUA bit */
 	unsigned lun_in_cdb:1;		/* Store LUN bits in CDB[1] */
 	unsigned synchronous_alua:1;	/* Synchronous ALUA commands */
+	unsigned urswrz:1;		/* Unrestricted reads */
 
 	atomic_t disk_events_disable_depth; /* disable depth for disk events */
 
@@ -243,6 +249,7 @@ scmd_printk(const char *, const struct scsi_cmnd *, const char *, ...);
 enum scsi_target_state {
 	STARGET_CREATED = 1,
 	STARGET_RUNNING,
+	STARGET_REMOVE,
 	STARGET_DEL,
 };
 
@@ -392,7 +399,8 @@ extern void scsi_device_resume(struct scsi_device *sdev);
 extern void scsi_target_quiesce(struct scsi_target *);
 extern void scsi_target_resume(struct scsi_target *);
 extern void scsi_scan_target(struct device *parent, unsigned int channel,
-			     unsigned int id, u64 lun, int rescan);
+			     unsigned int id, u64 lun,
+			     enum scsi_scan_mode rescan);
 extern void scsi_target_reap(struct scsi_target *);
 extern void scsi_target_block(struct device *);
 extern void scsi_target_unblock(struct device *, enum scsi_device_state);
@@ -535,9 +543,9 @@ static inline int scsi_device_supports_vpd(struct scsi_device *sdev)
 	/*
 	 * Although VPD inquiries can go to SCSI-2 type devices,
 	 * some USB ones crash on receiving them, and the pages
-	 * we currently ask for are for SPC-3 and beyond
+	 * we currently ask for are mandatory for SPC-2 and beyond
 	 */
-	if (sdev->scsi_level > SCSI_SPC_2 && !sdev->skip_vpd_pages)
+	if (sdev->scsi_level >= SCSI_SPC_2 && !sdev->skip_vpd_pages)
 		return 1;
 	return 0;
 }

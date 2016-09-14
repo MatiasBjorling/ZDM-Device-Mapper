@@ -32,6 +32,7 @@
 
 #include <errno.h>
 #include <string.h> // strdup
+#include <getopt.h>
 
 #include "libzdmwrap.h"
 #include "libzdm-compat.h"
@@ -101,8 +102,8 @@ static const char zdm_magic[] = {
 struct zdm_super_block {
 	uint32_t crc32;
 	uint32_t reserved;
-	uint8_t magic[ARRAY_SIZE(zdm_magic)];
-	uuid_t  uuid;
+	uint8_t  magic[ARRAY_SIZE(zdm_magic)];
+	uuid_t   uuid;
 	uint32_t version;     /* 0xMMMMmmpt */
 	uint64_t sect_start;
 	uint64_t sect_size;
@@ -115,6 +116,22 @@ struct zdm_super_block {
 	char label[64];
 	uint64_t data_start;  /* zone # of first *DATA* zone */
 	uint64_t zone_size;   /* zone size in 512 byte blocks */
+	uuid_t uuid_meta;     /* UUID of metadata block device */
+	uint32_t is_meta;     /* true if this is the metadata device */
+	uint32_t io_queue;    /* true if I/O queue should be enabled. */
+	uint32_t gc_prio_def;    /* 0xFF00 */
+	uint32_t gc_prio_low;    /* 0x7FFF */
+	uint32_t gc_prio_high;   /* 0x0400 */
+	uint32_t gc_prio_crit;   /* 0x0040 */
+	uint32_t gc_wm_crit;     /* 7 zones free */
+	uint32_t gc_wm_high;     /* < 5% zones free */
+	uint32_t gc_wm_low;      /* < 25% zones free */
+	uint32_t gc_status;      /* on/off/force */
+	uint32_t cache_size;      /* cache size (reserve) */
+	uint32_t cache_reada;     /* number of block to read-ahead */
+	uint32_t cache_ageout_ms; /* number of ms before droping */
+	uint32_t cache_to_pagecache;  /* if dropping through page-cache */
+	uint8_t  padding[264]; /* pad to 512 bytes */
 };
 typedef struct zdm_super_block zdm_super_block_t;
 
@@ -184,7 +201,9 @@ static void zdmadm_show(const char * dname, zdm_super_block_t *sblk)
 			sblk->mz_metadata_zones +  sblk->mz_over_provision,
 			sblk->mz_metadata_zones,
 			sblk->mz_over_provision);
-	printf("trim    - %s\n", sblk->discard ? "ON" : "OFF");
+	printf("trim    - %s\n", (sblk->discard & 1) ?
+				    ((sblk->discard & (1 << 16)) ?
+				        "ON+raid5" : "ON") : "OFF");
 	printf("ha/hm   - HostAware %s / HostManaged %s\n",
 		sblk->disk_type & MEDIA_HOST_AWARE   ? "Yes" : "No",
 		sblk->disk_type & MEDIA_HOST_MANAGED ? "Yes" : "No");
@@ -875,7 +894,7 @@ int zdmadm_probe_zones(int fd, zdm_super_block_t * sblk, int verbose)
 	size_t size = 128 * 4096;
 	struct bdev_zone_report_io *report = malloc(size);
 	if (report) {
-		int opt = ZOPT_NON_SEQ_AND_RESET;
+		int opt = ZBC_ZONE_REPORTING_OPTION_ALL;
 		u64 lba = sblk->sect_start;
 		int do_ata = (sblk->zac_zbc & MEDIA_ZAC) ? 1 : 0;
 
@@ -889,13 +908,14 @@ int zdmadm_probe_zones(int fd, zdm_super_block_t * sblk, int verbose)
 			struct bdev_zone_report *info = &report->data.out;
 			struct bdev_zone_descriptor *entry = &info->descriptors[zone];
 			int is_be = zdm_is_big_endian_report(info);
-			u64 fz_at = is_be ? be64toh(entry->lba_start) : entry->lba_start;
+			s64 fz_at = is_be ? be64toh(entry->lba_start) : entry->lba_start;
 			u64 fz_sz = is_be ? be64toh(entry->length) : entry->length;
 			unsigned int type = entry->type & 0xF;
 			u64 cache, need, pref;
 			u64 mdzcount = 0;
 			u64 nmegaz = 0;
 
+			fz_at += sblk->sect_start;
 			minimums(sblk->sect_size, fz_sz, &nmegaz, &cache, &need, &pref);
 			if ( !is_conv_or_relaxed(type) ) {
 				printf("Unsupported device: ZDM first zone must be conventional"
@@ -933,10 +953,6 @@ int zdmadm_probe_zones(int fd, zdm_super_block_t * sblk, int verbose)
 				printf("LBA start of first zone: %6" PRIx64 " Z# %d\n", fz_at, zone);
 				printf("LBA start of partition:  %6" PRIx64 "\n", sblk->sect_start);
 			}
-
-
-// printf("Using non-aligned space start of partition for metadata.*\n");
-
 
 			if ((fz_at - sblk->sect_start) > (cache * 8))
 				mdzcount++; /* really pref-- */
@@ -977,152 +993,161 @@ out:
 	return rcode;
 }
 
-int zdmadm_format_initmd(int fd, zdm_super_block_t * sblk, int use_force, int verbose)
+int zdmadm_format_initmd(int fd, zdm_super_block_t * sblk, sector_t sect_start, int use_force, int verbose)
 {
- 	struct io_4k_block *io_vcache = NULL;
- 	void *data = NULL;
- 	int locations;
- 	int iter;
- 	int err = 0;
- 	int rc;
- 	u64 pool_lba;
- 	u64 cache, need, pref;
- 	u64 fz_sz = 1 << 19; /* in 512 byte sectors */
- 	u64 zone = ((sblk->sect_start + fz_sz - 1) / fz_sz);
- 	u64 fz_at = zone * fz_sz;
- 	u64 mdzcount = 0;
- 	u64 mz_count;
- 	u64 lba = LBA_SB_START;
- 	unsigned long wchunk = (Z_C4K*IO_VCACHE_PAGES);
- 
- 	io_vcache = calloc(IO_VCACHE_PAGES, Z_C4K);
- 	data = calloc(1, Z_C4K);
- 	if (!data || !io_vcache) {
- 		err = -ENOMEM;
- 		goto out;
- 	}
- 
- 	/* pass through conventional ... no ZAC/ZBC report to check */
- 	minimums(sblk->sect_size, fz_sz, &mz_count, &cache, &need, &pref);
- 
- 	lba = LBA_SB_START;
- 	memset(data, 0, Z_C4K);
- 	locations = mz_count * CACHE_COPIES;
- 
- 	printf("ZDM: Initialize Metadata pool\n");
- 	printf(" ... initializing cache blocks from %" PRIx64 " - 0x%"
- 		PRIx64 "\n", lba, lba + WB_JRNL_BASE );
- 
- 	for (iter = 0; iter < WB_JRNL_BASE; iter++) {
- 		rc = pwrite64(fd, data, Z_C4K, lba << 12);
- 		if (rc != Z_C4K) {
- 			fprintf(stderr, "write error: %d writing %"
- 				PRIx64 "\n", rc, lba);
- 			err = -1;
- 			goto out;
- 		}
- 		lba++;
- 	}
- 
- 	pool_lba = fz_sz >> 3;
- 	if ( (fz_at - sblk->sect_start) > (cache << 3) ) {
- 		/* number of blocks until next zone begins */
- 		pool_lba = (fz_at - sblk->sect_start) >> 3;
- 		mdzcount++;
- 		printf(" ... used 0x%" PRIx64 " 4k blocks for"
- 		       " zone-alignment\n", pool_lba);
- 	}
- 
- 	printf(" ... clearing %" PRIu64 " ZTL zones from %"
- 		PRIx64 " - %" PRIx64 "\n",
- 		pref - 2, pool_lba, pool_lba + ((pref - 2) << 16) );
- 
- 	memset(io_vcache, 0xFF, wchunk);
- 	locations = (mz_count << 16) / IO_VCACHE_PAGES;
- 	if ( (pref - mdzcount) <= sblk->data_start) {
- 		locations *= 2;
- 		if (verbose)
- 			printf(" ... including reverse ZTL zones\n");
- 	}
- 
- 	printf(" ... %d writes of %d 4k blocks [%ld bytes]\n",
- 		locations, IO_VCACHE_PAGES, wchunk);
- 	printf("         lba of partition | drive\n");
- 	lba = pool_lba;
- 	for (iter = 0; iter < locations; iter++) {
- 		rc = pwrite64(fd, io_vcache, wchunk, lba << 12);
- 		if (rc != wchunk) {
- 			printf("%s: clear sb @ %" PRIx64
- 			       " failed:  %d\b", __func__, lba, rc);
- 		}
- 
- 		if (0 == (iter % 256)) {
- 			printf("    ... writing .. %6"PRIx64" | %6"PRIx64"\n",
- 				lba, lba + (sblk->sect_start >> 3));
- 		}
- 
- 		lba += IO_VCACHE_PAGES;
- 	}
- 
- 	if ( (pref - mdzcount) <= sblk->data_start) {
- 		__le16 crc;
- 		__le16 *crcs = data;
- 
- 		printf(" ... inititalize Meta CRCs %6"PRIx64" - %6"PRIx64"\n",
- 			lba, lba + (0x40 * mz_count));
- 		printf(" ...              absolute %6"PRIx64" - %6"PRIx64"\n",
- 			lba + (sblk->sect_start >> 3),
- 			lba + (0x40 * mz_count) + (sblk->sect_start >> 3));
- 
- 		memset(data, 0xFF, Z_C4K);
- 		crc = crc_md_le16(data, Z_CRC_4K);
- 
- 		if (verbose)
- 			printf(" ... Initial MetaCRC %04x\n", le16_to_cpu(crc));
- 
- 		/* make page of CRCs */
- 		for (iter = 0; iter < 2048; iter++) {
- 			crcs[iter] = crc;
- 		}
- 
- 		/* make IO_VCACHE_PAGES of CRCs */
- 		for (iter = 0; iter < IO_VCACHE_PAGES; iter++) {
- 			memcpy(io_vcache[iter].data, crcs, Z_C4K);
- 		}
- 
- 		if (verbose)
- 			printf(" ... Initial MetaMetaCRC %04x\n",
- 				le16_to_cpu(crc_md_le16(crcs, Z_CRC_4K)));
- 
- 		locations = dm_div_up((0x40 * mz_count), IO_VCACHE_PAGES);
- 		for (iter = 0; iter < locations; iter++) {
- 			rc = pwrite64(fd, io_vcache, wchunk, lba << 12);
- 			if (rc != wchunk) {
- 				printf("%s: clear sb @ %" PRIx64
- 					" failed:  %d\n", __func__,
- 				lba, rc);
- 			}
- 			lba += IO_VCACHE_PAGES;
- 		}
- 	}
- 	printf("Metadata pool initialized.\n");
- out:
- 
- 	if (io_vcache) free(io_vcache);
- 	if (data) free(data);
- 
- 	return err;
+	struct io_4k_block *io_vcache = NULL;
+	void *data = NULL;
+	int locations;
+	int iter;
+	int err = 0;
+	int rc;
+	u64 pool_lba;
+	u64 cache, need, pref;
+	u64 fz_sz = 1 << 19; /* in 512 byte sectors */
+	u64 zone = ((sect_start + fz_sz - 1) / fz_sz);
+	u64 fz_at = zone * fz_sz;
+	u64 mdzcount = 0;
+	u64 mz_count;
+	u64 lba = LBA_SB_START;
+	unsigned long wchunk = (Z_C4K*IO_VCACHE_PAGES);
+
+	io_vcache = calloc(IO_VCACHE_PAGES, Z_C4K);
+	data = calloc(1, Z_C4K);
+	if (!data || !io_vcache) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	/* pass through conventional ... no ZAC/ZBC report to check */
+	minimums(sblk->sect_size, fz_sz, &mz_count, &cache, &need, &pref);
+
+	lba = LBA_SB_START;
+	memset(data, 0, Z_C4K);
+	locations = mz_count * CACHE_COPIES;
+
+	printf("ZDM: Initialize Metadata pool\n");
+	printf(" ... initializing cache blocks from %" PRIx64 " - 0x%"
+		PRIx64 "\n", lba, lba + WB_JRNL_BASE );
+
+	for (iter = 0; iter < WB_JRNL_BASE; iter++) {
+		rc = pwrite64(fd, data, Z_C4K, lba << 12);
+		if (rc != Z_C4K) {
+			fprintf(stderr, "write error: %d writing %"
+				PRIx64 "\n", rc, lba);
+			err = -1;
+			goto out;
+		}
+		lba++;
+	}
+
+	pool_lba = fz_sz >> 3;
+	if ( (fz_at - sect_start) > (cache << 3) ) {
+		/* number of blocks until next zone begins */
+		pool_lba = (fz_at - sect_start) >> 3;
+		mdzcount++;
+		printf(" ... used 0x%" PRIx64 " 4k blocks for"
+		       " zone-alignment\n", pool_lba);
+	} else {
+		pool_lba = (fz_at - sect_start + fz_sz) >> 3;
+	}
+
+	printf(" ... clearing %" PRIu64 " ZTL zones from %"
+		PRIx64 " - %" PRIx64 "\n",
+		pref - 2, pool_lba, pool_lba + ((pref - 2) << 16) );
+
+	memset(io_vcache, 0xFF, wchunk);
+	locations = (mz_count << 16) / IO_VCACHE_PAGES;
+	if ( (pref - mdzcount) <= sblk->data_start) {
+		locations *= 2;
+		if (verbose)
+			printf(" ... including reverse ZTL zones\n");
+	}
+
+	printf(" ... %d writes of %d 4k blocks [%ld bytes]\n",
+		locations, IO_VCACHE_PAGES, wchunk);
+	printf("         lba of partition | drive\n");
+	lba = pool_lba;
+	for (iter = 0; iter < locations; iter++) {
+		rc = pwrite64(fd, io_vcache, wchunk, lba << 12);
+		if (rc != wchunk) {
+			printf("%s: clear sb @ %" PRIx64
+			       " failed:  %d\n", __func__, lba, rc);
+			err = -ENOSPC;
+			printf("Metadata device is undersized? %d\n", err);
+			goto out;
+		}
+
+		if (0 == (iter % 256)) {
+			printf("    ... writing .. %6"PRIx64" | %6"PRIx64"\n",
+				lba, lba + (sect_start >> 3));
+		}
+
+		lba += IO_VCACHE_PAGES;
+	}
+
+	if ( (pref - mdzcount) <= sblk->data_start) {
+		__le16 crc;
+		__le16 *crcs = data;
+
+		printf(" ... inititalize Meta CRCs %6"PRIx64" - %6"PRIx64"\n",
+			lba, lba + (0x40 * mz_count));
+		printf(" ...              absolute %6"PRIx64" - %6"PRIx64"\n",
+			lba + (sect_start >> 3),
+			lba + (0x40 * mz_count) + (sect_start >> 3));
+
+		memset(data, 0xFF, Z_C4K);
+		crc = crc_md_le16(data, Z_CRC_4K);
+
+		if (verbose)
+			printf(" ... Initial MetaCRC %04x\n", le16_to_cpu(crc));
+
+		/* make page of CRCs */
+		for (iter = 0; iter < 2048; iter++) {
+			crcs[iter] = crc;
+		}
+
+		/* make IO_VCACHE_PAGES of CRCs */
+		for (iter = 0; iter < IO_VCACHE_PAGES; iter++) {
+			memcpy(io_vcache[iter].data, crcs, Z_C4K);
+		}
+
+		if (verbose)
+			printf(" ... Initial MetaMetaCRC %04x\n",
+				le16_to_cpu(crc_md_le16(crcs, Z_CRC_4K)));
+
+		locations = dm_div_up((0x40 * mz_count), IO_VCACHE_PAGES);
+		for (iter = 0; iter < locations; iter++) {
+			rc = pwrite64(fd, io_vcache, wchunk, lba << 12);
+			if (rc != wchunk) {
+				printf("%s: clear sb @ %" PRIx64
+					" failed:  %d\n", __func__,
+				lba, rc);
+			}
+			lba += IO_VCACHE_PAGES;
+		}
+	}
+	printf("Metadata pool initialized.\n");
+out:
+
+	if (io_vcache) free(io_vcache);
+	if (data) free(data);
+
+	return err;
 }
 
 
-int zdmadm_create(const char *dname, char *zname_opt,
-		  int fd, zdm_super_block_t * sblk, int use_force, int verbose)
+int zdmadm_create(char *dname, char *zname_opt,
+		  char *md_dev, zdm_super_block_t * sblk,
+		  int use_force, int num_mirr, int verbose)
 {
-	int rc = 0;
+	int rc = 0, i, fd;
 	off_t lba = 0ul;
 	zdm_super_block_t * data = malloc(Z_C4K);
 	char cmd[1024];
+	char md_devstr[16];
 	char * zname;
+	char * tname;
+	sector_t sect_start;
 
 	if (zname_opt) {
 		snprintf(sblk->label, sizeof(sblk->label), "%s", zname_opt);
@@ -1147,32 +1172,79 @@ int zdmadm_create(const char *dname, char *zname_opt,
 		goto out;
 	}
 
-	zdmadm_format_initmd(fd, sblk, use_force, verbose);
+	if (md_dev && !num_mirr)
+		tname = md_dev;
+	else
+		tname = dname;
 
-	memset(data, 0, Z_C4K);
-	memcpy(data, sblk, sizeof(*sblk));
-
-	rc = pwrite64(fd, data, Z_C4K, lba);
-	if (rc != Z_C4K) {
-		fprintf(stderr, "write error: %d writing %"
-			PRIx64 "\n", rc, lba);
+	fd = open(tname, O_RDWR);
+	if (fd < 0) {
+		perror("Failed to open device for RW");
+		printf("ZDM disk open RDWR failed: %s\n", tname);
 		rc = -1;
 		goto out;
 	}
 
+	if (blkdev_get_start(fd, &sect_start) < 0) {
+		printf("Failed to determine partition starting sector!!\n");
+		rc = -1;
+		goto out;
+	}
 	fsync(fd);
 	close(fd);
+
+	i = 0;
+	do {
+		fd = open(tname, O_RDWR);
+		if (fd < 0) {
+			perror("Failed to open device for RW");
+			printf("ZDM disk open RDWR failed: %s\n", tname);
+			rc = -1;
+			goto out;
+		}
+		printf("ZDM: Initialize metadata pool for %s\n", tname);
+		rc = zdmadm_format_initmd(fd, sblk, sect_start, use_force, verbose);
+		if (rc) {
+			printf("** ERROR: ZDM metadata init failed: %d\n", rc);
+			close(fd);
+			goto out;
+		}
+
+		memset(data, 0, Z_C4K);
+		memcpy(data, sblk, sizeof(*sblk));
+
+		rc = pwrite64(fd, data, Z_C4K, lba);
+		if (rc != Z_C4K) {
+			fprintf(stderr, "write error: %d writing %" PRIx64 "\n",
+				rc, lba);
+			rc = -1;
+			goto out;
+		}
+
+		fsync(fd);
+		close(fd);
+		i++;
+		tname = md_dev;
+	} while (i <= num_mirr);
+
+	*md_devstr = 0;
+	if (md_dev)
+		snprintf(md_devstr, sizeof(md_devstr), "meta=%s", md_dev);
 
 	snprintf(cmd, sizeof(cmd),
 		"dmsetup create \"zdm_%s\" "
 			"--table \"0 %" PRIu64 " zdm %s %"PRIu64
-			        " create %s %s %s %s reserve=%d\"",
+			        " %s %s create %s %s %s %s %s %s reserve=%d\"",
 		zname,
 		sblk->zdm_blocks,
 		dname,
 		sblk->data_start,
+		md_devstr,
+		num_mirr ? "mirror-md" : "",
 		use_force ? "force" : "",
-		sblk->discard ? "discard" : "nodiscard",
+		(sblk->discard & 1) ? "discard" : "nodiscard",
+		(sblk->discard & (1 << 16)) ? "raid5-trim" : "no-raid5-trim",
+		sblk->io_queue ? "bio-queue" : "no-bio-queue",
 		sblk->zac_zbc & MEDIA_ZAC ? "zac" : "nozac",
 		sblk->zac_zbc & MEDIA_ZBC ? "zbc" : "nozbc",
 		sblk->mz_metadata_zones + sblk->mz_over_provision);
@@ -1192,11 +1264,13 @@ out:
 	return rc;
 }
 
-int zdmadm_restore(const char *dname, int fd, zdm_super_block_t * sblock)
+int zdmadm_restore(const char *dname, char *md_dev, int fd, int num_mirr,
+		   zdm_super_block_t * sblock)
 {
 	int rc = 0;
 	char cmd[1024];
 	char * zname;
+	char md_devstr[16];
 
 	if (strlen(sblock->label) > 0) {
 		zname = sblock->label;
@@ -1215,15 +1289,22 @@ int zdmadm_restore(const char *dname, int fd, zdm_super_block_t * sblock)
 
 	close(fd);
 
+	*md_devstr = 0;
+	if (md_dev)
+		snprintf(md_devstr, sizeof(md_devstr), "meta=%s", md_dev);
+
 	snprintf(cmd, sizeof(cmd),
 		"dmsetup create \"zdm_%s\" --table "
 			"\"0 %" PRIu64 " zdm %s %"
-		                PRIu64 " load %s %s %s reserve=%d\"",
+				PRIu64 " %s %s load %s %s %s %s reserve=%d\"",
 		zname,
 		sblock->zdm_blocks,
 		dname,
 		sblock->data_start,
-		sblock->discard ? "discard" : "nodiscard",
+		md_devstr,
+		num_mirr ? "mirror_md" : "",
+		(sblock->discard & 1) ? "discard" : "nodiscard",
+		(sblock->discard & (1 << 16)) ? "raid5-trim" : "no-raid5-trim",
 		sblock->zac_zbc & MEDIA_ZAC ? "zac" : "nozac",
 		sblock->zac_zbc & MEDIA_ZBC ? "zbc" : "nozbc",
 		sblock->mz_metadata_zones + sblock->mz_over_provision );
@@ -1451,55 +1532,106 @@ out:
 
 void usage(void)
 {
-	printf("USAGE:\n"
-	       "    zdmadm [options] device\n"
-	       "Options:\n"
-	       "    -c create zdm on device\n"
-	       "    -F force used with create or wipe \n"
-	       "    -k check zdm instance\n"
-	       "    -l specify zdm 'label' (default is zdm_sdXn)\n"
-	       "    -p probe device for superblock. (default)\n"
-	       "    -r restore zdm instance\n"
-	       "    -R <N> over-provision <N> zones per Megazone (minimum=8)\n"
-	       "    -t <0|1> trim on/off, default is on.\n"
-	       "    -u unload zdm instance\n"
-	       "    -v verbosity. More v's more verbose.\n"
-	       "    -w wipe an existing zdm instance. Requires -F\n"
-	       "\n");
+	printf(
+		"USAGE:\n"
+		"    zdmadm [options] device\n"
+		"Options:\n"
+		"    -c, --create           create zdm on device\n"
+		"    -r, --restore          restore zdm instance\n"
+		"    -u, --unload           unload zdm instance\n"
+		"    -w, --wipe             Wipe/Erase an existing zdm instance. Requires -F\n"
+		"    -k, --check            check zdm instance\n"
+		"    -s, --set              set/adjust run-time paramters\n"
+		"        --adjust           set/adjust run-time paramters\n"
+		"    -p, --probe            probe device for superblock. (default)\n"
+		"    -l, --label            specify zdm 'label' (default is zdm_sdXn)\n"
+		"    -F, --force            force used with create or wipe \n"
+		"    -m, --meta <device>    Use device for metadata.\n"
+		"    -M, --mirror           Mirror the metadata on all drives.\n"
+		"    -q, --queue <num>      BIO input queue 1=on/0=off, default is off\n"
+		"    -R, --over <N>         over-provision <N> zones in 0.1%% increments.\n"
+		"                           minimum value is 8 for 0.8%%\n"
+		"    -t, --trim <num>       trim 1=on/0=off, default is on.\n"
+		"    -v, --verbosity.       More v's more verbose.\n"
+		"    -a, --raid-trim <num>  Raid level 4/5/6 trim support 1=on/0=off\n"
+		"                           default is off\n"
+		"    --gc <on|off|force>    enable, disable and force GC to act\n"
+		"    --gc-prio-def  <stale> number of stale blocks for zone reclaim.\n"
+		"    --gc-prio-log  <stale> number of stale blocks for zone reclaim.\n"
+		"    --gc-prio-high <stale> number of stale blocks for zone reclaim.\n"
+		"    --gc-prio-crit <stale> number of stale blocks for zone reclaim.\n"
+		"    --gc-wm-crit <zones>   number of unused zones remaining\n"
+		"    --gc-wm-high <%%>       percentage of unused zones (default: 5)\n"
+		"    --gc-wm-low  <%%>       percentage of unused zones (default: 25)\n"
+		"    --cache-timeout <ms>   default: 9000\n"
+		"    --cache-size <pages>   default: 4096\n"
+		"    --cache-to-pagecache <num> 1=on/0=off, default is off.\n"
+		"\n");
 }
 
 int main(int argc, char *argv[])
 {
 	int opt;
 	int index;
-	char * label = NULL;
+	char *label = NULL;
 	int exCode = 0;
-
 	u32 reserved_zones  = 3;
 	u32 over_provision  = 5;
 	u32 discard_default = 1;
+	u32 raid_trim       = 0;
 	u32 resv;
 	int command = ZDMADM_PROBE;
 	int use_force = 0;
 	int verbose = 0;
+	int io_queue = 0;
+	int num_mirr = 0;
+	char *md_device = NULL;
+	static const char *options = "a:t:R:l:q:m:MFpcruwkvh";
+	static const struct option longopts[] = {
+	    { "raid-trim",          1, 0, 'a' },
+	    { "trim",               1, 0, 't' },
+	    { "over",               1, 0, 'R' },
+	    { "label",              1, 0, 'l' },
+	    { "queue",              1, 0, 'q' },
+	    { "meta",               1, 0, 'm' },
+	    { "mirror",             0, 0, 'M' },
+	    { "force",              0, 0, 'F' },
+	    { "set",                0, 0, 's' },
+	    { "adjust",             0, 0, 's' },
+	    { "probe",              0, 0, 'p' },
+	    { "create",             0, 0, 'c' },
+	    { "restore",            0, 0, 'r' },
+	    { "unload",             0, 0, 'u' },
+	    { "wipe",               0, 0, 'w' },
+	    { "check",              0, 0, 'k' },
+	    { "verbose",            0, 0, 'v' },
+	    { "help",               0, 0, 'h' },
+	    { "gc",                 1, 0, 0 },
+	    { "gc-prio-def",        1, 0, 0 },
+	    { "gc-prio-log",        1, 0, 0 },
+	    { "gc-prio-high",       1, 0, 0 },
+	    { "gc-prio-crit",       1, 0, 0 },
+	    { "gc-wm-crit",         1, 0, 0 },
+	    { "gc-wm-high",         1, 0, 0 },
+	    { "gc-wm-low",          1, 0, 0 },
+	    { "cache-timeout",      1, 0, 0 },
+	    { "cache-size",         1, 0, 0 },
+	    { "cache-to-pagecache", 1, 0, 0 },
+	    { NULL,                 0, 0, 0 }
+	};
 
 	printf("zdmadm %d.%d\n", zdm_VERSION_MAJOR, zdm_VERSION_MINOR );
 
 	/* Parse command line */
 	errno = EINVAL; // Assume invalid Argument if we die
-	while ((opt = getopt(argc, argv, "t:R:l:Fpcrkuwv")) != -1) {
+	while ((opt = getopt_long(argc, argv, options, longopts, NULL)) != -1) {
 		switch (opt) {
+		/* commands: */
 		case 'p':
 			command = ZDMADM_PROBE;
 			break;
 		case 'c':
 			command = ZDMADM_CREATE;
-			break;
-		case 'R':
-			resv = strtoul(optarg, NULL, 0);
-			if (8 < resv && resv < 1024) {
-				over_provision = resv - reserved_zones;
-			}
 			break;
 		case 'r':
 			command = ZDMADM_RESTORE;
@@ -1513,6 +1645,7 @@ int main(int argc, char *argv[])
 		case 'u':
 			command = ZDMADM_UNLOAD;
 			break;
+		/* options: */
 		case 'F':
 			use_force = 1;
 			break;
@@ -1524,14 +1657,35 @@ int main(int argc, char *argv[])
 					optarg);
 			}
 			break;
+		case 'm':
+			md_device = optarg;
+			break;
+		case 'M':
+			num_mirr = 1;
+			break;
+		case 'q':
+			io_queue = atoi(optarg) ? 1 : 0;
+			break;
+		case 'R':
+			resv = strtoul(optarg, NULL, 0);
+			if (8 < resv && resv < 1024) {
+				over_provision = resv - reserved_zones;
+			}
+			break;
 		case 't':
 			discard_default = atoi(optarg) ? 1 : 0;
+			break;
+		case 'a':
+			raid_trim = atoi(optarg) ? 1 : 0;
 			break;
 		case 'v':
 			verbose++;
 			break;
+		case 'h':
 		default:
 			usage();
+			exCode = 1;
+			goto out;
 			break;
 		} /* switch */
 	} /* while */
@@ -1541,13 +1695,21 @@ int main(int argc, char *argv[])
 	}
 
 	for (index = optind; index < argc; ) {
-		int fd;
+		int fd, meta_fd;
 		char *dname = argv[index];
 		int is_busy;
 		char buf[80];
 		int flags;
 		int need_rw = 0;
 		int o_flags = O_RDONLY;
+
+		if (md_device) {
+			if (!strcmp(md_device,dname)) {
+				printf("Meta data and data device are same\n");
+				exCode = 1;
+				goto out;
+			}
+		}
 
 		is_busy = is_anypart_mounted(dname, &flags, buf, sizeof(buf));
 		if (is_busy || flags) {
@@ -1582,11 +1744,12 @@ int main(int argc, char *argv[])
 		}
 
 		fd = open(dname, o_flags);
-		if (fd) {
+		if (fd > 0) {
 			int zdm_exists = 1;
 			zdm_super_block_t sblk_def;
 			zdm_super_block_t sblk;
 
+			discard_default |= raid_trim << 16;
 			memset(&sblk_def, 0, sizeof(sblk_def));
 
 			exCode = zdmadm_probe_default(dname, fd, &sblk_def,
@@ -1598,10 +1761,46 @@ int main(int argc, char *argv[])
 				goto out;
 			}
 
-			exCode = zdmadm_probe_existing(fd, &sblk, verbose);
+			if (md_device) {
+				meta_fd = open( md_device, o_flags);
+				if (meta_fd < 0) {
+					perror("Failed to open device");
+					fprintf(stderr, "device: %s", dname);
+					exCode = 1;
+					goto out;
+				}
+			} else {
+				meta_fd = fd;
+			}
+			exCode = zdmadm_probe_existing(meta_fd, &sblk, verbose);
 			if (exCode < 0) {
 				zdm_exists = 0;
 			}
+
+			if (md_device && command == ZDMADM_CREATE) {
+				u64 mdsz = 0ul;
+				u64 min_zones = sblk_def.data_start - 1;
+
+				if (blkdev_get_size(meta_fd, &mdsz) < 0) {
+					printf("Failed to metadata size!!\n");
+					exCode = 2;
+					goto out;
+				}
+
+				printf("MD Size: %" PRIu64 ", need %" PRIu64 "\n",
+					mdsz, min_zones << 28);
+
+				if (mdsz < (min_zones << 28)) {
+					printf("Metatdata device is too small.\n");
+					printf("  must be at least %" PRIu64
+					       " bytes [%" PRIu64 " zones]\n",
+						min_zones << 28, min_zones);
+					exCode = 2;
+					goto out;
+				}
+			}
+			if(md_device)
+				close(meta_fd);
 
 			switch(command) {
 			case ZDMADM_CREATE:
@@ -1611,18 +1810,37 @@ int main(int argc, char *argv[])
 					goto out;
 				}
 				close(fd);
-				fd = open(dname, O_RDWR);
-				if (fd < 0) {
-					perror("Failed to open device for RW");
-					printf("ZDM disk re-open RDWR failed: %s\n", dname);
+
+				if (md_device) {
+					 is_busy = is_anypart_mounted(md_device, &flags, buf, sizeof(buf));
+
+					if (is_busy) {
+						printf("%s is busy/mounted: %d:%x\n",
+							md_device, is_busy, flags );
+						printf("refusing to proceed\n");
+						exCode = 1;
+						goto out;
+					}
+				}
+
+				if (!md_device && num_mirr)
+				{
+					printf("No metadata device provided\n");
 					exCode = 1;
 					goto out;
 				}
 
+				/* if we change options, update CRC too */
+				if (io_queue) {
+					sblk_def.io_queue = io_queue;
+					sblk_def.crc32 = zdm_crc32(&sblk_def);
+				}
+
 				/* does a lot of writing to fd and closes before
 				 * starting ZDM instance */
-				exCode = zdmadm_create(dname, label, fd, &sblk_def,
-							use_force, verbose);
+				exCode = zdmadm_create(dname, label, md_device,
+						       &sblk_def, use_force,
+						       num_mirr, verbose);
 				if (exCode < 0) {
 					printf("ZDM Create failed.\n");
 					exCode = 1;
@@ -1631,13 +1849,13 @@ int main(int argc, char *argv[])
 			break;
 			case ZDMADM_RESTORE:
 				if (! zdm_exists) {
-					printf("ZDM No found. Nothing to restore.\n");
+					printf("ZDM Not found. Nothing to restore.\n");
 					goto next;
 				}
 
 				/* closes fd before
 				 * starting ZDM instance */
-				exCode = zdmadm_restore(dname, fd, &sblk);
+				exCode = zdmadm_restore(dname, md_device, fd, num_mirr, &sblk);
 				if (exCode < 0) {
 					printf("ZDM Restore failed.\n");
 					exCode = 1;
@@ -1646,7 +1864,7 @@ int main(int argc, char *argv[])
 			break;
 			case ZDMADM_UNLOAD:
 				if (! zdm_exists) {
-					printf("ZDM No found. Nothing to unload.\n");
+					printf("ZDM Not found. Nothing to unload.\n");
 					goto next;
 				}
 				exCode = zdmadm_unload(dname, fd, &sblk);
@@ -1658,7 +1876,7 @@ int main(int argc, char *argv[])
 			break;
 			case ZDMADM_WIPE:
 				if (! zdm_exists) {
-					printf("ZDM No found. Nothing to wipe.\n");
+					printf("ZDM Not found. Nothing to wipe.\n");
 					exCode = 1;
 					goto out;
 				}

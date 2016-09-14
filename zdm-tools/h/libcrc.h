@@ -20,6 +20,7 @@ extern "C" {
 
 u16 crc16(u16 crc, const void *buffer, size_t len);
 u32 crc32c(u32 crc, const void *data, unsigned int length);
+u32 crc32(u32 crc, const void *p, unsigned int length);
 
 #ifdef __cplusplus
 }

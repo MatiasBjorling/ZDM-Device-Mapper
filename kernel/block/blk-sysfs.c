@@ -130,11 +130,6 @@ static ssize_t queue_physical_block_size_show(struct request_queue *q, char *pag
 	return queue_var_show(queue_physical_block_size(q), page);
 }
 
-static ssize_t queue_chunk_sectors_show(struct request_queue *q, char *page)
-{
-	return queue_var_show(q->limits.chunk_sectors, page);
-}
-
 static ssize_t queue_io_min_show(struct request_queue *q, char *page)
 {
 	return queue_var_show(queue_io_min(q), page);
@@ -191,9 +186,9 @@ static ssize_t queue_discard_zeroes_data_show(struct request_queue *q, char *pag
 	return queue_var_show(queue_discard_zeroes_data(q), page);
 }
 
-static ssize_t queue_raid_discard_safe_show(struct request_queue *q, char *page)
+static ssize_t queue_zoned_show(struct request_queue *q, char *page)
 {
-	return queue_var_show(queue_raid_discard_safe(q), page);
+	return queue_var_show(queue_zoned(q), page);
 }
 
 static ssize_t queue_write_same_max_show(struct request_queue *q, char *page)
@@ -233,42 +228,6 @@ static ssize_t queue_max_hw_sectors_show(struct request_queue *q, char *page)
 
 	return queue_var_show(max_hw_sectors_kb, (page));
 }
-
-#ifdef CONFIG_BLK_DEV_ZONED
-static ssize_t queue_zoned_show(struct request_queue *q, char *page)
-{
-	struct rb_node *node;
-	struct blk_zone *zone;
-	ssize_t offset = 0, end = 0;
-	size_t size = 0, num = 0;
-	enum blk_zone_type type = BLK_ZONE_TYPE_UNKNOWN;
-
-	for (node = rb_first(&q->zones); node; node = rb_next(node)) {
-		zone = rb_entry(node, struct blk_zone, node);
-		if (zone->type != type ||
-		    zone->len != size ||
-		    end != zone->start) {
-			if (size != 0)
-				offset += sprintf(page + offset, "%zu\n", num);
-			/* We can only store one page ... */
-			if (offset + 42 > PAGE_SIZE) {
-				offset += sprintf(page + offset, "...\n");
-				return offset;
-			}
-			size = zone->len;
-			type = zone->type;
-			offset += sprintf(page + offset, "%zu %zu %d ",
-					  zone->start, size, type);
-			num = 0;
-			end = zone->start + size;
-		} else
-			end += zone->len;
-		num++;
-	}
-	offset += sprintf(page + offset, "%zu\n", num);
-	return offset;
-}
-#endif
 
 #define QUEUE_SYSFS_BIT_FNS(name, flag, neg)				\
 static ssize_t								\
@@ -393,6 +352,43 @@ static ssize_t queue_poll_store(struct request_queue *q, const char *page,
 	return ret;
 }
 
+static ssize_t queue_wc_show(struct request_queue *q, char *page)
+{
+	if (test_bit(QUEUE_FLAG_WC, &q->queue_flags))
+		return sprintf(page, "write back\n");
+
+	return sprintf(page, "write through\n");
+}
+
+static ssize_t queue_wc_store(struct request_queue *q, const char *page,
+			      size_t count)
+{
+	int set = -1;
+
+	if (!strncmp(page, "write back", 10))
+		set = 1;
+	else if (!strncmp(page, "write through", 13) ||
+		 !strncmp(page, "none", 4))
+		set = 0;
+
+	if (set == -1)
+		return -EINVAL;
+
+	spin_lock_irq(q->queue_lock);
+	if (set)
+		queue_flag_set(QUEUE_FLAG_WC, q);
+	else
+		queue_flag_clear(QUEUE_FLAG_WC, q);
+	spin_unlock_irq(q->queue_lock);
+
+	return count;
+}
+
+static ssize_t queue_dax_show(struct request_queue *q, char *page)
+{
+	return queue_var_show(blk_queue_dax(q), page);
+}
+
 static struct queue_sysfs_entry queue_requests_entry = {
 	.attr = {.name = "nr_requests", .mode = S_IRUGO | S_IWUSR },
 	.show = queue_requests_show,
@@ -452,11 +448,6 @@ static struct queue_sysfs_entry queue_physical_block_size_entry = {
 	.show = queue_physical_block_size_show,
 };
 
-static struct queue_sysfs_entry queue_chunk_sectors_entry = {
-	.attr = {.name = "chunk_sectors", .mode = S_IRUGO },
-	.show = queue_chunk_sectors_show,
-};
-
 static struct queue_sysfs_entry queue_io_min_entry = {
 	.attr = {.name = "minimum_io_size", .mode = S_IRUGO },
 	.show = queue_io_min_show,
@@ -488,22 +479,15 @@ static struct queue_sysfs_entry queue_discard_zeroes_data_entry = {
 	.show = queue_discard_zeroes_data_show,
 };
 
-static struct queue_sysfs_entry queue_raid_discard_safe_entry = {
-	.attr = {.name = "raid_discard_safe", .mode = S_IRUGO },
-	.show = queue_raid_discard_safe_show,
+static struct queue_sysfs_entry queue_zoned_entry = {
+	.attr = {.name = "zoned", .mode = S_IRUGO },
+	.show = queue_zoned_show,
 };
 
 static struct queue_sysfs_entry queue_write_same_max_entry = {
 	.attr = {.name = "write_same_max_bytes", .mode = S_IRUGO },
 	.show = queue_write_same_max_show,
 };
-
-#ifdef CONFIG_BLK_DEV_ZONED
-static struct queue_sysfs_entry queue_zoned_entry = {
-	.attr = {.name = "zoned", .mode = S_IRUGO },
-	.show = queue_zoned_show,
-};
-#endif
 
 static struct queue_sysfs_entry queue_nonrot_entry = {
 	.attr = {.name = "rotational", .mode = S_IRUGO | S_IWUSR },
@@ -541,6 +525,17 @@ static struct queue_sysfs_entry queue_poll_entry = {
 	.store = queue_poll_store,
 };
 
+static struct queue_sysfs_entry queue_wc_entry = {
+	.attr = {.name = "write_cache", .mode = S_IRUGO | S_IWUSR },
+	.show = queue_wc_show,
+	.store = queue_wc_store,
+};
+
+static struct queue_sysfs_entry queue_dax_entry = {
+	.attr = {.name = "dax", .mode = S_IRUGO },
+	.show = queue_dax_show,
+};
+
 static struct attribute *default_attrs[] = {
 	&queue_requests_entry.attr,
 	&queue_ra_entry.attr,
@@ -553,24 +548,22 @@ static struct attribute *default_attrs[] = {
 	&queue_hw_sector_size_entry.attr,
 	&queue_logical_block_size_entry.attr,
 	&queue_physical_block_size_entry.attr,
-	&queue_chunk_sectors_entry.attr,
 	&queue_io_min_entry.attr,
 	&queue_io_opt_entry.attr,
 	&queue_discard_granularity_entry.attr,
 	&queue_discard_max_entry.attr,
 	&queue_discard_max_hw_entry.attr,
 	&queue_discard_zeroes_data_entry.attr,
-	&queue_raid_discard_safe_entry.attr,
+	&queue_zoned_entry.attr,
 	&queue_write_same_max_entry.attr,
 	&queue_nonrot_entry.attr,
-#ifdef CONFIG_BLK_DEV_ZONED
-	&queue_zoned_entry.attr,
-#endif
 	&queue_nomerges_entry.attr,
 	&queue_rq_affinity_entry.attr,
 	&queue_iostats_entry.attr,
 	&queue_random_entry.attr,
 	&queue_poll_entry.attr,
+	&queue_wc_entry.attr,
+	&queue_dax_entry.attr,
 	NULL,
 };
 

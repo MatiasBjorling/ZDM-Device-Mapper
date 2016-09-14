@@ -46,8 +46,9 @@ enum {
 	ATA_MAX_SECTORS_128	= 128,
 	ATA_MAX_SECTORS		= 256,
 	ATA_MAX_SECTORS_1024    = 1024,
-	ATA_MAX_SECTORS_LBA48	= 65535,/* TODO: 65536? */
+	ATA_MAX_SECTORS_LBA48	= 65535,/* avoid count to be 0000h */
 	ATA_MAX_SECTORS_TAPE	= 65535,
+	ATA_MAX_TRIM_RNUM	= 64,	/* 512-byte payload / (6-byte LBA + 2-byte range per entry) */
 
 	ATA_ID_WORDS		= 256,
 	ATA_ID_CONFIG		= 0,
@@ -104,7 +105,6 @@ enum {
 	ATA_ID_CFA_KEY_MGMT	= 162,
 	ATA_ID_CFA_MODES	= 163,
 	ATA_ID_DATA_SET_MGMT	= 169,
-	ATA_ID_SCT_CMD_XPORT	= 206,
 	ATA_ID_ROT_SPEED	= 217,
 	ATA_ID_PIO4		= (1 << 1),
 
@@ -410,11 +410,15 @@ enum {
 	SETFEATURES_WC_ON	= 0x02, /* Enable write cache */
 	SETFEATURES_WC_OFF	= 0x82, /* Disable write cache */
 
+	SETFEATURES_RA_ON	= 0xaa, /* Enable read look-ahead */
+	SETFEATURES_RA_OFF	= 0x55, /* Disable read look-ahead */
+
 	/* Enable/Disable Automatic Acoustic Management */
 	SETFEATURES_AAM_ON	= 0x42,
 	SETFEATURES_AAM_OFF	= 0xC2,
 
-	SETFEATURES_SPINUP	= 0x07, /* Spin-up drive */
+	SETFEATURES_SPINUP		= 0x07, /* Spin-up drive */
+	SETFEATURES_SPINUP_TIMEOUT	= 30000, /* 30s timeout for drive spin-up from PUIS */
 
 	SETFEATURES_SATA_ENABLE = 0x10, /* Enable use of SATA feature */
 	SETFEATURES_SATA_DISABLE = 0x90, /* Disable use of SATA feature */
@@ -519,16 +523,23 @@ enum {
 	SERR_DEV_XCHG		= (1 << 26), /* device exchanged */
 };
 
-enum ata_tf_protocols {
-	/* ATA taskfile protocols */
-	ATA_PROT_UNKNOWN,	/* unknown/invalid */
-	ATA_PROT_NODATA,	/* no data */
-	ATA_PROT_PIO,		/* PIO data xfer */
-	ATA_PROT_DMA,		/* DMA */
-	ATA_PROT_NCQ,		/* NCQ */
-	ATAPI_PROT_NODATA,	/* packet command, no data */
-	ATAPI_PROT_PIO,		/* packet command, PIO data xfer*/
-	ATAPI_PROT_DMA,		/* packet command with special DMA sauce */
+enum ata_prot_flags {
+	/* protocol flags */
+	ATA_PROT_FLAG_PIO	= (1 << 0), /* is PIO */
+	ATA_PROT_FLAG_DMA	= (1 << 1), /* is DMA */
+	ATA_PROT_FLAG_NCQ	= (1 << 2), /* is NCQ */
+	ATA_PROT_FLAG_ATAPI	= (1 << 3), /* is ATAPI */
+
+	/* taskfile protocols */
+	ATA_PROT_UNKNOWN	= (u8)-1,
+	ATA_PROT_NODATA		= 0,
+	ATA_PROT_PIO		= ATA_PROT_FLAG_PIO,
+	ATA_PROT_DMA		= ATA_PROT_FLAG_DMA,
+	ATA_PROT_NCQ_NODATA	= ATA_PROT_FLAG_NCQ,
+	ATA_PROT_NCQ		= ATA_PROT_FLAG_DMA | ATA_PROT_FLAG_NCQ,
+	ATAPI_PROT_NODATA	= ATA_PROT_FLAG_ATAPI,
+	ATAPI_PROT_PIO		= ATA_PROT_FLAG_ATAPI | ATA_PROT_FLAG_PIO,
+	ATAPI_PROT_DMA		= ATA_PROT_FLAG_ATAPI | ATA_PROT_FLAG_DMA,
 };
 
 enum ata_ioctls {
@@ -775,48 +786,6 @@ static inline bool ata_id_sense_reporting_enabled(const u16 *id)
 	if (!(id[ATA_ID_CFS_ENABLE_2] & (1 << 15)))
 		return false;
 	return id[ATA_ID_COMMAND_SET_4] & (1 << 6);
-}
-
-/**
- *
- * Word: 206 - SCT Command Transport
- *    15:12 - Vendor Specific
- *     11:6 - Reserved
- *        5 - SCT Command Transport Data Tables supported
- *        4 - SCT Command Transport Features Control supported
- *        3 - SCT Command Transport Error Recovery Control supported
- *        2 - SCT Command Transport Write Same supported
- *        1 - SCT Command Transport Long Sector Access supported
- *        0 - SCT Command Transport supported
- */
-static inline bool ata_id_sct_data_tables(const u16 *id)
-{
-	return id[ATA_ID_SCT_CMD_XPORT] & (1 << 5) ? true : false;
-}
-
-static inline bool ata_id_sct_features_ctrl(const u16 *id)
-{
-	return id[ATA_ID_SCT_CMD_XPORT] & (1 << 4) ? true : false;
-}
-
-static inline bool ata_id_sct_error_recovery_ctrl(const u16 *id)
-{
-	return id[ATA_ID_SCT_CMD_XPORT] & (1 << 3) ? true : false;
-}
-
-static inline bool ata_id_sct_write_same(const u16 *id)
-{
-	return id[ATA_ID_SCT_CMD_XPORT] & (1 << 2) ? true : false;
-}
-
-static inline bool ata_id_sct_long_sector_access(const u16 *id)
-{
-	return id[ATA_ID_SCT_CMD_XPORT] & (1 << 1) ? true : false;
-}
-
-static inline bool ata_id_sct_supported(const u16 *id)
-{
-	return id[ATA_ID_SCT_CMD_XPORT] & (1 << 0) ? true : false;
 }
 
 /**
@@ -1108,12 +1077,12 @@ static inline void ata_id_to_hd_driveid(u16 *id)
  * TO NV CACHE PINNED SET.
  */
 static inline unsigned ata_set_lba_range_entries(void *_buffer,
-		unsigned buf_size, u64 sector, unsigned long count)
+		unsigned num, u64 sector, unsigned long count)
 {
 	__le64 *buffer = _buffer;
 	unsigned i = 0, used_bytes;
 
-	while (i < buf_size / 8 ) { /* 6-byte LBA + 2-byte range per entry */
+	while (i < num) {
 		u64 entry = sector |
 			((u64)(count > 0xffff ? 0xffff : count) << 48);
 		buffer[i++] = __cpu_to_le64(entry);
@@ -1128,6 +1097,21 @@ static inline unsigned ata_set_lba_range_entries(void *_buffer,
 	return used_bytes;
 }
 
+/**
+ * _lba_to_cmd_ata() - Copy lba48 to ATA command
+ * @cmd: ATA command as an array of bytes
+ * @_lba: lba48 in the low 48 bits
+ */
+static inline void _lba_to_cmd_ata(u8 *cmd, u64 _lba)
+{
+	cmd[1] =  _lba	      & 0xff;
+	cmd[3] = (_lba >>  8) & 0xff;
+	cmd[5] = (_lba >> 16) & 0xff;
+	cmd[0] = (_lba >> 24) & 0xff;
+	cmd[2] = (_lba >> 32) & 0xff;
+	cmd[4] = (_lba >> 40) & 0xff;
+}
+
 static inline bool ata_ok(u8 status)
 {
 	return ((status & (ATA_BUSY | ATA_DRDY | ATA_DF | ATA_DRQ | ATA_ERR))
@@ -1137,13 +1121,13 @@ static inline bool ata_ok(u8 status)
 static inline bool lba_28_ok(u64 block, u32 n_block)
 {
 	/* check the ending block number: must be LESS THAN 0x0fffffff */
-	return ((block + n_block) < ((1 << 28) - 1)) && (n_block <= 256);
+	return ((block + n_block) < ((1 << 28) - 1)) && (n_block <= ATA_MAX_SECTORS);
 }
 
 static inline bool lba_48_ok(u64 block, u32 n_block)
 {
 	/* check the ending block number */
-	return ((block + n_block - 1) < ((u64)1 << 48)) && (n_block <= 65536);
+	return ((block + n_block - 1) < ((u64)1 << 48)) && (n_block <= ATA_MAX_SECTORS_LBA48);
 }
 
 #define sata_pmp_gscr_vendor(gscr)	((gscr)[SATA_PMP_GSCR_PROD_ID] & 0xffff)

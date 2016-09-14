@@ -2,10 +2,13 @@
  * Kernel Device Mapper for abstracting ZAC/ZBC devices as normal
  * block devices for linux file systems.
  *
- * Copyright (C) 2015 Seagate Technology PLC
+ * Copyright (C) 2015,2016 Seagate Technology PLC
  *
  * Written by:
  * Shaun Tancheff <shaun.tancheff@seagate.com>
+ * 
+ * Bio queue support and metadata relocation by:
+ * Vineet Agarwal <vineet.agarwal@seagate.com>
  *
  * This file is licensed under  the terms of the GNU General Public
  * License version 2. This program is licensed "as is" without any
@@ -16,10 +19,17 @@
 #define _DM_ZONED_H
 
 #define ALLOC_DEBUG		0
+#define ADBG_ENTRIES		65536
+
+#define ENABLE_BIO_QUEUE	1
+#define ENABLE_SEC_METADATA	1
+
+#define WB_DELAY_MS		1
+
 #define USE_KTHREAD		0
 #define KFIFO_SIZE		(1 << 14)
 
-#define NORMAL			0
+#define NORMAL			GFP_KERNEL
 #define CRIT			GFP_NOIO
 
 #define DM_MSG_PREFIX		"zdm"
@@ -59,6 +69,7 @@
 #define Z_AQ_META_STREAM	(Z_AQ_META | Z_AQ_STREAM_ID | 0xFE)
 
 #define Z_C4K			(4096ul)
+#define Z_SHFT_SEC		(9)
 #define Z_UNSORTED		(Z_C4K / sizeof(struct map_cache_entry))
 #define Z_MAP_MAX		(Z_UNSORTED - 1)
 #define Z_BLOCKS_PER_DM_SECTOR	(Z_C4K/512)
@@ -119,6 +130,10 @@
 #define FWD_KEY_BLOCKS		8
 #define FWD_KEY_BASE		(WP_ZF_BASE + (MAX_WP_BLKS * 2))
 
+#define MC_POOL_SZ		(4 * 4096u)
+#define MC_HIGH_WM		4096
+#define MC_MOVE_SZ		512
+
 #define WB_JRNL_MIN		4096u
 #define WB_JRNL_MAX		WB_JRNL_MIN /* 16384u */
 #define WB_JRNL_BLKS		(WB_JRNL_MAX >> 10)
@@ -143,10 +158,21 @@ struct z_io_req_t {
 	int result;
 };
 
-#define Z_LOWER48 (~0ul >> 16)
-#define Z_UPPER16 (~Z_LOWER48)
+#define MAX_EXTENT_ORDER	17
 
-#define STREAM_SIZE	256
+#define LBA48_BITS		45
+#define LBA48_XBITS		(64 - LBA48_BITS)
+#if LBA48_XBITS > MAX_EXTENT_ORDER
+    #define EXTENT_CEILING	(1 << MAX_EXTENT_ORDER)
+#else
+    #define EXTENT_CEILING	(1 << LBA48_XBITS)
+#endif
+#define LBA48_CEILING		(1 << LBA48_BITS)
+
+#define Z_LOWER48		(~0ul >> LBA48_XBITS)
+#define Z_UPPER16		(~Z_LOWER48 >> LBA48_BITS)
+
+#define STREAM_SIZE		256
 
 /* -------------------------------------------------------------------------- */
 /* -------------------------------------------------------------------------- */
@@ -176,39 +202,45 @@ struct z_io_req_t {
  *
  */
 enum pg_flag_enum {
-	IS_DIRTY,
-	IS_STALE,
-	IS_FLUSH,
+	IS_DIRTY,         /*     1  */
+	IS_STALE,         /*     2  */
+	IS_FLUSH,         /*     4  */
 
-	IS_FWD,
-	IS_REV,
-	IS_CRC,
-	IS_LUT,
+	IS_FWD,           /*     8  */
+	IS_REV,           /*    10  */
+	IS_CRC,           /*    20  */
+	IS_LUT,           /*    40  */
 
-	WB_JRNL_1,
-	WB_JRNL_2,
-	WB_DIRECT,
-	WB_RE_CACHE,
-	IN_WB_JOURNAL,
+	WB_JRNL_1,        /*    80  */
+	WB_JRNL_2,        /*   100  */
+	WB_DIRECT,        /*   200  */
+	WB_RE_CACHE,      /*   400  */
+	IN_WB_JOURNAL,    /*   800  */
 
-	R_IN_FLIGHT,
-	W_IN_FLIGHT,
-	DELAY_ADD,
-	STICKY,
-	IS_READA,
-	IS_DROPPED,
-	IS_LAZY,
-	IN_ZLT,
+	R_IN_FLIGHT,      /*   1000 */
+	R_CRC_PENDING,    /*   2000 */
+	W_IN_FLIGHT,      /*   4000 */
+	DELAY_ADD,        /*   8000 */
+	STICKY,           /*  10000 */
+	IS_READA,         /*  20000 */
+	IS_DROPPED,       /*  40000 */
+	IS_LAZY,          /*  80000 */
+	IN_ZLT,           /* 100000 */
+	IS_ALLOC,         /* 200000 */
+	R_SCHED,          /* 400000 */
 };
 
 /**
  * enum gc_flags_enum - Garbage Collection [GC] states.
  */
 enum gc_flags_enum {
-	DO_GC_NEW,
-	DO_GC_PREPARE,		/* -> READ or COMPLETE state */
-	DO_GC_WRITE,
-	DO_GC_META,		/* -> PREPARE state */
+	DO_GC_INIT,		/* -> GC_MD_MAP                          */
+	DO_GC_MD_MAP,		/* -> GC_MD_MAP   | GC_READ    | GC_DONE */
+	DO_GC_READ,		/* -> GC_WRITE    | GC_MD_SYNC           */
+	DO_GC_WRITE,		/* -> GC_CONTINUE                        */
+	DO_GC_CONTINUE,		/* -> GC_READ     | GC_MD_SYNC           */
+	DO_GC_MD_SYNC,		/* -> GC_DONE                            */
+	DO_GC_DONE,
 	DO_GC_COMPLETE,
 };
 
@@ -241,32 +273,6 @@ enum znd_flags_enum {
 struct zdm;
 
 /**
- * struct gc_state - A page of map table
- * @znd: ZDM Instance
- * @gc_flags: See gc_flags_enum
- * @r_ptr: Next read in zone.
- * @w_ptr: Next write in target zone.
- * @nblks: Number of blocks in I/O
- * @result: GC operation result.
- * @z_gc: Zone undergoing compacation
- * @tag: System wide serial number (debugging).
- *
- * Longer description of this structure.
- */
-struct gc_state {
-	struct zdm *znd;
-	unsigned long gc_flags;
-
-	u32 r_ptr;
-	u32 w_ptr;
-
-	u32 nblks;		/* 1-65536 */
-	u32 z_gc;
-
-	int result;
-};
-
-/**
  * struct map_addr - A page of map table
  * @dm_s:    full map on dm layer
  * @zone_id: z_id match zone_list_t.z_id
@@ -297,7 +303,21 @@ struct map_cache_entry {
 	__le64 bval;	/* csum 16 [16 bits] + 'physical' block lba */
 } __packed;
 
-struct map_cache_data {
+
+#define MCE_NO_ENTRY	0x4000
+#define MCE_NO_MERGE	0x8000
+
+/*
+ * 2 copies for ingress, 2 copies for discard(unused)
+ */
+struct map_cache_pool {
+	struct map_cache_entry header;
+	struct map_cache_entry maps[MC_POOL_SZ];
+} __packed;
+
+/* 1 temporary buffer for each for overlay/split/mergeback
+ */
+struct map_cache_page {
 	struct map_cache_entry header;
 	struct map_cache_entry maps[Z_MAP_MAX];
 } __packed;
@@ -319,20 +339,19 @@ struct jrnl_map_cache_data {
  * @IS_DISCARD: Is a discard pool.
  */
 enum map_type_enum {
-	IS_MAP,
-	IS_DISCARD,
-	MAP_COUNT,
-	IS_JRNL_PG,
+	IS_JRNL_PG = 1,
 	IS_POST_MAP,
+
+	IS_WBJRNL,
+	IS_INGRESS,
+	IS_TRIM,
+	IS_UNUSED,
 };
 
 /**
- * struct map_cache - A page of map table
- * @mclist:
- * @jdata: 4k page of data
- * @refcount:
+ * struct map_cache - An array of mappings (deprecating)
+ * @mcd: map_cache_entry array
  * @cached_lock:
- * @busy_locked:
  * @jcount:
  * @jsorted:
  * @jsize:
@@ -341,15 +360,20 @@ enum map_type_enum {
  * Longer description of this structure.
  */
 struct map_cache {
-	struct list_head mclist;
 	void *mcd;
-	atomic_t refcount;
-	atomic_t busy_locked;
-	struct mutex cached_lock;
+	spinlock_t cached_lock;
 	int jcount;
 	int jsorted;
 	int jsize;
 	int map_content;
+};
+
+struct map_pool {
+	struct map_cache_pool mcd;
+	int count;
+	int sorted;
+	int size;
+	int isa;
 };
 
 /**
@@ -389,12 +413,20 @@ struct map_pg {
 	u64 lba;
 	u64 last_write;
 	struct hlist_node hentry;
-	struct mutex md_lock;
+
+	spinlock_t md_lock;
+
 	unsigned long flags;
 	struct list_head zltlst;
 
 	/* in flight/cache hit tracking */
 	struct list_head lazy;
+
+	/* for async io */
+	struct completion event;
+	int io_error;
+	u64 lba48_in;
+
 	struct zdm *znd;
 	struct map_pg *crc_pg;
 	int hotness;
@@ -415,6 +447,36 @@ struct map_crc {
 	u64 lba;
 	int pg_no;
 	int pg_idx;
+};
+
+/**
+ * struct gc_state - A page of map table
+ * @znd: ZDM Instance
+ * @pgs: map pages held during GC.
+ * @gc_flags: See gc_flags_enum
+ * @r_ptr: Next read in zone.
+ * @w_ptr: Next write in target zone.
+ * @nblks: Number of blocks in I/O
+ * @result: GC operation result.
+ * @z_gc: Zone undergoing compacation
+ * @tag: System wide serial number (debugging).
+ *
+ * Longer description of this structure.
+ */
+struct gc_state {
+	struct zdm *znd;
+	struct completion gc_complete;
+	unsigned long gc_flags;
+	atomic_t refcount;
+
+	u32 r_ptr;
+	u32 w_ptr;
+
+	u32 nblks;		/* 1-65536 */
+	u32 z_gc;
+
+	int is_cpick;
+	int result;
 };
 
 /**
@@ -541,7 +603,8 @@ struct mz_superkey {
 	__le16 zf_crc[64];
 	__le16 discards;
 	__le16 maps;
-	u8 reserved[1896];
+	__le16 unused;
+	u8 reserved[1894];
 	__le32 wb_blocks;
 	__le32 wb_next;
 	__le32 wb_crc32;
@@ -576,6 +639,37 @@ struct stale_tracking {
 	int bins[STREAM_SIZE];
 };
 
+#if ENABLE_BIO_QUEUE
+
+/*
+ * struct zdm_io_q - Queueing and ordering the BIO.
+ */
+struct zdm_q_node {
+	struct bio *bio;
+	struct list_head jlist;
+	struct list_head llist;
+	sector_t bi_sector;
+	unsigned long jiffies;
+//	unsigned long reserved;
+};
+
+struct zdm_bio_chain {
+	struct zdm *znd;
+	struct bio *bio[BIO_MAX_PAGES];
+	atomic_t num_bios; /*Zero based counter & used as idx to bio[]*/
+//	int reserved;
+};
+
+#endif /* ENABLE_BIO_QUEUE */
+
+#if ENABLE_SEC_METADATA
+enum meta_dst_flags {
+	DST_TO_PRI_DEVICE,
+	DST_TO_SEC_DEVICE,
+	DST_TO_BOTH_DEVICE,
+};
+#endif
+
 /*
  *
  * Partition -----------------------------------------------------------------+
@@ -593,6 +687,9 @@ struct stale_tracking {
  * struct zdm - A page of map table
  * @ti:		dm_target entry
  * @dev:	dm_dev entry
+ * @meta_dev:	device for keeping secondary metadata
+ * @sec_zone_align: Sectors required to align data start to zone boundary
+ * @meta_dst_flag:	See: enum meta_dst_flags
  * @mclist:	list of pages of in-memory LBA mappings.
  * @mclck:	in memory map-cache lock (spinlock)
 
@@ -617,6 +714,7 @@ struct stale_tracking {
  * @data_lba:	LBA at start of data pool
  * @zdstart:	ZONE # at start of data pool (first Possible WP ZONE)
  * @start_sect:	where ZDM partition starts (RAW LBA)
+ * @sec_dev_start_sect: secondary device partition starts. (RAW LBA)
  * @flags:	See: enum znd_flags_enum
  * @gc_backlog:
  * @gc_io_buf:
@@ -647,10 +745,14 @@ struct zdm {
 	struct dm_target *ti;
 	struct dm_dev *dev;
 
+#if ENABLE_SEC_METADATA
+	struct dm_dev *meta_dev;
+	u64 sec_zone_align;
+	u8 meta_dst_flag;
+#endif
+
 	struct list_head zltpool;
 	struct list_head lzy_pool;
-	struct list_head mclist[MAP_COUNT];
-	spinlock_t       mclck[MAP_COUNT];
 
 	struct work_struct bg_work;
 	struct workqueue_struct *bg_wq;
@@ -666,11 +768,46 @@ struct zdm {
 	struct mutex mz_io_mutex;
 	struct mutex vcio_lock;
 
+	/* Primary ingress cache */
+	struct map_pool *ingress;
+	struct map_pool in[2];  /* active and update */
+	spinlock_t in_rwlck;
+
+	/* unused blocks cache */
+	struct map_pool *unused;
+	struct map_pool _use[2]; /* active and update */
+	struct map_cache_page unused_pg;
+	spinlock_t unused_rwlck;
+
+	struct map_pool *trim;
+	struct map_pool trim_mp[2]; /* active and update */
+	struct map_cache_page trim_pg;
+	spinlock_t trim_rwlck;
+
+	struct map_pool *wbjrnl;
+	struct map_pool _wbj[2]; /* active and update */
+	struct map_cache_page wbjrnl_pg;
+	spinlock_t wbjrnl_rwlck;
+
+	mempool_t *mempool_pages;
+	mempool_t *mempool_maps;
+	mempool_t *mempool_wset;
+
 #if USE_KTHREAD /* experimental++ */
 	struct task_struct *bio_kthread;
 	DECLARE_KFIFO_PTR(bio_fifo, struct bio *);
 	wait_queue_head_t wait_bio;
 	wait_queue_head_t wait_fifo;
+#elif ENABLE_BIO_QUEUE
+	struct task_struct *bio_kthread;
+	struct list_head bio_srt_jif_lst_head;
+	struct list_head bio_srt_lba_lst_head;
+	spinlock_t zdm_bio_q_lck;
+
+	mempool_t *bp_q_node;
+	mempool_t *bp_chain_vec;
+	atomic_t enqueued;
+	wait_queue_head_t wait_bio;
 #endif
 	struct bio_set *bio_set;
 
@@ -681,6 +818,10 @@ struct zdm {
 
 	u64 nr_blocks;
 	u64 start_sect;
+#if ENABLE_SEC_METADATA
+	u64 sec_dev_start_sect;
+#endif
+	u64 htlba;
 
 	u64 md_start;
 	u64 md_end;
@@ -748,11 +889,18 @@ struct zdm {
 	struct workqueue_struct *io_wq;
 	struct workqueue_struct *zone_action_wq;
 	struct timer_list timer;
-	int last_op;
+	bool last_op_is_flush;
 
 	u32 bins[40];
+	u32 max_bins[40];
 	char bdev_name[BDEVNAME_SIZE];
+	char bdev_metaname[BDEVNAME_SIZE];
 	char proc_name[BDEVNAME_SIZE+4];
+	char meta_wq_name[BDEVNAME_SIZE+16];
+	char gc_wq_name[BDEVNAME_SIZE+16];
+	char bg_wq_name[BDEVNAME_SIZE+16];
+	char io_wq_name[BDEVNAME_SIZE+16];
+	char za_wq_name[BDEVNAME_SIZE+16];
 	struct proc_dir_entry *proc_fs;
 	loff_t wp_proc_at;
 	loff_t used_proc_at;
@@ -773,9 +921,8 @@ struct zdm {
 	unsigned issue_open_zone:1;
 	unsigned issue_close_zone:1;
 	unsigned is_empty:1;
-	unsigned trim:1;
-	unsigned raid5_trim:1;
-
+	unsigned enable_trim:1;
+	unsigned bio_queue:1;
 };
 
 /**

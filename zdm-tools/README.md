@@ -58,7 +58,7 @@ or
 ```
  
 Building:
-  - Normal kernel build with CONFIG_DM_ZONED and CONFIG_BLK_ZONED_CTRL enabled.
+  - Normal kernel build with CONFIG_DM_ZDM enabled.
 
 Architecture:
 

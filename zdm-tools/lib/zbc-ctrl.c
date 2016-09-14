@@ -89,17 +89,17 @@ static const char * same_text[] = {
 
 
 static unsigned char r_opts[] = {
-	ZOPT_NON_SEQ_AND_RESET,
-	ZOPT_ZC1_EMPTY,
-	ZOPT_ZC2_OPEN_IMPLICIT,
-	ZOPT_ZC3_OPEN_EXPLICIT,
-	ZOPT_ZC4_CLOSED,
-	ZOPT_ZC5_FULL,
-	ZOPT_ZC6_READ_ONLY,
-	ZOPT_ZC7_OFFLINE,
-	ZOPT_RESET,
-	ZOPT_NON_SEQ,
-	ZOPT_NON_WP_ZONES,
+	ZBC_ZONE_REPORTING_OPTION_ALL,
+	ZBC_ZONE_REPORTING_OPTION_EMPTY,
+	ZBC_ZONE_REPORTING_OPTION_IMPLICIT_OPEN,
+	ZBC_ZONE_REPORTING_OPTION_EXPLICIT_OPEN,
+	ZBC_ZONE_REPORTING_OPTION_CLOSED,
+	ZBC_ZONE_REPORTING_OPTION_FULL,
+	ZBC_ZONE_REPORTING_OPTION_READONLY,
+	ZBC_ZONE_REPORTING_OPTION_OFFLINE,
+	ZBC_ZONE_REPORTING_OPTION_NEED_RESET_WP,
+	ZBC_ZONE_REPORTING_OPTION_NON_SEQWRITE,
+	ZBC_ZONE_REPORTING_OPTION_NON_WP,
 };
 
 
@@ -122,7 +122,7 @@ int zdm_is_ha_device(uint32_t flags, int verbose)
 		default:
 			break;
 	}
-	
+
 	if (verbose) {
 		printf("HostAware:%d, SMR:%d\n", is_ha, is_smr );
 	}
@@ -232,16 +232,27 @@ uint32_t zdm_device_inquiry(int fd, int do_ata)
 
 int zdm_zone_command(int fd, int command, uint64_t lba, int do_ata)
 {
+	struct bdev_zone_action za;
 	uint64_t iolba = lba;
 	int rc;
 
-	if (do_ata) {
-		iolba |= 1;
-	} else {
-		iolba &= ~1ul;
+
+	za.zone_locator_lba = iolba;
+	za.all_zones = 0;
+	if (iolba == ~0ul) {
+		za.zone_locator_lba = 0;
+		za.all_zones = 1;
 	}
 
-	rc = ioctl(fd, command, iolba);
+	if (do_ata)
+		za.zone_locator_lba |= 1;
+	else
+		za.zone_locator_lba &= ~1ul;
+
+	za.action = command;
+	za.force_unit_access = 1;
+
+	rc = ioctl(fd, BLKZONEACTION, &za);
 	if (rc == -1) {
 		fprintf(stderr, "ERR: %d -> %s\n\n", errno, strerror(errno));
 	}
@@ -251,23 +262,22 @@ int zdm_zone_command(int fd, int command, uint64_t lba, int do_ata)
 
 int zdm_zone_close(int fd, uint64_t lba, int do_ata)
 {
-	return zdm_zone_command(fd, BLKCLOSEZONE, lba, do_ata);
+	return zdm_zone_command(fd, ZONE_ACTION_CLOSE, lba, do_ata);
 }
 
 int zdm_zone_finish(int fd, uint64_t lba, int do_ata)
 {
-	fprintf(stderr, "zdm_zone_finish: Not Implemented!!\n"); 
-	return zdm_zone_command(fd, BLKCLOSEZONE, lba, do_ata);
+	return zdm_zone_command(fd, ZONE_ACTION_FINISH, lba, do_ata);
 }
 
 int zdm_zone_open(int fd, uint64_t lba, int do_ata)
 {
-	return zdm_zone_command(fd, BLKOPENZONE, lba, do_ata);
+	return zdm_zone_command(fd, ZONE_ACTION_OPEN, lba, do_ata);
 }
 
 int zdm_zone_reset_wp(int fd, uint64_t lba, int do_ata)
 {
-	return zdm_zone_command(fd, BLKRESETZONE, lba, do_ata);
+	return zdm_zone_command(fd, ZONE_ACTION_RESET, lba, do_ata);
 }
 
 
@@ -327,17 +337,17 @@ void print_zones(struct bdev_zone_report *info, uint32_t size)
 
 int zdm_is_big_endian_report(struct bdev_zone_report *info)
 {
-	int is_big = 0;
+	int is_big = 1;
 	struct bdev_zone_descriptor * entry = &info->descriptors[0];
 	u64 be_len;
-	be_len = be64toh(entry->length);
-	if ( be_len == 0x080000 ||
-             be_len == 0x100000 ||
-             be_len == 0x200000 ||
-             be_len == 0x300000 ||
-             be_len == 0x400000 ||
-             be_len == 0x800000 ) {
-		is_big = 1;
+
+	be_len = entry->length;
+	if (be_len == 0x080000 ||
+	    be_len == 0x100000 ||
+	    be_len == 0x200000 ||
+	    be_len == 0x400000 ||
+	    be_len == 0x800000) {
+		is_big = 0;
 	}
 	return is_big;
 }

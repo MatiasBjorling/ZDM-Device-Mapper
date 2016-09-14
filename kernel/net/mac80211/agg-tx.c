@@ -194,17 +194,21 @@ static void
 ieee80211_agg_stop_txq(struct sta_info *sta, int tid)
 {
 	struct ieee80211_txq *txq = sta->sta.txq[tid];
+	struct ieee80211_sub_if_data *sdata;
+	struct fq *fq;
 	struct txq_info *txqi;
 
 	if (!txq)
 		return;
 
 	txqi = to_txq_info(txq);
+	sdata = vif_to_sdata(txq->vif);
+	fq = &sdata->local->fq;
 
 	/* Lock here to protect against further seqno updates on dequeue */
-	spin_lock_bh(&txqi->queue.lock);
+	spin_lock_bh(&fq->lock);
 	set_bit(IEEE80211_TXQ_STOP, &txqi->flags);
-	spin_unlock_bh(&txqi->queue.lock);
+	spin_unlock_bh(&fq->lock);
 }
 
 static void
@@ -935,6 +939,7 @@ void ieee80211_process_addba_resp(struct ieee80211_local *local,
 				  size_t len)
 {
 	struct tid_ampdu_tx *tid_tx;
+	struct ieee80211_txq *txq;
 	u16 capab, tid;
 	u8 buf_size;
 	bool amsdu;
@@ -944,6 +949,10 @@ void ieee80211_process_addba_resp(struct ieee80211_local *local,
 	tid = (capab & IEEE80211_ADDBA_PARAM_TID_MASK) >> 2;
 	buf_size = (capab & IEEE80211_ADDBA_PARAM_BUF_SIZE_MASK) >> 6;
 	buf_size = min(buf_size, local->hw.max_tx_aggregation_subframes);
+
+	txq = sta->sta.txq[tid];
+	if (!amsdu && txq)
+		set_bit(IEEE80211_TXQ_NO_AMSDU, &to_txq_info(txq)->flags);
 
 	mutex_lock(&sta->ampdu_mlme.mtx);
 

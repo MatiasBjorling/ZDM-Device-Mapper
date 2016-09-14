@@ -1,0 +1,337 @@
+From 81773c28bcaa10e97b3df2c69141a019fada4a95 Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Wed, 14 Sep 2016 15:18:04 -0500
+Subject: [PATCH 7/7] Seagate Internal: Default to ata_passthrough.
+
+Lots of old HBAs in test systems need to use ZAC because ZBC support
+is not available via the HBA's firmware SAT.
+
+Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
+---
+ block/blk-lib.c            | 13 ++++++++
+ drivers/md/dm-zdm.c        | 14 +++++----
+ drivers/md/dm-zdm.h        |  2 ++
+ drivers/scsi/sd.c          | 74 ++++++++++++++++++++++++++++++++++++++--------
+ include/linux/ata.h        | 15 ++++++++++
+ include/scsi/scsi_device.h |  1 +
+ 6 files changed, 102 insertions(+), 17 deletions(-)
+
+diff --git a/block/blk-lib.c b/block/blk-lib.c
+index 19f0c4d..c019863 100644
+--- a/block/blk-lib.c
++++ b/block/blk-lib.c
+@@ -291,6 +291,7 @@ static void fixup_zone_report(struct block_device *bdev,
+ 		for (iter = 0; iter < offmax; iter++) {
+ 			bzde = &rpt->descriptors[iter];
+ 
++#if 0 /* for external */
+ 			if (be64_to_cpu(bzde->length) == 0)
+ 				break;
+ 
+@@ -301,6 +302,18 @@ static void fixup_zone_report(struct block_device *bdev,
+ 			tmp = be64_to_cpu(bzde->lba_wptr) << lborder;
+ 			tmp -= offset;
+ 			bzde->lba_wptr  = cpu_to_be64(tmp);
++#else  /* ata passthrough forced on hack */
++			if (le64_to_cpu(bzde->length) == 0)
++				break;
++
++			tmp = le64_to_cpu(bzde->lba_start) << lborder;
++			tmp -= offset;
++			bzde->lba_start = cpu_to_le64(tmp);
++
++			tmp = le64_to_cpu(bzde->lba_wptr) << lborder;
++			tmp -= offset;
++			bzde->lba_wptr  = cpu_to_le64(tmp);
++#endif
+ 		}
+ 	}
+ }
+diff --git a/drivers/md/dm-zdm.c b/drivers/md/dm-zdm.c
+index f194398..11adde8 100644
+--- a/drivers/md/dm-zdm.c
++++ b/drivers/md/dm-zdm.c
+@@ -282,7 +282,7 @@ static void za_endio(struct bio *bio)
+ 	case REQ_OP_ZONE_FINISH:
+ 		/* find the zone and set the wp to len on it */
+ 		break;
+-	
++
+ 	case REQ_OP_ZONE_OPEN:
+ 	case REQ_OP_ZONE_CLOSE:
+ 		break;
+@@ -365,6 +365,8 @@ static int dmz_zone_action(struct zdm *znd, u64 z_id, unsigned int op,
+ 	if (!znd->bdev_is_zoned)
+ 		return wp_err;
+ 
++	if (znd->ata_passthrough)
++		za.op_f |= REQ_META;
+ 	/*
+ 	 * Issue the synchronous I/O from a different thread
+ 	 * to avoid generic_make_request recursion.
+@@ -408,7 +410,7 @@ static int dmz_reset_wp(struct zdm *znd, u64 z_id)
+ static int dmz_open_zone(struct zdm *znd, u64 z_id)
+ {
+ /* FIXME: Just alloc and submit a bio here */
+-	
++
+ 	if (!znd->issue_open_zone)
+ 		return 0;
+ 	return dmz_zone_action(znd, z_id, REQ_OP_ZONE_OPEN, 0, 0);
+@@ -464,6 +466,8 @@ static int dmz_report_zones(struct zdm *znd, u64 z_id,
+ 			s_addr -= znd->start_sect << Z_SHFT4K;
+ 
+ #endif
++		if (znd->ata_passthrough)
++			op_f = REQ_META;
+ 
+ 		wp_err = blkdev_issue_zone_report(bdev, op_f, s_addr, opt,
+ 						  pgs, bufsz, GFP_KERNEL);
+@@ -1055,6 +1059,7 @@ static int zoned_ctr(struct dm_target *ti, unsigned int argc, char **argv)
+ 		znd->bdev_is_zoned = 1;
+ 	if (zbc_probe)
+ 		znd->bdev_is_zoned = 1;
++	znd->ata_passthrough = 1;
+ 
+ 	r = zoned_init_disk(ti, znd, create, force);
+ 	if (r) {
+@@ -1493,7 +1498,7 @@ static void _common_endio(struct zdm *znd, struct bio *bio)
+ 		if (bio->bi_bdev == bdev->bd_contains &&
+ 		    bio_op(bio) == REQ_OP_WRITE &&
+ 		    lba > znd->sec_dev_start_sect) {
+-			
++
+ 			lba = lba - znd->sec_dev_start_sect
+ 				 - (znd->sec_zone_align >> Z_SHFT4K);
+ 			if (lba > 0)
+@@ -2134,8 +2139,7 @@ static int zm_read_bios(struct zdm *znd, struct bio *bio, u64 s_zdm)
+ 	do {
+ 		count = blks = dm_div_up(bio->bi_iter.bi_size, Z_C4K);
+ 		ua_off = bio->bi_iter.bi_sector & 0x0007;
+-		ua_size = bio->bi_iter.bi_size & 0x0FFF;	/* in bytes */
+-
++		ua_size = bio->bi_iter.bi_size & 0x0FFF;
+ 		blba = current_map_range(znd, s_zdm, &count, gfp);
+ 		s_zdm += count;
+ 		sectors = (count << Z_SHFT4K);
+diff --git a/drivers/md/dm-zdm.h b/drivers/md/dm-zdm.h
+index a8d1f34..a89278b 100644
+--- a/drivers/md/dm-zdm.h
++++ b/drivers/md/dm-zdm.h
+@@ -736,6 +736,7 @@ enum meta_dst_flags {
+  * @suspended:
+  * @gc_mz_pref:
+  * @mz_provision:	Number of zones per 1024 of over-provisioning.
++ * @ata_passthrough:
+  * @is_empty:		For fast discards on initial format
+  *
+  * Longer description of this structure.
+@@ -916,6 +917,7 @@ struct zdm {
+ 	u32 filled_zone;
+ 	u16 mz_provision;
+ 	unsigned bdev_is_zoned:1;
++	unsigned ata_passthrough:1;
+ 	unsigned issue_open_zone:1;
+ 	unsigned issue_close_zone:1;
+ 	unsigned is_empty:1;
+diff --git a/drivers/scsi/sd.c b/drivers/scsi/sd.c
+index decd620..8e5ea5f 100644
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -52,6 +52,7 @@
+ #include <linux/slab.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/pr.h>
++#include <linux/ata.h>
+ #include <asm/uaccess.h>
+ #include <asm/unaligned.h>
+ 
+@@ -123,6 +124,10 @@ static void sd_print_result(const struct scsi_disk *, const char *, int);
+ static DEFINE_SPINLOCK(sd_index_lock);
+ static DEFINE_IDA(sd_index_ida);
+ 
++static int zbc_use_ata16 = 1;
++module_param_named(zbc_use_ata16, zbc_use_ata16, int, S_IRUGO | S_IWUSR);
++MODULE_PARM_DESC(zbc_use_ata16, "Some controllers / drivers break on ZBC");
++
+ /* This semaphore is used to mediate the 0->1 reference get in the
+  * face of object destruction (i.e. we can't allow a get on an
+  * object after last put) */
+@@ -1153,9 +1158,9 @@ static int sd_setup_zone_report_cmnd(struct scsi_cmnd *cmd)
+ 	struct scsi_disk *sdkp = scsi_disk(rq->rq_disk);
+ 	struct bio *bio = rq->bio;
+ 	sector_t sector = blk_rq_pos(rq);
+-	struct gendisk *disk = rq->rq_disk;
+ 	unsigned int nr_bytes = blk_rq_bytes(rq);
+ 	int ret = BLKPREP_KILL;
++	u8 rpt_opt = ZBC_ZONE_REPORTING_OPTION_ALL;
+ 
+ 	WARN_ON(nr_bytes == 0);
+ 
+@@ -1166,18 +1171,26 @@ static int sd_setup_zone_report_cmnd(struct scsi_cmnd *cmd)
+ 	if (sdkp->zoned != 1 && sdkp->device->type != TYPE_ZBC) {
+ 		void *src;
+ 		struct bdev_zone_report *conv;
++		__be64 blksz = cpu_to_be64(sdkp->capacity);
+ 
+-		if (nr_bytes < sizeof(struct bdev_zone_report))
++		if (nr_bytes < 512)
+ 			goto out;
+ 
+ 		src = kmap_atomic(bio->bi_io_vec->bv_page);
+ 		conv = src + bio->bi_io_vec->bv_offset;
+ 		conv->descriptor_count = cpu_to_be32(1);
+ 		conv->same_field = BLK_ZONE_SAME_ALL;
+-		conv->maximum_lba = cpu_to_be64(disk->part0.nr_sects);
++		conv->maximum_lba = blksz;
++		conv->descriptors[0].type = BLK_ZONE_TYPE_CONVENTIONAL;
++		conv->descriptors[0].flags = BLK_ZONE_NO_WP << 4;
++		conv->descriptors[0].length = blksz;
++		conv->descriptors[0].lba_start = 0;
++		conv->descriptors[0].lba_wptr = blksz;
+ 		kunmap_atomic(src);
+ 		goto out;
+ 	}
++	/* FUTURE ... when streamid is available */
++	/* rpt_opt = bio_get_streamid(bio); */
+ 
+ 	ret = scsi_init_io(cmd);
+ 	if (ret != BLKPREP_OK)
+@@ -1192,13 +1205,26 @@ static int sd_setup_zone_report_cmnd(struct scsi_cmnd *cmd)
+ 
+ 	cmd->cmd_len = 16;
+ 	memset(cmd->cmnd, 0, cmd->cmd_len);
+-	cmd->cmnd[0] = ZBC_IN;
+-	cmd->cmnd[1] = ZI_REPORT_ZONES;
+-	put_unaligned_be64(sector, &cmd->cmnd[2]);
+-	put_unaligned_be32(nr_bytes, &cmd->cmnd[10]);
+-	/* FUTURE ... when streamid is available */
+-	/* cmd->cmnd[14] = bio_get_streamid(bio); */
+-
++	if (sdp->use_ata16_for_zbc) {
++		cmd->cmnd[0] = ATA_16;
++		cmd->cmnd[1] = (0x6 << 1) | 1;
++		cmd->cmnd[2] = 0x0e;
++		cmd->cmnd[3] = rpt_opt;
++		cmd->cmnd[4] = ATA_SUBCMD_ZAC_MGMT_IN_REPORT_ZONES;
++		cmd->cmnd[5] = ((nr_bytes / 512) >> 8) & 0xff;
++		cmd->cmnd[6] = (nr_bytes / 512) & 0xff;
++
++		_lba_to_cmd_ata(&cmd->cmnd[7], sector);
++
++		cmd->cmnd[13] = 1 << 6;
++		cmd->cmnd[14] = ATA_CMD_ZAC_MGMT_IN;
++	} else {
++		cmd->cmnd[0] = ZBC_IN;
++		cmd->cmnd[1] = ZI_REPORT_ZONES;
++		put_unaligned_be64(sector, &cmd->cmnd[2]);
++		put_unaligned_be32(nr_bytes, &cmd->cmnd[10]);
++		cmd->cmnd[14] = rpt_opt;
++	}
+ 	cmd->sc_data_direction = DMA_FROM_DEVICE;
+ 	cmd->sdb.length = nr_bytes;
+ 	cmd->transfersize = sdp->sector_size;
+@@ -1220,6 +1246,9 @@ static int sd_setup_zone_action_cmnd(struct scsi_cmnd *cmd)
+ 	if (sdkp->zoned != 1 && sdkp->device->type != TYPE_ZBC)
+ 		goto out;
+ 
++	rq->timeout = SD_TIMEOUT;
++	rq->completion_data = NULL;
++
+ 	if (sector == ~0ul) {
+ 		allbit = 1;
+ 		sector = 0;
+@@ -1247,7 +1276,18 @@ static int sd_setup_zone_action_cmnd(struct scsi_cmnd *cmd)
+ 	}
+ 	cmd->cmnd[14] = allbit;
+ 	put_unaligned_be64(sector, &cmd->cmnd[2]);
+-
++	if (sdkp->device->use_ata16_for_zbc) {
++		cmd->cmnd[4] = cmd->cmnd[1];
++		cmd->cmnd[0] = ATA_16;
++		cmd->cmnd[1] = (3 << 1) | 1;
++		cmd->cmnd[2] = 0;
++		cmd->cmnd[3] = allbit;
++		cmd->cmnd[5] = 0;
++		cmd->cmnd[6] = 0;
++		_lba_to_cmd_ata(&cmd->cmnd[7], sector);
++		cmd->cmnd[13] = 1 << 6;
++		cmd->cmnd[14] = ATA_CMD_ZAC_MGMT_OUT;
++	}
+ 	cmd->transfersize = 0;
+ 	cmd->underflow = 0;
+ 	cmd->allowed = SD_MAX_RETRIES;
+@@ -2886,7 +2926,7 @@ static void sd_read_block_characteristics(struct scsi_disk *sdkp)
+ {
+ 	unsigned char *buffer;
+ 	u16 rot;
+-	const int vpd_len = 64;
++	const int vpd_len = 512; /* this will bork a certain aac HBA */
+ 
+ 	buffer = kmalloc(vpd_len, GFP_KERNEL);
+ 
+@@ -2903,6 +2943,15 @@ static void sd_read_block_characteristics(struct scsi_disk *sdkp)
+ 	}
+ 
+ 	sdkp->zoned = (buffer[8] >> 4) & 3;
++	if (sdkp->zoned != 1) {
++		struct scsi_device *sdev = sdkp->device;
++
++		if (!scsi_get_vpd_page(sdev, 0x89, buffer, SD_BUF_SIZE)) {
++			sdkp->zoned = ata_id_zoned_cap((u16 *)&buffer[60]);
++			if (sdkp->zoned == 1)
++				sdev->use_ata16_for_zbc = 1;
++		}
++	}
+ 
+  out:
+ 	kfree(buffer);
+@@ -3150,6 +3199,7 @@ static void sd_probe_async(void *data, async_cookie_t cookie)
+ 	gd->queue = sdkp->device->request_queue;
+ 
+ 	/* defaults, until the device tells us otherwise */
++	sdp->use_ata16_for_zbc = zbc_use_ata16;
+ 	sdp->sector_size = 512;
+ 	sdkp->capacity = 0;
+ 	sdkp->media_present = 1;
+diff --git a/include/linux/ata.h b/include/linux/ata.h
+index adbc812..492553b 100644
+--- a/include/linux/ata.h
++++ b/include/linux/ata.h
+@@ -1097,6 +1097,21 @@ static inline unsigned ata_set_lba_range_entries(void *_buffer,
+ 	return used_bytes;
+ }
+ 
++/**
++ * _lba_to_cmd_ata() - Copy lba48 to ATA command
++ * @cmd: ATA command as an array of bytes
++ * @_lba: lba48 in the low 48 bits
++ */
++static inline void _lba_to_cmd_ata(u8 *cmd, u64 _lba)
++{
++	cmd[1] =  _lba	      & 0xff;
++	cmd[3] = (_lba >>  8) & 0xff;
++	cmd[5] = (_lba >> 16) & 0xff;
++	cmd[0] = (_lba >> 24) & 0xff;
++	cmd[2] = (_lba >> 32) & 0xff;
++	cmd[4] = (_lba >> 40) & 0xff;
++}
++
+ static inline bool ata_ok(u8 status)
+ {
+ 	return ((status & (ATA_BUSY | ATA_DRDY | ATA_DF | ATA_DRQ | ATA_ERR))
+diff --git a/include/scsi/scsi_device.h b/include/scsi/scsi_device.h
+index 7a4d38a..4c8a5c3 100644
+--- a/include/scsi/scsi_device.h
++++ b/include/scsi/scsi_device.h
+@@ -156,6 +156,7 @@ struct scsi_device {
+ 	unsigned use_10_for_ms:1; /* first try 10-byte mode sense/select */
+ 	unsigned no_report_opcodes:1;	/* no REPORT SUPPORTED OPERATION CODES */
+ 	unsigned no_write_same:1;	/* no WRITE SAME command */
++	unsigned use_ata16_for_zbc:1;	/* HBA blocks ZBC -> ZAC use ata16 */
+ 	unsigned use_16_for_rw:1; /* Use read/write(16) over read/write(10) */
+ 	unsigned skip_ms_page_8:1;	/* do not use MODE SENSE page 0x08 */
+ 	unsigned skip_ms_page_3f:1;	/* do not use MODE SENSE page 0x3f */
+-- 
+2.9.3
+

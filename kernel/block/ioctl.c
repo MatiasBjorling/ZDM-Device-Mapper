@@ -4,11 +4,9 @@
 #include <linux/gfp.h>
 #include <linux/blkpg.h>
 #include <linux/hdreg.h>
-#include <linux/badblocks.h>
 #include <linux/backing-dev.h>
 #include <linux/fs.h>
 #include <linux/blktrace_api.h>
-#include <linux/blkzoned_api.h>
 #include <linux/pr.h>
 #include <asm/uaccess.h>
 
@@ -197,36 +195,37 @@ int blkdev_reread_part(struct block_device *bdev)
 EXPORT_SYMBOL(blkdev_reread_part);
 
 static int blk_zoned_report_ioctl(struct block_device *bdev, fmode_t mode,
-		void __user *parg)
+				  void __user *parg)
 {
 	int error = -EFAULT;
-	gfp_t gfp = GFP_KERNEL;
-	struct bdev_zone_report_io *zone_iodata = NULL;
+	gfp_t gfp = GFP_KERNEL | GFP_DMA;
+	void *iopg = NULL;
+	struct bdev_zone_report_io *bzrpt = NULL;
 	int order = 0;
-	struct page * pgs = NULL;
+	struct page *pgs = NULL;
 	u32 alloc_size = PAGE_SIZE;
-	unsigned long bi_rw = 0;
+	unsigned int op_flags = 0;
 	u8 opt = 0;
 
 	if (!(mode & FMODE_READ))
 		return -EBADF;
 
-	zone_iodata = (void *)get_zeroed_page(gfp);
-	if (!zone_iodata) {
+	iopg = (void *)get_zeroed_page(gfp);
+	if (!iopg) {
 		error = -ENOMEM;
 		goto report_zones_out;
 	}
-	if (copy_from_user(zone_iodata, parg, sizeof(*zone_iodata))) {
+	bzrpt = iopg;
+	if (copy_from_user(bzrpt, parg, sizeof(*bzrpt))) {
 		error = -EFAULT;
 		goto report_zones_out;
 	}
-	if (zone_iodata->data.in.return_page_count > alloc_size) {
+	if (bzrpt->data.in.return_page_count > alloc_size) {
 		int npages;
 
-		alloc_size = zone_iodata->data.in.return_page_count;
-		npages = (alloc_size + PAGE_SIZE - 1) / PAGE_SIZE;
-		order =  ilog2(roundup_pow_of_two(npages));
-		pgs = alloc_pages(gfp, order);
+		alloc_size = bzrpt->data.in.return_page_count;
+		npages = (alloc_size + PAGE_SIZE - 1) >> PAGE_SHIFT;
+		pgs = alloc_pages(gfp, ilog2(npages));
 		if (pgs) {
 			void *mem = page_address(pgs);
 
@@ -234,101 +233,110 @@ static int blk_zoned_report_ioctl(struct block_device *bdev, fmode_t mode,
 				error = -ENOMEM;
 				goto report_zones_out;
 			}
+			order = ilog2(npages);
 			memset(mem, 0, alloc_size);
-			memcpy(mem, zone_iodata, sizeof(*zone_iodata));
-			free_page((unsigned long)zone_iodata);
-			zone_iodata = mem;
+			memcpy(mem, bzrpt, sizeof(*bzrpt));
+			bzrpt = mem;
 		} else {
 			/* Result requires DMA capable memory */
 			pr_err("Not enough memory available for request.\n");
 			error = -ENOMEM;
 			goto report_zones_out;
 		}
+	} else {
+		alloc_size = bzrpt->data.in.return_page_count;
 	}
-	opt = zone_iodata->data.in.report_option & 0x7F;
-	if (zone_iodata->data.in.report_option & ZOPT_USE_ATA_PASS)
-		bi_rw |= REQ_META;
-
-	error = blkdev_issue_zone_report(bdev, bi_rw,
-			zone_iodata->data.in.zone_locator_lba, opt,
-			pgs ? pgs : virt_to_page(zone_iodata),
+	if (bzrpt->data.in.force_unit_access)
+		op_flags |= REQ_META;
+	opt = bzrpt->data.in.report_option;
+	error = blkdev_issue_zone_report(bdev, op_flags,
+			bzrpt->data.in.zone_locator_lba, opt,
+			pgs ? pgs : virt_to_page(iopg),
 			alloc_size, GFP_KERNEL);
-
 	if (error)
 		goto report_zones_out;
 
-	if (copy_to_user(parg, zone_iodata, alloc_size))
-		error = -EFAULT;
+	if (pgs) {
+		void *src = bzrpt;
+		u32 off = 0;
+
+		/*
+		 * When moving a multi-order page with GFP_DMA
+		 * the copy to user can trap "<spans multiple pages>"
+		 * so instead we copy out 1 page at a time.
+		 */
+		while (off < alloc_size && !error) {
+			u32 len = min_t(u32, PAGE_SIZE, alloc_size - off);
+
+			memcpy(iopg, src + off, len);
+			if (copy_to_user(parg + off, iopg, len))
+				error = -EFAULT;
+			off += len;
+		}
+	} else {
+		if (copy_to_user(parg, iopg, alloc_size))
+			error = -EFAULT;
+	}
 
 report_zones_out:
 	if (pgs)
 		__free_pages(pgs, order);
-	else if (zone_iodata)
-		free_page((unsigned long)zone_iodata);
+	if (iopg)
+		free_page((unsigned long)iopg);
 	return error;
 }
 
 static int blk_zoned_action_ioctl(struct block_device *bdev, fmode_t mode,
-				  unsigned cmd, unsigned long arg)
+				  void __user *parg)
 {
-	unsigned long bi_rw = 0;
+	unsigned int op = 0;
+	unsigned int op_flags = 0;
+	sector_t lba;
+	struct bdev_zone_action za;
 
 	if (!(mode & FMODE_WRITE))
 		return -EBADF;
 
-	/*
-	 * When acting on zones we explicitly disallow using a partition.
-	 */
+	/* When acting on zones we explicitly disallow using a partition. */
 	if (bdev != bdev->bd_contains) {
 		pr_err("%s: All zone operations disallowed on this device\n",
 			__func__);
 		return -EFAULT;
 	}
 
-	/*
-	 * When the low bit is set force ATA passthrough try to work around
-	 * older SAS HBA controllers that don't support ZBC to ZAC translation.
-	 *
-	 * When the low bit is clear follow the normal path but also correct
-	 * for ~0ul LBA means 'for all lbas'.
-	 *
-	 * NB: We should do extra checking here to see if the user specified
-	 *     the entire block device as opposed to a partition of the
-	 *     device....
-	 */
-	if (arg & 1) {
-		bi_rw |= REQ_META;
-		if (arg != ~0ul)
-			arg &= ~1ul; /* ~1 :: 0xFF...FE */
-	} else {
-		if (arg == ~1ul)
-			arg = ~0ul;
-	}
-
-	/*
-	 * When acting on zones we explicitly disallow using a partition.
-	 */
-	if (bdev != bdev->bd_contains) {
-		pr_err("%s: All zone operations disallowed on this device\n",
-			__func__);
+	if (copy_from_user(&za, parg, sizeof(za)))
 		return -EFAULT;
-	}
 
-	switch (cmd) {
-	case BLKOPENZONE:
-		bi_rw |= REQ_OPEN_ZONE;
+	switch (za.action) {
+	case ZONE_ACTION_CLOSE:
+		op = REQ_OP_ZONE_CLOSE;
 		break;
-	case BLKCLOSEZONE:
-		bi_rw |= REQ_CLOSE_ZONE;
+	case ZONE_ACTION_FINISH:
+		op = REQ_OP_ZONE_FINISH;
 		break;
-	case BLKRESETZONE:
-		bi_rw |= REQ_RESET_ZONE;
+	case ZONE_ACTION_OPEN:
+		op = REQ_OP_ZONE_OPEN;
+		break;
+	case ZONE_ACTION_RESET:
+		op = REQ_OP_ZONE_RESET;
 		break;
 	default:
-		pr_err("%s: Unknown action: %u\n", __func__, cmd);
-		WARN_ON(1);
+		pr_err("%s: Unknown action: %u\n", __func__, za.action);
+		return -EINVAL;
 	}
-	return blkdev_issue_zone_action(bdev, bi_rw, arg, GFP_KERNEL);
+
+	lba = za.zone_locator_lba;
+	if (za.all_zones) {
+		if (lba) {
+			pr_err("%s: if all_zones, LBA must be 0.\n", __func__);
+			return -EINVAL;
+		}
+		lba = ~0ul;
+	}
+	if (za.force_unit_access || lba == ~0ul)
+		op_flags |= REQ_META;
+
+	return blkdev_issue_zone_action(bdev, op, op_flags, lba, GFP_KERNEL);
 }
 
 static int blk_ioctl_discard(struct block_device *bdev, fmode_t mode,
@@ -543,35 +551,6 @@ static inline int is_unrecognized_ioctl(int ret)
 		ret == -ENOIOCTLCMD;
 }
 
-#ifdef CONFIG_FS_DAX
-bool blkdev_dax_capable(struct block_device *bdev)
-{
-	struct gendisk *disk = bdev->bd_disk;
-
-	if (!disk->fops->direct_access)
-		return false;
-
-	/*
-	 * If the partition is not aligned on a page boundary, we can't
-	 * do dax I/O to it.
-	 */
-	if ((bdev->bd_part->start_sect % (PAGE_SIZE / 512))
-			|| (bdev->bd_part->nr_sects % (PAGE_SIZE / 512)))
-		return false;
-
-	/*
-	 * If the device has known bad blocks, force all I/O through the
-	 * driver / page cache.
-	 *
-	 * TODO: support finer grained dax error handling
-	 */
-	if (disk->bb && disk->bb->count)
-		return false;
-
-	return true;
-}
-#endif
-
 static int blkdev_flushbuf(struct block_device *bdev, fmode_t mode,
 		unsigned cmd, unsigned long arg)
 {
@@ -736,13 +715,8 @@ int blkdev_ioctl(struct block_device *bdev, fmode_t mode, unsigned cmd,
 		return blk_trace_ioctl(bdev, cmd, argp);
 	case BLKREPORT:
 		return blk_zoned_report_ioctl(bdev, mode, argp);
-	case BLKOPENZONE:
-	case BLKCLOSEZONE:
-	case BLKRESETZONE:
-		return blk_zoned_action_ioctl(bdev, mode, cmd, arg);
-	case BLKDAXGET:
-		return put_int(arg, !!(bdev->bd_inode->i_flags & S_DAX));
-		break;
+	case BLKZONEACTION:
+		return blk_zoned_action_ioctl(bdev, mode, argp);
 	case IOC_PR_REGISTER:
 		return blkdev_pr_register(bdev, argp);
 	case IOC_PR_RESERVE:

@@ -1530,7 +1530,7 @@ static u32 dmz_report_count(struct zdm *znd, void *rpt_in, size_t bufsz)
  */
 static inline int is_conventional(struct bdev_zone_descriptor *dentry)
 {
-	return (ZTYP_CONVENTIONAL == (dentry->type & 0x0F)) ? 1 : 0;
+	return (BLK_ZONE_TYPE_CONVENTIONAL == (dentry->type & 0x0F)) ? 1 : 0;
 }
 
 /**
@@ -1544,7 +1544,8 @@ static inline int is_zone_reset(struct bdev_zone_descriptor *dentry)
 	u8 type = dentry->type & 0x0F;
 	u8 cond = (dentry->flags & 0xF0) >> 4;
 
-	return (ZCOND_ZC1_EMPTY == cond || ZTYP_CONVENTIONAL == type) ? 1 : 0;
+	return (BLK_ZONE_EMPTY == cond ||
+		BLK_ZONE_TYPE_CONVENTIONAL == type) ? 1 : 0;
 }
 
 /**

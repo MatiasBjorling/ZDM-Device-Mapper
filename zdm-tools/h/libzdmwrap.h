@@ -306,12 +306,12 @@ void set_debug(int state);
 #define mzio_lock( p )   (void)p
 #define mzio_unlock( p ) (void)p
 
-static inline spin_trylock_irqsave(spinlock_t *lck, unsigned long flags)
+static inline int spin_trylock_irqsave(spinlock_t *lck, unsigned long flags)
 {
 	return 1;
 }
 
-static inline spin_trylock(spinlock_t *lck)
+static inline int spin_trylock(spinlock_t *lck)
 {
 	return 1;
 }

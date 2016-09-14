@@ -1,0 +1,213 @@
+From b9586299eb1a7eafb2a3bf27ef0692689afd5269 Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Tue, 13 Sep 2016 14:21:25 -0500
+Subject: [PATCH 1/7] Add zoned to queue_limits and sysfs
+
+In order to easily identify zoned (ZBC enabled) devices to both
+user space via sysfs and to users of the block interfaces capture
+the zoned type (None, Host Aware, Host Managed, or DM Compsite)
+and expose it.
+
+Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
+---
+ block/blk-settings.c   |  2 ++
+ block/blk-sysfs.c      | 11 +++++++++++
+ drivers/scsi/sd.c      | 20 +++++++++++++++-----
+ drivers/scsi/sd.h      |  1 +
+ include/linux/blkdev.h | 18 ++++++++++++++++++
+ 5 files changed, 47 insertions(+), 5 deletions(-)
+
+diff --git a/block/blk-settings.c b/block/blk-settings.c
+index f679ae1..d9cf86f 100644
+--- a/block/blk-settings.c
++++ b/block/blk-settings.c
+@@ -101,6 +101,7 @@ void blk_set_default_limits(struct queue_limits *lim)
+ 	lim->discard_alignment = 0;
+ 	lim->discard_misaligned = 0;
+ 	lim->discard_zeroes_data = 0;
++	lim->zoned = ZONED_TYPE_NONE;
+ 	lim->logical_block_size = lim->physical_block_size = lim->io_min = 512;
+ 	lim->bounce_pfn = (unsigned long)(BLK_BOUNCE_ANY >> PAGE_SHIFT);
+ 	lim->alignment_offset = 0;
+@@ -570,6 +571,7 @@ int blk_stack_limits(struct queue_limits *t, struct queue_limits *b,
+ 
+ 	t->cluster &= b->cluster;
+ 	t->discard_zeroes_data &= b->discard_zeroes_data;
++	t->zoned |= b->zoned;
+ 
+ 	/* Physical block size a multiple of the logical block size? */
+ 	if (t->physical_block_size & (t->logical_block_size - 1)) {
+diff --git a/block/blk-sysfs.c b/block/blk-sysfs.c
+index f87a7e7..c89eec9 100644
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@ -186,6 +186,11 @@ static ssize_t queue_discard_zeroes_data_show(struct request_queue *q, char *pag
+ 	return queue_var_show(queue_discard_zeroes_data(q), page);
+ }
+ 
++static ssize_t queue_zoned_show(struct request_queue *q, char *page)
++{
++	return queue_var_show(queue_zoned(q), page);
++}
++
+ static ssize_t queue_write_same_max_show(struct request_queue *q, char *page)
+ {
+ 	return sprintf(page, "%llu\n",
+@@ -474,6 +479,11 @@ static struct queue_sysfs_entry queue_discard_zeroes_data_entry = {
+ 	.show = queue_discard_zeroes_data_show,
+ };
+ 
++static struct queue_sysfs_entry queue_zoned_entry = {
++	.attr = {.name = "zoned", .mode = S_IRUGO },
++	.show = queue_zoned_show,
++};
++
+ static struct queue_sysfs_entry queue_write_same_max_entry = {
+ 	.attr = {.name = "write_same_max_bytes", .mode = S_IRUGO },
+ 	.show = queue_write_same_max_show,
+@@ -544,6 +554,7 @@ static struct attribute *default_attrs[] = {
+ 	&queue_discard_max_entry.attr,
+ 	&queue_discard_max_hw_entry.attr,
+ 	&queue_discard_zeroes_data_entry.attr,
++	&queue_zoned_entry.attr,
+ 	&queue_write_same_max_entry.attr,
+ 	&queue_nonrot_entry.attr,
+ 	&queue_nomerges_entry.attr,
+diff --git a/drivers/scsi/sd.c b/drivers/scsi/sd.c
+index d3e852a..36c5e39 100644
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -92,6 +92,7 @@ MODULE_ALIAS_BLOCKDEV_MAJOR(SCSI_DISK15_MAJOR);
+ MODULE_ALIAS_SCSI_DEVICE(TYPE_DISK);
+ MODULE_ALIAS_SCSI_DEVICE(TYPE_MOD);
+ MODULE_ALIAS_SCSI_DEVICE(TYPE_RBC);
++MODULE_ALIAS_SCSI_DEVICE(TYPE_ZBC);
+ 
+ #if !defined(CONFIG_DEBUG_BLOCK_EXT_DEVT)
+ #define SD_MINORS	16
+@@ -162,7 +163,7 @@ cache_type_store(struct device *dev, struct device_attribute *attr,
+ 	static const char temp[] = "temporary ";
+ 	int len;
+ 
+-	if (sdp->type != TYPE_DISK)
++	if (sdp->type != TYPE_DISK && sdp->type != TYPE_ZBC)
+ 		/* no cache control on RBC devices; theoretically they
+ 		 * can do it, but there's probably so many exceptions
+ 		 * it's not worth the risk */
+@@ -261,7 +262,7 @@ allow_restart_store(struct device *dev, struct device_attribute *attr,
+ 	if (!capable(CAP_SYS_ADMIN))
+ 		return -EACCES;
+ 
+-	if (sdp->type != TYPE_DISK)
++	if (sdp->type != TYPE_DISK && sdp->type != TYPE_ZBC)
+ 		return -EINVAL;
+ 
+ 	sdp->allow_restart = simple_strtoul(buf, NULL, 10);
+@@ -458,7 +459,7 @@ max_write_same_blocks_store(struct device *dev, struct device_attribute *attr,
+ 	if (!capable(CAP_SYS_ADMIN))
+ 		return -EACCES;
+ 
+-	if (sdp->type != TYPE_DISK)
++	if (sdp->type != TYPE_DISK && sdp->type != TYPE_ZBC)
+ 		return -EINVAL;
+ 
+ 	err = kstrtoul(buf, 10, &max);
+@@ -2612,7 +2613,7 @@ static void sd_read_app_tag_own(struct scsi_disk *sdkp, unsigned char *buffer)
+ 	struct scsi_mode_data data;
+ 	struct scsi_sense_hdr sshdr;
+ 
+-	if (sdp->type != TYPE_DISK)
++	if (sdp->type != TYPE_DISK && sdp->type != TYPE_ZBC)
+ 		return;
+ 
+ 	if (sdkp->protection_type == 0)
+@@ -2737,6 +2738,8 @@ static void sd_read_block_characteristics(struct scsi_disk *sdkp)
+ 		queue_flag_clear_unlocked(QUEUE_FLAG_ADD_RANDOM, sdkp->disk->queue);
+ 	}
+ 
++	sdkp->zoned = (buffer[8] >> 4) & 3;
++
+  out:
+ 	kfree(buffer);
+ }
+@@ -2847,6 +2850,10 @@ static int sd_revalidate_disk(struct gendisk *disk)
+ 		sd_read_cache_type(sdkp, buffer);
+ 		sd_read_app_tag_own(sdkp, buffer);
+ 		sd_read_write_same(sdkp, buffer);
++		if (sdkp->zoned == 1)
++			q->limits.zoned |= ZONED_TYPE_HA;
++		if (sdp->type == TYPE_ZBC)
++			q->limits.zoned |= ZONED_TYPE_HM;
+ 	}
+ 
+ 	sdkp->first_scan = 0;
+@@ -3040,7 +3047,10 @@ static int sd_probe(struct device *dev)
+ 
+ 	scsi_autopm_get_device(sdp);
+ 	error = -ENODEV;
+-	if (sdp->type != TYPE_DISK && sdp->type != TYPE_MOD && sdp->type != TYPE_RBC)
++	if (sdp->type != TYPE_DISK &&
++	    sdp->type != TYPE_ZBC &&
++	    sdp->type != TYPE_MOD &&
++	    sdp->type != TYPE_RBC)
+ 		goto out;
+ 
+ 	SCSI_LOG_HLQUEUE(3, sdev_printk(KERN_INFO, sdp,
+diff --git a/drivers/scsi/sd.h b/drivers/scsi/sd.h
+index 765a6f1..f782990 100644
+--- a/drivers/scsi/sd.h
++++ b/drivers/scsi/sd.h
+@@ -94,6 +94,7 @@ struct scsi_disk {
+ 	unsigned	lbpvpd : 1;
+ 	unsigned	ws10 : 1;
+ 	unsigned	ws16 : 1;
++	unsigned	zoned: 2;
+ };
+ #define to_scsi_disk(obj) container_of(obj,struct scsi_disk,dev)
+ 
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index e79055c..f5df4c9 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -261,6 +261,13 @@ struct blk_queue_tag {
+ #define BLK_SCSI_MAX_CMDS	(256)
+ #define BLK_SCSI_CMD_PER_LONG	(BLK_SCSI_MAX_CMDS / (sizeof(long) * 8))
+ 
++enum queue_limit_zoned_type {
++	ZONED_TYPE_NONE = 0,		/* Not a zoned device */
++	ZONED_TYPE_HA = 1,		/* Host Aware ZBC device */
++	ZONED_TYPE_HM = 2,		/* Host Managed ZBC device */
++	ZONED_TYPE_COMPOSITE = 3,	/* DM composite of HA and HM devices */
++};
++
+ struct queue_limits {
+ 	unsigned long		bounce_pfn;
+ 	unsigned long		seg_boundary_mask;
+@@ -290,6 +297,7 @@ struct queue_limits {
+ 	unsigned char		cluster;
+ 	unsigned char		discard_zeroes_data;
+ 	unsigned char		raid_partial_stripes_expensive;
++	unsigned		zoned:2;
+ };
+ 
+ struct request_queue {
+@@ -1344,6 +1352,16 @@ static inline unsigned int bdev_discard_zeroes_data(struct block_device *bdev)
+ 	return queue_discard_zeroes_data(bdev_get_queue(bdev));
+ }
+ 
++static inline unsigned int queue_zoned(struct request_queue *q)
++{
++	return q->limits.zoned;
++}
++
++static inline unsigned int bdev_zoned(struct block_device *bdev)
++{
++	return queue_zoned(bdev_get_queue(bdev));
++}
++
+ static inline unsigned int bdev_write_same(struct block_device *bdev)
+ {
+ 	struct request_queue *q = bdev_get_queue(bdev);
+-- 
+2.9.3
+

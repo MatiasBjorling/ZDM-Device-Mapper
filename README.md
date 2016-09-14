@@ -36,7 +36,7 @@ provided the required amount of conventional space is available.
 
 ## Software Requirements
 
-  - Current Linux Kernel v4.1 to v.4.6-rc6 with ZDM patches
+  - Current Linux Kernel v4.4 to v.4.8 with ZDM patches
   - Recommended: Util Linux with ZDM patches
   - Recommended: sg3utils (1.41 or later)
 
@@ -59,10 +59,11 @@ provided the required amount of conventional space is available.
   - Host Aware zoned block device, possibly with conventional zones.
   - Host Managed zoned block device with conventional zones.
   - Currently 256 MiB of RAM per drive is recommended.
+  - SAS controller SAT supports ZBC <-> ZAC translation.
 
 ## Userspace utilities
   - zdm-tools: zdmadm, zdm-status, zdm-zones, zdmon and others ...
-  - zbc/zac tools (sd_* tools)
+  - util-linux: blkid, blkreport and blkzonecmd
 
 ## Typical Setup
 
@@ -72,11 +73,11 @@ provided the required amount of conventional space is available.
 ```
 or
 ```
-      blkzonecmd --reset --zone -1 /dev/sdX
+      blkzonecmd --reset --all /dev/sdX
 ```
 or
 ```
-      blkzonecmd --reset --zone -1 --ata /dev/sdX
+      zdm-zonecmd --reset --all --sat /dev/sdX
 ```
 
   - Partition the drive to start the partition at a WP boundary.
@@ -108,7 +109,6 @@ or
 
 Building:
   - Normal kernel build with CONFIG_DM_ZDM
-  - Additionally CONFIG_SCSI_ZBC and CONFIG_BLK_DEV_ZONED can be used for testing file systmes such as NILFS2 and F2FS.
 
 ## Standards Versions Supported
 
@@ -134,21 +134,23 @@ If not, please see http://www.gnu.org/licenses/.
   - CEPH: Enable ceph to created and used an OSD that used ZDM. NOTE: depends on blkid support from util-linux or util-linux-ng.
     * 0.94.5 [ceph patch](/patches/ceph)
   - util-linux -- Added: blkreport, blkzonecmd
-    * 2.20.1 [For Ubuntu 14.04](/patches/util-linux/2.20.1)
-    * 2.28-rc2 [For Debian sid development](/patches/util-linux/2.28-rc2)
+    * 2.27.1 [For Ubuntu 16.04](/patches/util-linux/2.27.1)
   - util-linux-ng -- Missing: blkreport, blkzonecmd
     * 2.17.2 [For CentOS 6.7](/patches/util-linux-ng)
 
 ## ZDM Linux Kernel
 
   - Patches
-    * v4.2.8 [ZDM r114 patches for linux v4.2.8](/patches/linux/v4.2.8+ZDM-r114)
-    * v4.4 [ZDM r114 patches for linux v4.4](/patches/linux/v4.4+ZDM-r114)
-    * v4.6 [ZDM r114 patches for linux v4.6-rc6](/patches/linux/v4.6+ZDM-r114)
+    * v4.8-rc6 [ZDM r119 patches for linux v4.8-rc6](/patches/linux/v4.8+ZDM-r119)
 
-## Observations and Known Issues in this release (#114)
+## Observations and Known Issues in this release (#119)
 
-  - Bug: mkfs segfaulting with 4.6 kernel on (some) embedded platforms.
+  - Bug: Very random workloads can cause cache buffers to overflow.
+    * Fixed in r120.
+  - Notice for MD-RAID level 4/5/6. The bio queue feature is off by default.
+    * Workaround: Add -q1 to zdmadm command-line when creating and restoring
+      ZDM instances.
+    * Fix planned for r121.
 
 ## Changes from Initial Release
 
@@ -241,3 +243,7 @@ If not, please see http://www.gnu.org/licenses/.
     * Disabled WB journal path by default.
     * Expanded de-dupe to include any 4k aligned bio.
     * Updated to 4.6 kerenl.
+
+  - ZDM #119
+    * Updated to 4.8 kerenl.
+    * Numerous bug fixes and stability enhancements.

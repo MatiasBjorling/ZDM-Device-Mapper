@@ -15,10 +15,11 @@ endif (EXISTS /usr/include/linux/blkzoned_api.h)
 
 if (EXISTS /usr/lib/libsgutils2.a)
    message ("sg3 utils found..")
+elseif (EXISTS /usr/lib/x86_64-linux-gnu/libsgutils2.a)
+   message ("sg3 x64 utils found..")
 else (EXISTS /usr/lib/libsgutils2.a)
    message ("Need libsg3utils-dev package.")
 endif (EXISTS /usr/lib/libsgutils2.a)
-
 
 INCLUDE(FindPkgConfig)
 
@@ -40,7 +41,7 @@ set(LIBSRC lib/is_mounted.c lib/libcrc.c lib/libsort.c lib/libzdmwrap.c lib/zbc-
 add_library(zdm ${LIBSRC})
 
 set (zdm_VERSION_MAJOR 0)
-set (zdm_VERSION_MINOR 110)
+set (zdm_VERSION_MINOR 119)
 
 # configure a header file to pass some of the CMake settings
 # to the source code
@@ -54,14 +55,19 @@ add_executable(zdm-rawio  src/zdm-rawio.c)
 add_executable(zdm-mlog   src/zdm-mlog.c)
 add_executable(zdm-status src/zdm-status.c)
 add_executable(zdm-zones  src/zdm-zones.c)
+add_executable(zdm-report  src/zdm-report.c)
+add_executable(zdm-zonecmd  src/zdm-zonecmd.c)
 
 target_link_libraries (zdmadm     zdm uuid ssl sgutils2)
 target_link_libraries (zdm-rawio  zdm uuid ssl sgutils2)
 target_link_libraries (zdm-mlog   zdm uuid ssl sgutils2)
 target_link_libraries (zdm-status zdm uuid ssl sgutils2)
 target_link_libraries (zdm-zones  zdm uuid ssl sgutils2)
+target_link_libraries (zdm-report  zdm uuid ssl sgutils2)
+target_link_libraries (zdm-zonecmd  zdm uuid ssl sgutils2)
 
 install(TARGETS zdmadm zdm-rawio zdm-mlog zdm-status zdm-zones zdm
+                zdm-report zdm-zonecmd
         RUNTIME DESTINATION bin
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib)

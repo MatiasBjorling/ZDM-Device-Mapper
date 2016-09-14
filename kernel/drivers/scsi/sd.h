@@ -56,7 +56,6 @@ enum {
 	SD_LBP_WS16,		/* Use WRITE SAME(16) with UNMAP bit */
 	SD_LBP_WS10,		/* Use WRITE SAME(10) with UNMAP bit */
 	SD_LBP_ZERO,		/* Use WRITE SAME(10) with zero payload */
-	SD_ZBC_RESET_WP,	/* Use RESET WRITE POINTER */
 	SD_LBP_DISABLE,		/* Discard disabled due to failed cmd */
 };
 
@@ -65,12 +64,6 @@ struct scsi_disk {
 	struct scsi_device *device;
 	struct device	dev;
 	struct gendisk	*disk;
-#ifdef CONFIG_SCSI_ZBC
-	struct workqueue_struct *zone_work_q;
-	unsigned long	zone_flags;
-#define SD_ZBC_ZONE_RESET 1
-#define SD_ZBC_ZONE_INIT  2
-#endif
 	atomic_t	openers;
 	sector_t	capacity;	/* size in logical blocks */
 	u32		max_xfer_blocks;
@@ -101,7 +94,6 @@ struct scsi_disk {
 	unsigned	lbpvpd : 1;
 	unsigned	ws10 : 1;
 	unsigned	ws16 : 1;
-	unsigned	rc_basis: 2;
 	unsigned	zoned: 2;
 };
 #define to_scsi_disk(obj) container_of(obj,struct scsi_disk,dev)
@@ -160,9 +152,9 @@ static inline sector_t logical_to_sectors(struct scsi_device *sdev, sector_t blo
 	return blocks << (ilog2(sdev->sector_size) - 9);
 }
 
-static inline sector_t sectors_to_logical(struct scsi_device *sdev, sector_t sector)
+static inline unsigned int logical_to_bytes(struct scsi_device *sdev, sector_t blocks)
 {
-	return sector >> (ilog2(sdev->sector_size) - 9);
+	return blocks * sdev->sector_size;
 }
 
 /*
@@ -277,61 +269,5 @@ static inline void sd_dif_complete(struct scsi_cmnd *cmd, unsigned int a)
 }
 
 #endif /* CONFIG_BLK_DEV_INTEGRITY */
-
-
-#define SD_ZBC_INIT		0
-#define SD_ZBC_RESET_WP_ERR	1
-#define SD_ZBC_WRITE_ERR	2
-
-
-#ifdef CONFIG_SCSI_ZBC
-
-extern int sd_zbc_report_zones(struct scsi_disk *, unsigned char *, int,
-			       sector_t, enum zbc_zone_reporting_options, bool);
-extern int sd_zbc_setup(struct scsi_disk *, u64, char *, int);
-extern void sd_zbc_remove(struct scsi_disk *);
-extern void sd_zbc_reset_zones(struct scsi_disk *);
-extern int sd_zbc_lookup_zone(struct scsi_disk *, struct request *,
-			      sector_t, unsigned int);
-extern void sd_zbc_update_zones(struct scsi_disk *, sector_t, int, int);
-extern unsigned int sd_zbc_discard_granularity(struct scsi_disk *);
-
-#else /* CONFIG_SCSI_ZBC */
-
-static inline int sd_zbc_report_zones(struct scsi_disk *sdkp,
-				      unsigned char *buf, int buf_len,
-				      sector_t start_sector,
-				      enum zbc_zone_reporting_options option,
-				      bool partial)
-{
-	return -EOPNOTSUPP;
-}
-
-static inline int sd_zbc_setup(struct scsi_disk *sdkp, u64 zlen,
-			       unsigned char *buf, int buf_len)
-{
-	return 0;
-}
-
-static inline int sd_zbc_lookup_zone(struct scsi_disk *sdkp,
-				     struct request *rq, sector_t sector,
-				     unsigned int num_sectors)
-{
-	return BLKPREP_OK;
-}
-
-static inline void sd_zbc_remove(struct scsi_disk *sdkp) {}
-
-static inline void sd_zbc_update_zones(struct scsi_disk *sdkp, sector_t s,
-				       int a, int b)
-{
-}
-
-static inline unsigned int sd_zbc_discard_granularity(struct scsi_disk *sdkp)
-{
-	return sdkp->device->sector_size;
-}
-
-#endif /* CONFIG_SCSI_ZBC */
 
 #endif /* _SCSI_DISK_H */

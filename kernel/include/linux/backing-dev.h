@@ -24,6 +24,7 @@ __printf(3, 4)
 int bdi_register(struct backing_dev_info *bdi, struct device *parent,
 		const char *fmt, ...);
 int bdi_register_dev(struct backing_dev_info *bdi, dev_t dev);
+int bdi_register_owner(struct backing_dev_info *bdi, struct device *owner);
 void bdi_unregister(struct backing_dev_info *bdi);
 
 int __must_check bdi_setup_and_register(struct backing_dev_info *, char *);
@@ -197,7 +198,7 @@ static inline int wb_congested(struct bdi_writeback *wb, int cong_bits)
 }
 
 long congestion_wait(int sync, long timeout);
-long wait_iff_congested(struct zone *zone, int sync, long timeout);
+long wait_iff_congested(struct pglist_data *pgdat, int sync, long timeout);
 int pdflush_proc_obsolete(struct ctl_table *table, int write,
 		void __user *buffer, size_t *lenp, loff_t *ppos);
 
@@ -513,8 +514,5 @@ static inline int bdi_rw_congested(struct backing_dev_info *bdi)
 	return bdi_congested(bdi, (1 << WB_sync_congested) |
 				  (1 << WB_async_congested));
 }
-
-int bdi_streamid_open(struct backing_dev_info *bdi, unsigned int id);
-int bdi_streamid_close(struct backing_dev_info *bdi, unsigned int id);
 
 #endif	/* _LINUX_BACKING_DEV_H */

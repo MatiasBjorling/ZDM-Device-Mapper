@@ -6,6 +6,7 @@
 #define __LINUX_BLK_TYPES_H
 
 #include <linux/types.h>
+#include <linux/bvec.h>
 
 struct bio_set;
 struct bio;
@@ -17,28 +18,7 @@ struct cgroup_subsys_state;
 typedef void (bio_end_io_t) (struct bio *);
 typedef void (bio_destructor_t) (struct bio *);
 
-/*
- * was unsigned short, but we might as well be ready for > 64kB I/O pages
- */
-struct bio_vec {
-	struct page	*bv_page;
-	unsigned int	bv_len;
-	unsigned int	bv_offset;
-};
-
 #ifdef CONFIG_BLOCK
-
-struct bvec_iter {
-	sector_t		bi_sector;	/* device address in 512 byte
-						   sectors */
-	unsigned int		bi_size;	/* residual I/O count */
-
-	unsigned int		bi_idx;		/* current index into bvl_vec */
-
-	unsigned int            bi_bvec_done;	/* number of bytes completed in
-						   current bvec */
-};
-
 /*
  * main unit of I/O for the block layer and lower layers (ie drivers and
  * stacking drivers)
@@ -46,11 +26,13 @@ struct bvec_iter {
 struct bio {
 	struct bio		*bi_next;	/* request queue link */
 	struct block_device	*bi_bdev;
-	unsigned int		bi_flags;	/* status, command, etc */
 	int			bi_error;
-	unsigned long		bi_rw;		/* bottom bits READ/WRITE,
-						 * top bits priority
+	unsigned int		bi_opf;		/* bottom bits req flags,
+						 * top bits REQ_OP. Use
+						 * accessors.
 						 */
+	unsigned short		bi_flags;	/* status, command, etc */
+	unsigned short		bi_ioprio;
 
 	struct bvec_iter	bi_iter;
 
@@ -107,73 +89,60 @@ struct bio {
 	struct bio_vec		bi_inline_vecs[0];
 };
 
+#define BIO_OP_SHIFT	(8 * sizeof(unsigned int) - REQ_OP_BITS)
+#define bio_op(bio)	((bio)->bi_opf >> BIO_OP_SHIFT)
+
+#define bio_set_op_attrs(bio, op, op_flags) do {		\
+	WARN_ON(op >= (1 << REQ_OP_BITS));			\
+	(bio)->bi_opf &= ((1 << BIO_OP_SHIFT) - 1);		\
+	(bio)->bi_opf |= ((unsigned int) (op) << BIO_OP_SHIFT);	\
+	(bio)->bi_opf |= op_flags;				\
+} while (0)
+
 #define BIO_RESET_BYTES		offsetof(struct bio, bi_max_vecs)
 
 /*
  * bio flags
  */
-enum {
-	BIO_SEG_VALID	= 0,	/* bi_phys_segments valid */
-	BIO_CLONED,		/* doesn't own data */
-	BIO_BOUNCED,		/* bio is a bounce bio */
-	BIO_USER_MAPPED,	/* contains user pages */
-	BIO_NULL_MAPPED,	/* contains invalid user pages */
-	BIO_QUIET,		/* Mnake BIO Quiet */
-	BIO_CHAIN,		/* chained bio, ->bi_remaining in effect */
-	BIO_REFFED,		/* bio has elevated ->bi_cnt */
-	BIO_OWNS_VEC,		/* bio_free() should free bvec */
-	BIO_FLAG_LAST,		/* end of bits */
-	/*
-	 * Flags starting here get preserved by bio_reset() - this includes
-	 * BIO_POOL_IDX()
-	 */
-	BIO_RESET_BITS = BIO_FLAG_LAST,
-};
+#define BIO_SEG_VALID	1	/* bi_phys_segments valid */
+#define BIO_CLONED	2	/* doesn't own data */
+#define BIO_BOUNCED	3	/* bio is a bounce bio */
+#define BIO_USER_MAPPED 4	/* contains user pages */
+#define BIO_NULL_MAPPED 5	/* contains invalid user pages */
+#define BIO_QUIET	6	/* Make BIO Quiet */
+#define BIO_CHAIN	7	/* chained bio, ->bi_remaining in effect */
+#define BIO_REFFED	8	/* bio has elevated ->bi_cnt */
 
 /*
- * top 4 bits of bio flags indicate the pool this bio came from
+ * Flags starting here get preserved by bio_reset() - this includes
+ * BVEC_POOL_IDX()
  */
-#define BIO_POOL_BITS		(4)
-#define BIO_POOL_NONE		((1UL << BIO_POOL_BITS) - 1)
-#define BIO_POOL_OFFSET		(32 - BIO_POOL_BITS)
-#define BIO_POOL_IDX(bio)	((bio)->bi_flags >> BIO_POOL_OFFSET)
+#define BIO_RESET_BITS	10
 
 /*
- * after the pool bits, next 16 bits are for the stream id
+ * We support 6 different bvec pools, the last one is magic in that it
+ * is backed by a mempool.
  */
-#define BIO_STREAM_BITS		(16)
-#define BIO_STREAM_OFFSET	(BIO_POOL_OFFSET - BIO_STREAM_BITS)
-#define BIO_STREAM_MASK		((1 << BIO_STREAM_BITS) - 1)
+#define BVEC_POOL_NR		6
+#define BVEC_POOL_MAX		(BVEC_POOL_NR - 1)
 
-static inline unsigned long streamid_to_flags(unsigned int id)
-{
-	return (unsigned long) (id & BIO_STREAM_MASK) << BIO_STREAM_OFFSET;
-}
-
-static inline void bio_set_streamid(struct bio *bio, unsigned int id)
-{
-	bio->bi_flags |= streamid_to_flags(id);
-}
-
-static inline unsigned int bio_get_streamid(struct bio *bio)
-{
-	return (bio->bi_flags >> BIO_STREAM_OFFSET) & BIO_STREAM_MASK;
-}
-
-static inline bool bio_streamid_valid(struct bio *bio)
-{
-	return bio_get_streamid(bio) != 0;
-}
+/*
+ * Top 4 bits of bio flags indicate the pool the bvecs came from.  We add
+ * 1 to the actual index so that 0 indicates that there are no bvecs to be
+ * freed.
+ */
+#define BVEC_POOL_BITS		(4)
+#define BVEC_POOL_OFFSET	(16 - BVEC_POOL_BITS)
+#define BVEC_POOL_IDX(bio)	((bio)->bi_flags >> BVEC_POOL_OFFSET)
 
 #endif /* CONFIG_BLOCK */
 
 /*
  * Request flags.  For use in the cmd_flags field of struct request, and in
- * bi_rw of struct bio.  Note that some flags are only valid in either one.
+ * bi_opf of struct bio.  Note that some flags are only valid in either one.
  */
 enum rq_flag_bits {
 	/* common flags */
-	__REQ_WRITE,		/* not set, read. set, write */
 	__REQ_FAILFAST_DEV,	/* no driver retries of device errors */
 	__REQ_FAILFAST_TRANSPORT, /* no driver retries of transport errors */
 	__REQ_FAILFAST_DRIVER,	/* no driver retries of driver errors */
@@ -181,18 +150,11 @@ enum rq_flag_bits {
 	__REQ_SYNC,		/* request is sync (sync write or read) */
 	__REQ_META,		/* metadata io request */
 	__REQ_PRIO,		/* boost priority in cfq */
-	__REQ_DISCARD,		/* request to discard sectors */
-	__REQ_SECURE,		/* secure discard (used with __REQ_DISCARD) */
-	__REQ_WRITE_SAME,	/* write same block many times */
 
 	__REQ_NOIDLE,		/* don't anticipate more IO after this one */
 	__REQ_INTEGRITY,	/* I/O includes block integrity payload */
 	__REQ_FUA,		/* forced unit access */
-	__REQ_FLUSH,		/* request for cache flush */
-
-	__REQ_REPORT_ZONES,	/* Zoned device: Report Zones */
-	__REQ_OPEN_ZONE,	/* Zoned device: Open Zone */
-	__REQ_CLOSE_ZONE,	/* Zoned device: Close Zone */
+	__REQ_PREFLUSH,		/* request for cache flush */
 
 	/* bio only flags */
 	__REQ_RAHEAD,		/* read ahead, can fail anytime */
@@ -223,40 +185,25 @@ enum rq_flag_bits {
 	__REQ_NR_BITS,		/* stops here */
 };
 
-#define REQ_WRITE		(1ULL << __REQ_WRITE)
 #define REQ_FAILFAST_DEV	(1ULL << __REQ_FAILFAST_DEV)
 #define REQ_FAILFAST_TRANSPORT	(1ULL << __REQ_FAILFAST_TRANSPORT)
 #define REQ_FAILFAST_DRIVER	(1ULL << __REQ_FAILFAST_DRIVER)
 #define REQ_SYNC		(1ULL << __REQ_SYNC)
 #define REQ_META		(1ULL << __REQ_META)
 #define REQ_PRIO		(1ULL << __REQ_PRIO)
-#define REQ_DISCARD		(1ULL << __REQ_DISCARD)
-#define REQ_WRITE_SAME		(1ULL << __REQ_WRITE_SAME)
 #define REQ_NOIDLE		(1ULL << __REQ_NOIDLE)
 #define REQ_INTEGRITY		(1ULL << __REQ_INTEGRITY)
-
-#define REQ_REPORT_ZONES	(1ULL << __REQ_REPORT_ZONES)
-#define REQ_OPEN_ZONE		(1ULL << __REQ_OPEN_ZONE)
-#define REQ_CLOSE_ZONE		(1ULL << __REQ_CLOSE_ZONE)
-#define REQ_RESET_ZONE		(REQ_REPORT_ZONES)
-#define REQ_ZONED_CMDS \
-	(REQ_OPEN_ZONE | REQ_CLOSE_ZONE | REQ_RESET_ZONE | REQ_REPORT_ZONES)
 
 #define REQ_FAILFAST_MASK \
 	(REQ_FAILFAST_DEV | REQ_FAILFAST_TRANSPORT | REQ_FAILFAST_DRIVER)
 #define REQ_COMMON_MASK \
-	(REQ_WRITE | REQ_FAILFAST_MASK | REQ_SYNC | REQ_META | REQ_PRIO | \
-	 REQ_DISCARD | REQ_WRITE_SAME | REQ_NOIDLE | REQ_FLUSH | REQ_FUA | \
-	 REQ_SECURE | REQ_INTEGRITY | \
-	 REQ_REPORT_ZONES | REQ_ZONED_CMDS)
+	(REQ_FAILFAST_MASK | REQ_SYNC | REQ_META | REQ_PRIO | REQ_NOIDLE | \
+	 REQ_PREFLUSH | REQ_FUA | REQ_INTEGRITY | REQ_NOMERGE)
 #define REQ_CLONE_MASK		REQ_COMMON_MASK
-#define BIO_NO_ADVANCE_ITER_MASK \
-	(REQ_DISCARD | REQ_WRITE_SAME | REQ_ZONED_CMDS)
 
 /* This mask is used for both bio and request merge checking */
 #define REQ_NOMERGE_FLAGS \
-	(REQ_NOMERGE | REQ_STARTED | REQ_SOFTBARRIER | \
-	 REQ_FLUSH | REQ_FUA | REQ_FLUSH_SEQ | REQ_ZONED_CMDS)
+	(REQ_NOMERGE | REQ_STARTED | REQ_SOFTBARRIER | REQ_PREFLUSH | REQ_FUA | REQ_FLUSH_SEQ)
 
 #define REQ_RAHEAD		(1ULL << __REQ_RAHEAD)
 #define REQ_THROTTLED		(1ULL << __REQ_THROTTLED)
@@ -274,20 +221,29 @@ enum rq_flag_bits {
 #define REQ_PREEMPT		(1ULL << __REQ_PREEMPT)
 #define REQ_ALLOCED		(1ULL << __REQ_ALLOCED)
 #define REQ_COPY_USER		(1ULL << __REQ_COPY_USER)
-#define REQ_FLUSH		(1ULL << __REQ_FLUSH)
+#define REQ_PREFLUSH		(1ULL << __REQ_PREFLUSH)
 #define REQ_FLUSH_SEQ		(1ULL << __REQ_FLUSH_SEQ)
 #define REQ_IO_STAT		(1ULL << __REQ_IO_STAT)
 #define REQ_MIXED_MERGE		(1ULL << __REQ_MIXED_MERGE)
-#define REQ_SECURE		(1ULL << __REQ_SECURE)
 #define REQ_PM			(1ULL << __REQ_PM)
 #define REQ_HASHED		(1ULL << __REQ_HASHED)
 #define REQ_MQ_INFLIGHT		(1ULL << __REQ_MQ_INFLIGHT)
 
-#define REQ_REPORT_ZONES	(1ULL << __REQ_REPORT_ZONES)
-#define REQ_OPEN_ZONE		(1ULL << __REQ_OPEN_ZONE)
-#define REQ_CLOSE_ZONE		(1ULL << __REQ_CLOSE_ZONE)
-#define REQ_RESET_ZONE		(REQ_REPORT_ZONES)
+enum req_op {
+	REQ_OP_READ,
+	REQ_OP_WRITE,
+	REQ_OP_ZONE_REPORT,
+	REQ_OP_ZONE_OPEN,
+	REQ_OP_ZONE_CLOSE,
+	REQ_OP_ZONE_FINISH,
+	REQ_OP_ZONE_RESET,
+	REQ_OP_DISCARD,		/* request to discard sectors */
+	REQ_OP_SECURE_ERASE,	/* request to securely erase sectors */
+	REQ_OP_WRITE_SAME,	/* write same block many times */
+	REQ_OP_FLUSH,		/* request for cache flush */
+};
 
+#define REQ_OP_BITS 4
 
 typedef unsigned int blk_qc_t;
 #define BLK_QC_T_NONE	-1U

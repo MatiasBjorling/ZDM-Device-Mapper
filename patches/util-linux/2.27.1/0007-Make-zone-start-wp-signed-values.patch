@@ -1,0 +1,62 @@
+From 6dc0a2f37f42840fb30974e779a49090d127fcd6 Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun@tancheff.com>
+Date: Sun, 11 Sep 2016 16:09:38 -0500
+Subject: [PATCH 7/7] Make zone start / wp signed values.
+
+---
+ sys-utils/blkreport.c | 19 +++++++++++--------
+ 1 file changed, 11 insertions(+), 8 deletions(-)
+
+diff --git a/sys-utils/blkreport.c b/sys-utils/blkreport.c
+index b22b3f2..43aaf32 100644
+--- a/sys-utils/blkreport.c
++++ b/sys-utils/blkreport.c
+@@ -305,7 +305,6 @@ static void test_endian(struct bdev_zone_report * info)
+ 	if ( len == 0x080000 ||
+ 	     len == 0x100000 ||
+ 	     len == 0x200000 ||
+-	     len == 0x300000 ||
+ 	     len == 0x400000 ||
+ 	     len == 0x800000 ) {
+ 		fprintf(stdout, "Detected length: 0x%"PRIu64
+@@ -337,6 +336,10 @@ static void print_zones(struct bdev_zone_report * info, uint32_t size)
+ 	uint32_t max_count;
+ 	uint32_t iter;
+ 	int same_code = info->same_field & 0x0f;
++	const char *fmtx = "  start: %9"PRIx64", len %7"PRIx64", wptr %8"PRIx64
++		           " reset:%u non-seq:%u, zcond:%2u(%s) [type: %u(%s)]\n";
++	const char *fmti = "  start: %9"PRIi64", len %7"PRIi64", wptr %8"PRIi64
++		           " reset:%u non-seq:%u, zcond:%2u(%s) [type: %u(%s)]\n";
+ 
+ 	fprintf(stdout, "  count: %u, same %u (%s), max_lba %lu\n",
+ 		count,
+@@ -355,19 +358,19 @@ static void print_zones(struct bdev_zone_report * info, uint32_t size)
+ 		struct bdev_zone_descriptor * entry = &info->descriptors[iter];
+ 		unsigned int type  = entry->type & 0xF;
+ 		unsigned int flags = entry->flags;
+-		uint64_t start = endian64(entry->lba_start);
+-		uint64_t wp = endian64(entry->lba_wptr);
++		int64_t start = endian64(entry->lba_start);
++		int64_t wp = endian64(entry->lba_wptr);
+ 		uint8_t cond = (flags & 0xF0) >> 4;
+ 		uint64_t len = endian64(entry->length);
++		const char *fmt = (start < 0) ? fmti : fmtx;
+ 
+ 		if (!len) {
+ 			break;
+ 		}
+-		fprintf(stdout,
+-			"  start: %9lx, len %7lx, wptr %8lx"
+-			" reset:%u non-seq:%u, zcond:%2u(%s) [type: %u(%s)]\n",
+-		start, len, wp - start, flags & 0x01, (flags & 0x02) >> 1,
+-		cond, zone_condition_str(cond), type, type_text[type]);
++
++		fprintf(stdout, fmt, start, len, wp - start,
++			flags & 0x01, (flags & 0x02) >> 1,
++			cond, zone_condition_str(cond), type, type_text[type]);
+ 	}
+ }
+ 
+-- 
+2.9.3
+

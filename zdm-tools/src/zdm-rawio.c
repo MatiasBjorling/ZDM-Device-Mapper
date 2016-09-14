@@ -370,7 +370,7 @@ int zbc_example_io(int fd, u32 flgs, u32 blksz, u32 start_zone, u32 count, int v
 
     if (flgs)
     {
-        wp_err = zdm_zone_command(fd, BLKRESETZONE, s_addr, do_ata);
+        wp_err = zdm_zone_command(fd, ZONE_ACTION_RESET, s_addr, do_ata);
         if (wp_err)
         {
             printf("Reset All WP: %" PRIx64 " -> %d failed.\n", s_addr, wp_err);
@@ -385,7 +385,7 @@ int zbc_example_io(int fd, u32 flgs, u32 blksz, u32 start_zone, u32 count, int v
 
         if (flgs)
         {
-            wp_err = zdm_zone_command(fd, BLKOPENZONE, s_addr, do_ata);
+            wp_err = zdm_zone_command(fd, ZONE_ACTION_OPEN, s_addr, do_ata);
             if (wp_err)
             {
                 printf("Open Zone %" PRIu64 " @ %" PRIx64 " -> %d failed.\n",
@@ -406,7 +406,7 @@ int zbc_example_io(int fd, u32 flgs, u32 blksz, u32 start_zone, u32 count, int v
 
         if (flgs)
         {
-            wp_err = zdm_zone_command(fd, BLKCLOSEZONE, s_addr, do_ata);
+            wp_err = zdm_zone_command(fd, ZONE_ACTION_CLOSE, s_addr, do_ata);
             if (wp_err)
             {
                 printf("Close Zone %" PRIu64 " @ %" PRIx64 " -> %d failed.\n", zone, s_addr, wp_err);
