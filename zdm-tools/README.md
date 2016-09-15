@@ -141,12 +141,10 @@ If not, please see http://www.gnu.org/licenses/.
 ## ZDM Linux Kernel
 
   - Patches
-    * v4.8-rc6 [ZDM r119 patches for linux v4.8-rc6](/patches/linux/v4.8+ZDM-r119)
+    * v4.8-rc6 [ZDM r120 patches for linux v4.8-rc6](/patches/linux/v4.8+ZDM-r120)
 
-## Observations and Known Issues in this release (#119)
+## Observations and Known Issues in this release (#120)
 
-  - Bug: Very random workloads can cause cache buffers to overflow.
-    * Fixed in r120.
   - Notice for MD-RAID level 4/5/6. The bio queue feature is off by default.
     * Workaround: Add -q1 to zdmadm command-line when creating and restoring
       ZDM instances.
@@ -247,3 +245,6 @@ If not, please see http://www.gnu.org/licenses/.
   - ZDM #119
     * Updated to 4.8 kerenl.
     * Numerous bug fixes and stability enhancements.
+
+  - ZDM #120
+    * Bug fix: Dynamically expand extent cache.
