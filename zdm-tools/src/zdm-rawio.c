@@ -370,7 +370,7 @@ int zbc_example_io(int fd, u32 flgs, u32 blksz, u32 start_zone, u32 count, int v
 
     if (flgs)
     {
-        wp_err = zdm_zone_command(fd, ZONE_ACTION_RESET, s_addr, do_ata);
+        wp_err = zdm_zone_reset_wp(fd, s_addr);
         if (wp_err)
         {
             printf("Reset All WP: %" PRIx64 " -> %d failed.\n", s_addr, wp_err);
@@ -383,17 +383,17 @@ int zbc_example_io(int fd, u32 flgs, u32 blksz, u32 start_zone, u32 count, int v
     {
         s_addr = zone << 19;
 
-        if (flgs)
-        {
-            wp_err = zdm_zone_command(fd, ZONE_ACTION_OPEN, s_addr, do_ata);
-            if (wp_err)
-            {
-                printf("Open Zone %" PRIu64 " @ %" PRIx64 " -> %d failed.\n",
-                       zone, s_addr, wp_err);
-                rcode = wp_err;
-                goto out;
-            }
-        }
+//        if (flgs)
+//        {
+//            wp_err = zdm_zone_command(fd, ZONE_ACTION_OPEN, s_addr, do_ata);
+//            if (wp_err)
+//            {
+//                printf("Open Zone %" PRIu64 " @ %" PRIx64 " -> %d failed.\n",
+//                       zone, s_addr, wp_err);
+//                rcode = wp_err;
+//                goto out;
+//            }
+//        }
 
         wp_err = zbc_fill_zone(fd, s_addr, blksz, verbose);
         if (wp_err)
@@ -404,16 +404,16 @@ int zbc_example_io(int fd, u32 flgs, u32 blksz, u32 start_zone, u32 count, int v
             goto out;
         }
 
-        if (flgs)
-        {
-            wp_err = zdm_zone_command(fd, ZONE_ACTION_CLOSE, s_addr, do_ata);
-            if (wp_err)
-            {
-                printf("Close Zone %" PRIu64 " @ %" PRIx64 " -> %d failed.\n", zone, s_addr, wp_err);
-                rcode = wp_err;
-                goto out;
-            }
-        }
+//        if (flgs)
+//        {
+//            wp_err = zdm_zone_command(fd, ZONE_ACTION_CLOSE, s_addr, do_ata);
+//            if (wp_err)
+//            {
+//                printf("Close Zone %" PRIu64 " @ %" PRIx64 " -> %d failed.\n", zone, s_addr, wp_err);
+//                rcode = wp_err;
+//                goto out;
+//            }
+//        }
     }
 
 out:

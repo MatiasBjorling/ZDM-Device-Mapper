@@ -538,11 +538,7 @@ static inline void * page_address(void *pgs) { return pgs; }
 u64 zdm_mcache_find_gen(struct zdm *mz, u64 base, int opt, u64 * out);
 u64 zdm_mcache_greatest_gen(struct zdm * mz, int at, u64 *_a, u64 *_b);
 int dmz_report_zones(struct zdm *znd, u64 z_id, void *pgs, size_t bufsz);
-int zdm_reset_wp(struct zdm * znd, u64 z_id);
-int zdm_close(struct zdm * znd, u64 z_id);
-int zdm_open(struct zdm * znd, u64 z_id);
 int zdm_zoned_inq(struct zdm *znd);
-int zdm_zone_command(int fd, int command, uint64_t lba, int do_ata);
 
 struct zdm * zdm_acquire(int fd, char * name);
 struct zdm * zoned_alloc(int fd, char * name);

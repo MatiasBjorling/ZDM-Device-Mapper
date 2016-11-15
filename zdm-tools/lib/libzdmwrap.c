@@ -36,6 +36,8 @@
 #include "libzdmwrap.h"
 #include "zbc-ctrl.h"
 
+int zdm_reset_wp_wrap(struct zdm * znd, u64 z_id);
+
 static int __debug_state = 0;
 
 int _debug(void)
@@ -77,17 +79,17 @@ static int is_zoned_inquiry(struct zdm *znd)
 
 static int dmz_reset_wp(struct zdm * znd, u64 z_id)
 {
-	return zdm_reset_wp(znd, z_id);
+	return zdm_reset_wp_wrap(znd, z_id);
 }
 
 static int dmz_open_zone(struct zdm * znd, u64 z_id)
 {
-	return zdm_open(znd, z_id);
+	return 0;
 }
 
 static int dmz_close_zone(struct zdm * znd, u64 z_id)
 {
-	return zdm_close(znd, z_id);
+	return 0;
 }
 
 static void on_timeout_activity(struct zdm * znd, int delay)
@@ -159,7 +161,7 @@ u64 zdm_mcache_find_gen(struct zdm *mz, u64 base, int opt, u64 * out)
 	return zdm_mcache_find_gen(mz, base, opt, out);
 }
 
-int zdm_zone_ctrl(struct zdm * znd, u64 z_id, int command_id)
+int zdm_reset_wp_wrap(struct zdm * znd, u64 z_id)
 {
 	int wp_err = 0;
 	int fd = znd->ti->fd;
@@ -168,9 +170,8 @@ int zdm_zone_ctrl(struct zdm * znd, u64 z_id, int command_id)
 		u64 mapped_zoned = z_id + znd->zdstart;
 		u64 lba = Z_BLKSZ * mapped_zoned;
 		u64 s_addr = lba * Z_BLOCKS_PER_DM_SECTOR;
-		int do_ata = znd->ata_passthrough;
 
-		wp_err = zdm_zone_command(fd, command_id, s_addr, do_ata);
+		wp_err = zdm_zone_reset_wp(fd, s_addr);
 		if (wp_err) {
 			Z_ERR(znd, "Reset WP: %" PRIx64 " -> %d failed.",
 			       s_addr, wp_err);
@@ -179,21 +180,6 @@ int zdm_zone_ctrl(struct zdm * znd, u64 z_id, int command_id)
 		}
 	}
 	return wp_err;
-}
-
-int zdm_reset_wp(struct zdm * znd, u64 z_id)
-{
-	return zdm_zone_ctrl(znd, z_id, ZONE_ACTION_RESET);
-}
-
-int zdm_close(struct zdm * znd, u64 z_id)
-{
-	return zdm_zone_ctrl(znd, z_id, ZONE_ACTION_CLOSE);
-}
-
-int zdm_open(struct zdm * znd, u64 z_id)
-{
-	return zdm_zone_ctrl(znd, z_id, ZONE_ACTION_OPEN);
 }
 
 int zdm_zoned_inq(struct zdm *znd)
@@ -393,14 +379,17 @@ int dmz_report_zones(struct zdm *znd, u64 z_id, void *pgs, size_t bufsz)
 {
 	int wp_err = 0;
 	int fd = znd->ti->fd;
+	struct blk_zone_report *report = pgs;
 
 	if (znd->bdev_is_zoned) {
 		u64 mapped_zoned = z_id + znd->zdstart;
 		u64 lba = Z_BLKSZ * mapped_zoned;
 		u64 s_addr = lba * Z_BLOCKS_PER_DM_SECTOR;
-		int do_ata = znd->ata_passthrough;
 
-		wp_err = zdm_report_zones(fd, pgs, bufsz, 0, s_addr, do_ata);
+		report->nr_zones = (bufsz - sizeof(struct blk_zone_report)) >> 19;
+		report->sector = s_addr;
+
+		wp_err = zdm_report_zones(fd, report);
 		if (wp_err) {
 			Z_ERR(znd, "Zone Report: %" PRIx64 " -> %d failed.",
 			       s_addr, wp_err);

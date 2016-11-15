@@ -152,21 +152,21 @@ static inline u16 zc_get_word(u8 *buf)
 
 static int do_sg_io_inq(int fd, u8 *cdb, int cdb_sz, u8 *buf, int bufsz, u8 *sense, int s_sz)
 {
-        sg_io_hdr_t io_hdr;
+	sg_io_hdr_t io_hdr;
 
-        memset(&io_hdr, 0, sizeof(io_hdr));
-        io_hdr.interface_id    = 'S';
-        io_hdr.timeout         = 20000;
-        io_hdr.flags           = 0; //SG_FLAG_DIRECT_IO;
-        io_hdr.cmd_len         = cdb_sz;
-        io_hdr.cmdp            = cdb;
-        io_hdr.dxfer_direction = SG_DXFER_FROM_DEV;
-        io_hdr.dxfer_len       = bufsz;
-        io_hdr.dxferp          = buf;
-        io_hdr.mx_sb_len       = s_sz;
-        io_hdr.sbp             = sense;
+	memset(&io_hdr, 0, sizeof(io_hdr));
+	io_hdr.interface_id    = 'S';
+	io_hdr.timeout         = 20000;
+	io_hdr.flags           = 0; //SG_FLAG_DIRECT_IO;
+	io_hdr.cmd_len         = cdb_sz;
+	io_hdr.cmdp            = cdb;
+	io_hdr.dxfer_direction = SG_DXFER_FROM_DEV;
+	io_hdr.dxfer_len       = bufsz;
+	io_hdr.dxferp          = buf;
+	io_hdr.mx_sb_len       = s_sz;
+	io_hdr.sbp             = sense;
 
-        return ioctl(fd, SG_IO, &io_hdr);
+	return ioctl(fd, SG_IO, &io_hdr);
 }
 
 
@@ -230,29 +230,16 @@ uint32_t zdm_device_inquiry(int fd, int do_ata)
 	return ~0u;
 }
 
-int zdm_zone_command(int fd, int command, uint64_t lba, int do_ata)
+int zdm_reset_wp(int fd, uint64_t lba)
 {
-	struct bdev_zone_action za;
+	struct blk_zone_range za;
 	uint64_t iolba = lba;
 	int rc;
 
+	za.sector = iolba;
+	za.nr_sectors = 1 << 19;
 
-	za.zone_locator_lba = iolba;
-	za.all_zones = 0;
-	if (iolba == ~0ul) {
-		za.zone_locator_lba = 0;
-		za.all_zones = 1;
-	}
-
-	if (do_ata)
-		za.zone_locator_lba |= 1;
-	else
-		za.zone_locator_lba &= ~1ul;
-
-	za.action = command;
-	za.force_unit_access = 1;
-
-	rc = ioctl(fd, BLKZONEACTION, &za);
+	rc = ioctl(fd, BLKRESETZONE, &za);
 	if (rc == -1) {
 		fprintf(stderr, "ERR: %d -> %s\n\n", errno, strerror(errno));
 	}
@@ -262,111 +249,52 @@ int zdm_zone_command(int fd, int command, uint64_t lba, int do_ata)
 
 int zdm_zone_close(int fd, uint64_t lba, int do_ata)
 {
-	return zdm_zone_command(fd, ZONE_ACTION_CLOSE, lba, do_ata);
+	return 0;
 }
 
 int zdm_zone_finish(int fd, uint64_t lba, int do_ata)
 {
-	return zdm_zone_command(fd, ZONE_ACTION_FINISH, lba, do_ata);
+	return 0;
 }
 
 int zdm_zone_open(int fd, uint64_t lba, int do_ata)
 {
-	return zdm_zone_command(fd, ZONE_ACTION_OPEN, lba, do_ata);
+	return 0;
 }
 
-int zdm_zone_reset_wp(int fd, uint64_t lba, int do_ata)
+int zdm_zone_reset_wp(int fd, uint64_t lba)
 {
-	return zdm_zone_command(fd, ZONE_ACTION_RESET, lba, do_ata);
+	return zdm_reset_wp(fd, lba);
 }
 
-
-static int fix_endian = 0;
-
-static u64 endian64(u64 in)
+void print_zones(struct blk_zone_report *zone_info)
 {
-	return fix_endian ? be64toh(in) : in;
-}
-
-static u32 endian32(u32 in)
-{
-	return fix_endian ? be32toh(in) : in;
-}
-
-static void test_endian(struct bdev_zone_report *info)
-{
-	fix_endian = zdm_is_big_endian_report(info);
-}
-
-void print_zones(struct bdev_zone_report *info, uint32_t size)
-{
-	u32 count = endian32(info->descriptor_count);
-	u32 max_count;
 	int iter;
-	int same_code = info->same_field & 0x0f;
+	u32 count = zone_info->nr_zones;
 
-	fprintf(stdout, "  count: %u, same %u (%s), max_lba %lu\n",
-		count,
-		same_code, same_text[same_code],
-		endian64(info->maximum_lba & (~0ul >> 16)) );
-
-	max_count = (size - sizeof(struct bdev_zone_report))
-                        / sizeof(struct bdev_zone_descriptor);
-	if (count > max_count) {
-		fprintf(stderr, "Truncating report to %d of %d zones.\n",
-			max_count, count );
-		count = max_count;
-	}
-
+	fprintf(stdout, "  count: %u\n", count);
 	for (iter = 0; iter < count; iter++ ) {
-		struct bdev_zone_descriptor * entry =
-			&info->descriptors[iter];
-		unsigned int type  = entry->type & 0xF;
-		unsigned int flags = entry->flags;
-		u64 start = endian64(entry->lba_start);
-		u64 wp = endian64(entry->lba_wptr);
+		struct blk_zone * entry = &zone_info->zones[iter];
+		u64 start = entry->start;
+		u64 len   = entry->len;
+		u64 wp    = entry->wp;
+
+
+		
 
 		fprintf(stdout,
-			"  start: %lx, len %lx, wptr %lx\n"
+			"  start: %"PRIx64", len %"PRIx64", wptr %"PRIx64"\n"
 			"   type: %u(%s) reset:%u non-seq:%u, zcond:%u\n",
-		start, endian64(entry->length), wp - start,
-		type, type_text[type],
-		flags & 0x01, (flags & 0x02) >> 1, (flags & 0xF0) >> 4);
+		start, len, wp - start, entry->type, type_text[entry->type],
+		entry->reset, entry->non_seq, entry->cond);
 	}
 }
 
-int zdm_is_big_endian_report(struct bdev_zone_report *info)
-{
-	int is_big = 1;
-	struct bdev_zone_descriptor * entry = &info->descriptors[0];
-	u64 be_len;
-
-	be_len = entry->length;
-	if (be_len == 0x080000 ||
-	    be_len == 0x100000 ||
-	    be_len == 0x200000 ||
-	    be_len == 0x400000 ||
-	    be_len == 0x800000) {
-		is_big = 0;
-	}
-	return is_big;
-}
-
-int zdm_report_zones(int fd, struct bdev_zone_report_io *zone_info,
-		     uint64_t size, uint8_t option, uint64_t lba, int do_ata)
+int zdm_report_zones(int fd, struct blk_zone_report *zone_info)
 {
 	int rc;
-	uint32_t cmd = BLKREPORT;
 
-	zone_info->data.in.report_option     = option;
-	zone_info->data.in.return_page_count = size;
-	zone_info->data.in.zone_locator_lba  = lba;
-
-	if (do_ata) {
-		zone_info->data.in.report_option |= 0x80;
-	}
-
-	rc = ioctl(fd, cmd, zone_info);
+	rc = ioctl(fd, BLKREPORTZONE, zone_info);
 	if (rc == -1) {
 		fprintf(stderr, "ERR: %d -> %s\n\n", errno, strerror(errno));
 	}
@@ -377,39 +305,34 @@ int zdm_report_zones(int fd, struct bdev_zone_report_io *zone_info,
 int do_report_zones_ioctl(const char * pathname, uint64_t lba, int do_ata)
 {
 	int rc = -4;
-        int fd = open(pathname, O_RDWR);
-        if (fd != -1) {
-		struct bdev_zone_report_io *zone_info;
-                uint64_t size;
+	int fd = open(pathname, O_RDWR);
 
-		/* NOTE: 128 seems to be about the RELIABLE limit ...     */
-                /*       150 worked 180 was iffy (some or all ROs failed) */
-                /*       256 all ROs failed..                             */
-                size = 128 * 4096;
-                zone_info = malloc(size);
-                if (zone_info) {
-			int opt = 0;
-			for (opt = 0; opt < ARRAY_SIZE(r_opts); opt++) {
-				memset(zone_info, 0, size);
-				rc = zdm_report_zones(fd, zone_info, size, r_opts[opt], lba, do_ata);
-				if (rc != -1) {
-					test_endian(&zone_info->data.out);
+	if (fd != -1) {
+		struct blk_zone_report *zone_info;
+		u64 nr_zones = 4096;
+                uint64_t size = sizeof(struct blk_zone) * nr_zones;
 
-					fprintf(stdout, "%s(%d): found %d zones\n",
-						r_opt_text[opt],
-						r_opts[opt],
-						endian32(zone_info->data.out.descriptor_count) );
-					print_zones(&zone_info->data.out, size);
-				} else {
-					fprintf(stderr, "ERR: %d -> %s\n\n", errno, strerror(errno));
-					break;
-				}
+		zone_info = malloc(size + sizeof(struct blk_zone_report));
+		if (zone_info) {
+			memset(zone_info, 0, size);
+
+			zone_info->sector = lba;
+			zone_info->nr_zones = nr_zones;
+//			zone_info->future = r_opts[opt];
+
+			rc = zdm_report_zones(fd, zone_info);
+			if (rc != -1) {
+				fprintf(stdout, "found %d zones\n", zone_info->nr_zones);
+				print_zones(zone_info);
+			} else {
+				fprintf(stderr, "ERR: %d -> %s\n\n", errno, strerror(errno));
 			}
+			free(zone_info);
 		}
-                close(fd);
-        } else {
-                fprintf(stderr, "%s\n\n", strerror(errno));
-        }
+		close(fd);
+	} else {
+		fprintf(stderr, "%s\n\n", strerror(errno));
+	}
 
 	return rc;
 }

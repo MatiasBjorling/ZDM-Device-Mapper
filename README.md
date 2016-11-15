@@ -36,7 +36,7 @@ provided the required amount of conventional space is available.
 
 ## Software Requirements
 
-  - Current Linux Kernel v4.4 to v.4.8 with ZDM patches
+  - Current Linux Kernel v4.4 to v.4.10 with ZDM patches
   - Recommended: Util Linux with ZDM patches
   - Recommended: sg3utils (1.41 or later)
 
@@ -83,7 +83,7 @@ or
   - Partition the drive to start the partition at a WP boundary.
 ```
       parted -s /dev/sdX mklabel gpt
-      parted -s mkpart primary 1MiB -- -1
+      parted -s mkpart primary 256MiB -- -1
 ```
 
   - Place ZDM drive mapper on /dev/sdX
@@ -141,14 +141,17 @@ If not, please see http://www.gnu.org/licenses/.
 ## ZDM Linux Kernel
 
   - Patches
-    * v4.8-rc6 [ZDM r120 patches for linux v4.8-rc6](/patches/linux/v4.8+ZDM-r120)
+    * v4.8 [ZDM r127 patches for linux v4.8](/patches/linux/v4.8+ZDM-r127)
 
-## Observations and Known Issues in this release (#120)
+## Observations and Known Issues in this release (#127)
 
   - Notice for MD-RAID level 4/5/6. The bio queue feature is off by default.
-    * Workaround: Add -q1 to zdmadm command-line when creating and restoring
-      ZDM instances.
-    * Fix planned for r121.
+    * Workaround: Add -q 256 to zdmadm command-line when creating and restoring
+      ZDM instances. Can be changed at run-time.
+    * Data corruption has been noted with GC. Use --gc off to disable automatic
+      GC activity. Can be changed at run-time.
+    * Data corruption has been noted with metadata journaling. Use --journal-age 0
+      to disable metadata journaling. Can be changed at run-time.
 
 ## Changes from Initial Release
 
@@ -248,3 +251,10 @@ If not, please see http://www.gnu.org/licenses/.
 
   - ZDM #120
     * Bug fix: Dynamically expand extent cache.
+
+  - ZDM #127
+    * Incorported ZBC feature patches planned for v4.10
+    * Added dynamic configuration features such as:
+       * cache age and size
+       * GC on/off as well as GC profiles
+       * metadata journaling and aging

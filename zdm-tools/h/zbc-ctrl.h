@@ -22,46 +22,54 @@
 #define DEBUG 1
 
 #include <utypes.h>
-#include <linux/blkzoned_api.h>
-
-/**
- * struct bdev_zone_descriptor_le - See: bdev_zone_descriptor
- */
-struct bdev_zone_descriptor_le {
-	__u8 type;
-	__u8 flags;
-	__u8 reserved1[6];
-	__le64 length;
-	__le64 lba_start;
-	__le64 lba_wptr;
-	__u8 reserved[32];
-} __attribute__((packed));
-
-/**
- * struct bdev_zone_report_le - See: bdev_zone_report
- */
-struct bdev_zone_report_le {
-	__le32 descriptor_count;
-	__u8 same_field;
-	__u8 reserved1[3];
-	__le64 maximum_lba;
-	__u8 reserved2[48];
-	struct bdev_zone_descriptor_le descriptors[0];
-} __attribute__((packed));
-
-
+#include <linux/blkzoned.h>
 
 int zdm_is_ha_device(uint32_t, int verbose);
-int zdm_is_big_endian_report(struct bdev_zone_report *info);
 
 uint32_t zdm_device_inquiry(int fd, int do_ata);
-int zdm_zone_reset_wp(int fd, uint64_t lba, int do_ata);
-int zdm_report_zones(int fd, struct bdev_zone_report_io *zone_info,
-		     uint64_t size, uint8_t option, uint64_t lba, int do_ata);
 
-int zdm_zone_open(int fd, uint64_t lba, int do_ata);
-int zdm_zone_close(int fd, uint64_t lba, int do_ata);
-int zdm_zone_finish(int fd, uint64_t lba, int do_ata);
+int zdm_zone_reset_wp(int fd, uint64_t lba);
+int zdm_report_zones(int fd, struct blk_zone_report *zone_info);
 
+#define ZBC_REPORT_ZONE_PARTIAL 0x80
+
+/**
+ * enum zone_report_option - Report Zones types to be included.
+ *
+ * @ZBC_ZONE_REPORTING_OPTION_ALL: Default (all zones).
+ * @ZBC_ZONE_REPORTING_OPTION_EMPTY: Zones which are empty.
+ * @ZBC_ZONE_REPORTING_OPTION_IMPLICIT_OPEN:
+ *	Zones open but not explicitly opened
+ * @ZBC_ZONE_REPORTING_OPTION_EXPLICIT_OPEN: Zones opened explicitly
+ * @ZBC_ZONE_REPORTING_OPTION_CLOSED: Zones closed for writing.
+ * @ZBC_ZONE_REPORTING_OPTION_FULL: Zones that are full.
+ * @ZBC_ZONE_REPORTING_OPTION_READONLY: Zones that are read-only
+ * @ZBC_ZONE_REPORTING_OPTION_OFFLINE: Zones that are offline
+ * @ZBC_ZONE_REPORTING_OPTION_NEED_RESET_WP: Zones with Reset WP Recommended
+ * @ZBC_ZONE_REPORTING_OPTION_RESERVED: Zones that with Non-Sequential
+ *	Write Resources Active
+ * @ZBC_ZONE_REPORTING_OPTION_NON_WP: Zones that do not have Write Pointers
+ *	(conventional)
+ * @ZBC_ZONE_REPORTING_OPTION_RESERVED: Undefined
+ * @ZBC_ZONE_REPORTING_OPTION_PARTIAL: Modifies the definition of the Zone List
+ *	Length field.
+ *
+ * Used by Report Zones in bdev_zone_get_report: report_option
+ */
+enum zbc_zone_reporting_options {
+	ZBC_ZONE_REPORTING_OPTION_ALL = 0,
+	ZBC_ZONE_REPORTING_OPTION_EMPTY,
+	ZBC_ZONE_REPORTING_OPTION_IMPLICIT_OPEN,
+	ZBC_ZONE_REPORTING_OPTION_EXPLICIT_OPEN,
+	ZBC_ZONE_REPORTING_OPTION_CLOSED,
+	ZBC_ZONE_REPORTING_OPTION_FULL,
+	ZBC_ZONE_REPORTING_OPTION_READONLY,
+	ZBC_ZONE_REPORTING_OPTION_OFFLINE,
+	ZBC_ZONE_REPORTING_OPTION_NEED_RESET_WP = 0x10,
+	ZBC_ZONE_REPORTING_OPTION_NON_SEQWRITE,
+	ZBC_ZONE_REPORTING_OPTION_NON_WP = 0x3f,
+	ZBC_ZONE_REPORTING_OPTION_RESERVED = 0x40,
+	ZBC_ZONE_REPORTING_OPTION_PARTIAL = ZBC_REPORT_ZONE_PARTIAL
+};
 
 #endif /* _ZBC_CTRL_H_ */

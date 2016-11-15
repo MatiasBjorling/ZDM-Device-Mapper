@@ -1500,26 +1500,9 @@ out:
  */
 static u32 dmz_report_count(struct zdm *znd, void *rpt_in, size_t bufsz)
 {
-	u32 count;
-	u32 max_count = (bufsz - sizeof(struct bdev_zone_report))
-		      /	 sizeof(struct bdev_zone_descriptor);
+	struct blk_zone_report *rpt = rpt_in;
 
-	if (znd->ata_passthrough) {
-		struct bdev_zone_report_le *report = rpt_in;
-
-		/* ZAC: ata results are little endian */
-		if (max_count > le32_to_cpu(report->descriptor_count))
-			report->descriptor_count = cpu_to_le32(max_count);
-		count = le32_to_cpu(report->descriptor_count);
-	} else {
-		struct bdev_zone_report *report = rpt_in;
-
-		/* ZBC: scsi results are big endian */
-		if (max_count > be32_to_cpu(report->descriptor_count))
-			report->descriptor_count = cpu_to_be32(max_count);
-		count = be32_to_cpu(report->descriptor_count);
-	}
-	return count;
+	return rpt->nr_zones;
 }
 
 /**
@@ -1528,7 +1511,7 @@ static u32 dmz_report_count(struct zdm *znd, void *rpt_in, size_t bufsz)
  *
  * Return: 1 if zone type is conventional.
  */
-static inline int is_conventional(struct bdev_zone_descriptor *dentry)
+static inline int is_conventional(struct blk_zone *dentry)
 {
 	return (BLK_ZONE_TYPE_CONVENTIONAL == (dentry->type & 0x0F)) ? 1 : 0;
 }
@@ -1539,13 +1522,10 @@ static inline int is_conventional(struct bdev_zone_descriptor *dentry)
  *
  * Return: 1 if zone condition is empty or zone type is conventional.
  */
-static inline int is_zone_reset(struct bdev_zone_descriptor *dentry)
+static inline int is_zone_reset(struct blk_zone *dentry)
 {
-	u8 type = dentry->type & 0x0F;
-	u8 cond = (dentry->flags & 0xF0) >> 4;
-
-	return (BLK_ZONE_EMPTY == cond ||
-		BLK_ZONE_TYPE_CONVENTIONAL == type) ? 1 : 0;
+	return (BLK_ZONE_COND_EMPTY == dentry->cond ||
+		BLK_ZONE_TYPE_CONVENTIONAL == dentry->type) ? 1 : 0;
 }
 
 /**
@@ -1557,23 +1537,9 @@ static inline int is_zone_reset(struct bdev_zone_descriptor *dentry)
  */
 static inline u32 get_wp_from_descriptor(struct zdm *znd, void *dentry_in)
 {
-	u32 wp = 0;
+	struct blk_zone *zone = dentry_in;
 
-	/*
-	 * If ATA passthrough was used then ZAC results are little endian.
-	 * otherwise ZBC results are big endian.
-	 */
-
-	if (znd->ata_passthrough) {
-		struct bdev_zone_descriptor_le *lil = dentry_in;
-
-		wp = le64_to_cpu(lil->lba_wptr) - le64_to_cpu(lil->lba_start);
-	} else {
-		struct bdev_zone_descriptor *big = dentry_in;
-
-		wp = be64_to_cpu(big->lba_wptr) - be64_to_cpu(big->lba_start);
-	}
-	return wp;
+	return (u32)(zone->wp - zone->start);
 }
 
 /**
@@ -1600,7 +1566,7 @@ static int zoned_wp_sync(struct zdm *znd, int reset_non_empty)
 	int rcode = 0;
 	u32 rcount = 0;
 	u32 iter;
-	struct bdev_zone_report *report = NULL;
+	struct blk_zone_report *report = NULL;
 	int order = REPORT_ORDER;
 	size_t bufsz = REPORT_FILL_PGS * Z_C4K;
 	struct page *pgs = alloc_pages(GFP_KERNEL, order);
@@ -1618,14 +1584,15 @@ static int zoned_wp_sync(struct zdm *znd, int reset_non_empty)
 		u32 gzno  = iter >> 10;
 		u32 gzoff = iter & ((1 << 10) - 1);
 		struct meta_pg *wpg = &znd->wp[gzno];
-		struct bdev_zone_descriptor *dentry;
+		struct blk_zone *dentry;
 		u32 wp_flgs;
 		u32 wp_at;
 		u32 wp;
 
 		if (entry == 0) {
-			int err = dmz_report_zones(znd, iter, pgs, bufsz);
+			int err;
 
+			err = dmz_report_zones(znd, iter, pgs, bufsz);
 			if (err) {
 				Z_ERR(znd, "report zones-> %d", err);
 				if (err != -ENOTSUPP)
@@ -1635,7 +1602,7 @@ static int zoned_wp_sync(struct zdm *znd, int reset_non_empty)
 			rcount = dmz_report_count(znd, report, bufsz);
 		}
 
-		dentry = &report->descriptors[entry];
+		dentry = &report->zones[entry];
 		if (reset_non_empty && !is_conventional(dentry)) {
 			int err = 0;
 

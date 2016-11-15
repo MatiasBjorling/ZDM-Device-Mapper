@@ -34,6 +34,8 @@
 #include <string.h> // strdup
 #include <getopt.h>
 
+#include <libudev.h> // udev to find sysfs entries
+
 #include "libzdmwrap.h"
 #include "libzdm-compat.h"
 #include "zbc-ctrl.h"
@@ -67,6 +69,7 @@
 #define ZDMADM_PROBE 4
 #define ZDMADM_UNLOAD 5
 #define ZDMADM_WIPE 6
+#define ZDMADM_ADJUST 7
 
 
 #define ZDM_SBLK_VER_MAJOR 1
@@ -84,6 +87,27 @@
 #define MEDIA_HOST_MANAGED  (0x01 << 17)
 
 #define ZONE_SZ_IN_SECT 0x80000 /* 1 << 19 */
+
+enum lopt_t {
+	GC_OPT = 1,
+	GC_PRIO_DEF_OPT,
+	GC_PRIO_LOW_OPT,
+	GC_PRIO_HIGH_OPT,
+	GC_PRIO_CRIT_OPT,
+	GC_WM_CRIT_OPT,
+	GC_WM_HIGH_OPT,
+	GC_WM_LOW_OPT,
+	CACHE_TIMEOUT_OPT,
+	CACHE_SIZE_OPT,
+	CACHE_TO_PAGECACHE_OPT,
+	JOURNAL_AGE_OPT,
+};
+
+enum gc_opt_t {
+	GC_OFF = 0,
+	GC_ON,
+	GC_FORCE,
+};
 
 /**
  * A large randomish number to identify a ZDM partition
@@ -131,13 +155,112 @@ struct zdm_super_block {
 	uint32_t cache_reada;     /* number of block to read-ahead */
 	uint32_t cache_ageout_ms; /* number of ms before droping */
 	uint32_t cache_to_pagecache;  /* if dropping through page-cache */
-	uint8_t  padding[264]; /* pad to 512 bytes */
+	uint32_t journal_age;  /* if dropping through page-cache */
+	uint8_t  padding[260]; /* pad to 512 bytes */
 };
 typedef struct zdm_super_block zdm_super_block_t;
 
+
+int read_zoned(const char * syspath)
+{
+	FILE *fp;
+	char pathbuf[1024];
+	char fbuf[1024];
+	int zoned = 0;
+
+	snprintf(pathbuf, sizeof(pathbuf), "%s/queue/zoned", syspath);
+	fp = fopen(pathbuf, "r");
+	if (fp) {
+		if (fread(fbuf, 1, sizeof(fbuf), fp) > 0) {
+			if (strncasecmp("none", fbuf, 4) != 0)
+				zoned = 1;
+		}
+		fclose(fp);
+	}
+	return zoned;
+}
+
+
+unsigned long read_chunk_size(const char * syspath)
+{
+	FILE *fp;
+	char pathbuf[1024];
+	char fbuf[1024];
+	unsigned long zoned = 0;
+
+	snprintf(pathbuf, sizeof(pathbuf), "%s/queue/chunk_sectors", syspath);
+	fp = fopen(pathbuf, "r");
+	if (fp) {
+		if (fread(fbuf, 1, sizeof(fbuf), fp) > 0)
+			zoned = strtoul(fbuf, NULL, 10);
+		fclose(fp);
+	}
+	return zoned;
+}
+
+#define DT_BLOCK 0x62 /* pfm? */
+
+/*
+ * Mapping /dev/sdXn -> /sys/block/sdX to read the
+ *    zoned, and chunk_size files
+ *
+ *  fstat() -> S_ISBLK()
+ *    -> st_dev -> 12 bits major, 20 bits minor
+ *
+ *  int major_no = major(stat.st_dev);
+ *  int minor_no = minor(stat.st_dev);
+ *  int block_no = minor_no & ~0x0f
+ *
+ *  dev_t dev_no makedev(major_no, block_no);
+ *
+ *  udev_device_new_from_devnum(udev,
+ *
+ */
+static unsigned long get_zone_size(const char *dname)
+{
+	unsigned long chunk_size = 0;
+	int is_partition = 1;
+	struct stat st_buf;
+
+	if (stat(dname, &st_buf) == 0) {
+		if (S_ISBLK(st_buf.st_mode)) {
+			int major_no = MAJOR(st_buf.st_rdev);
+			int minor_no = minor(st_buf.st_rdev);
+			int block_no = minor_no & ~0x0f;
+			dev_t dev_no = makedev(major_no, block_no);
+			struct udev *udev;
+			struct udev_device *dev;
+			int is_zoned_flag;
+			const char *syspath;
+
+			if (block_no == minor_no) {
+				is_partition = 0;
+			}
+
+			/* Create the udev object */
+			udev = udev_new();
+			if (!udev) {
+				printf("Can't create udev\n");
+				return 0;
+			}
+
+			dev = udev_device_new_from_devnum(udev, DT_BLOCK, dev_no);
+			if (dev) {
+				syspath = udev_device_get_syspath(dev);
+				is_zoned_flag = read_zoned(syspath);
+				if (is_zoned_flag)
+					chunk_size = read_chunk_size(syspath);
+
+				udev_device_unref(dev);
+			}
+			udev_unref(udev);
+		}
+	}
+	return chunk_size;
+}
+
 /**
- * A 64bit CRC. Overkill but it looked nice,
- *   inspired by btrfs-tools via util-linux
+ * A 32bit CRC.
  */
 static uint64_t zdm_crc32(zdm_super_block_t *sblk)
 {
@@ -211,6 +334,21 @@ static void zdmadm_show(const char * dname, zdm_super_block_t *sblk)
 	printf("zac/zbc - ZAC: %s / ZBC: %s\n",
 		sblk->zac_zbc & MEDIA_ZAC ? "Yes" : "No",
 		sblk->zac_zbc & MEDIA_ZBC ? "Yes" : "No" );
+
+	printf("is_meta - %d\n", sblk->is_meta);
+	printf("---\n");
+	printf("io queue depth:            %u\n", sblk->io_queue);
+	printf("gc prio def/low/high/crit: 0x%04x/0x%04x/0x%04x/0x%04x\n",
+		sblk->gc_prio_def,  sblk->gc_prio_low,
+		sblk->gc_prio_high, sblk->gc_prio_crit);
+	printf("gc wm low/high/crit:       %u%%/%u%%/%u\n",
+		sblk->gc_wm_low, sblk->gc_wm_high, sblk->gc_wm_crit);
+	printf("gc state:                  %u\n", sblk->gc_status);
+	printf("cache size:                %u\n", sblk->cache_size);
+	printf("cache read ahead:          %u\n", sblk->cache_reada);
+	printf("cache ageout:              %u (ms)\n", sblk->cache_ageout_ms);
+	printf("cache to pagecache:        %u\n", sblk->cache_to_pagecache);
+	printf("metadata journal age:      %u\n", sblk->journal_age);
 }
 
 /**
@@ -220,6 +358,7 @@ static int is_part(const char *dname)
 {
 	int is_partition = 1;
 	struct stat st_buf;
+
 	if (stat(dname, &st_buf) == 0) {
 		if ( ((MAJOR(st_buf.st_rdev) == HD_MAJOR &&
 		      (MINOR(st_buf.st_rdev) % 64) == 0))
@@ -869,7 +1008,7 @@ static inline int is_conv_or_relaxed(unsigned int type)
  * @pref: # FWD/REV + CRC blks (in zones) + cache blocks (in zones).
  *
  * NOTE: cache blocks and CRC blocks are rounded up and reported as # of zones.
- * 
+ *
  */
 static int minimums(u64 ssize, u64 zonesz, u64 *mzc, u64 * cache, u64 * min, u64 * pref)
 {
@@ -891,26 +1030,28 @@ static int minimums(u64 ssize, u64 zonesz, u64 *mzc, u64 * cache, u64 * min, u64
 int zdmadm_probe_zones(int fd, zdm_super_block_t * sblk, int verbose)
 {
 	int rcode = 0;
-	size_t size = 128 * 4096;
-	struct bdev_zone_report_io *report = malloc(size);
+	unsigned int nz = 4096;
+	size_t size = sizeof(struct blk_zone) * nz;
+	struct blk_zone_report *report = malloc(size + sizeof(*report));
+
 	if (report) {
-		int opt = ZBC_ZONE_REPORTING_OPTION_ALL;
 		u64 lba = sblk->sect_start;
-		int do_ata = (sblk->zac_zbc & MEDIA_ZAC) ? 1 : 0;
 
 		memset(report, 0, size);
-		rcode = zdm_report_zones(fd, report, size, opt, lba, do_ata);
+		report->sector = lba;
+		report->nr_zones = nz;
+//		report->future = opt;
+		rcode = zdm_report_zones(fd, report);
 		if (rcode < 0) {
 			printf("report zones failure: %d\n", rcode);
 		} else  {
 			int zone = 0;
 			int zone_absolute_start = 0;
-			struct bdev_zone_report *info = &report->data.out;
-			struct bdev_zone_descriptor *entry = &info->descriptors[zone];
-			int is_be = zdm_is_big_endian_report(info);
-			s64 fz_at = is_be ? be64toh(entry->lba_start) : entry->lba_start;
-			u64 fz_sz = is_be ? be64toh(entry->length) : entry->length;
-			unsigned int type = entry->type & 0xF;
+			struct blk_zone_report *info = report;
+			struct blk_zone *entry = &info->zones[zone];
+			s64 fz_at = entry->start;
+			u64 fz_sz = entry->len;
+			unsigned int type = entry->type;
 			u64 cache, need, pref;
 			u64 mdzcount = 0;
 			u64 nmegaz = 0;
@@ -933,9 +1074,9 @@ int zdmadm_probe_zones(int fd, zdm_super_block_t * sblk, int verbose)
 			while (fz_at < sblk->sect_start) {
 				if (verbose)
 					printf("Finding first zone *AFTER START OF PARTITION*\n");
-				entry = &info->descriptors[++zone];
-				fz_at = is_be ? be64toh(entry->lba_start) : entry->lba_start;
-				fz_sz = is_be ? be64toh(entry->length) : entry->length;
+				entry = &info->zones[++zone];
+				fz_at = entry->start;
+				fz_sz = entry->len;
 			}
 			if (verbose) {
 				printf("LBA start of first zone: %6" PRIx64 " Z# %d\n", fz_at, zone);
@@ -945,9 +1086,9 @@ int zdmadm_probe_zones(int fd, zdm_super_block_t * sblk, int verbose)
 			while (sblk->sect_start >= fz_at) {
 				if (verbose)
 					printf("Skipping forward\n");
-				entry = &info->descriptors[++zone];
-				fz_at = is_be ? be64toh(entry->lba_start) : entry->lba_start;
-				fz_sz = is_be ? be64toh(entry->length) : entry->length;
+				entry = &info->zones[++zone];
+				fz_at = entry->start;
+				fz_sz = entry->len;
 			}
 			if (verbose) {
 				printf("LBA start of first zone: %6" PRIx64 " Z# %d\n", fz_at, zone);
@@ -964,9 +1105,9 @@ int zdmadm_probe_zones(int fd, zdm_super_block_t * sblk, int verbose)
 			for (; mdzcount < pref && zone < 200; zone++) {
 				u64 length;
 
-				entry = &info->descriptors[zone];
-				length = is_be ? be64toh(entry->length) : entry->length;
-				type = entry->type & 0xF;
+				entry = &info->zones[zone];
+				length = entry->len;
+				type = entry->type;
 
 				if ( !is_conv_or_relaxed(type) ) {
 					printf("Unsupported device: ZDM first zone must be conventional"
@@ -1319,6 +1460,135 @@ out:
 	return rc;
 }
 
+int zdmadm_modify(const char *dname, zdm_super_block_t *sblk, int updatesb, int verbose)
+{
+	int rc = 0;
+	char cmd[1024];
+	char *zname;
+	const char *fmt_d = "dmsetup message \"zdm_%s\" 0 %s=%u";
+
+	if (strlen(sblk->label) > 0) {
+		zname = sblk->label;
+	} else {
+		zname = strrchr(dname, '/');
+		if (zname) {
+			if (*zname == '/') {
+				zname++;
+			}
+		} else {
+			rc = -1;
+			printf("Invalid argument. Need valid dname or zname\n");
+			goto out;
+		}
+	}
+
+
+	if (updatesb) {
+		off_t lba = 0ul;
+		zdm_super_block_t * data = malloc(Z_C4K);
+		int fd;
+
+		fd = open(dname, O_RDWR);
+		if (fd < 0) {
+			perror("Failed to open device for RW");
+			printf("ZDM disk open RDWR failed: %s\n", dname);
+			rc = -1;
+			goto out;
+		}
+
+		memset(data, 0, Z_C4K);
+		memcpy(data, sblk, sizeof(*sblk));
+
+		rc = pwrite64(fd, data, Z_C4K, lba);
+		if (rc != Z_C4K) {
+			fprintf(stderr, "write error: %d writing %" PRIx64 "\n",
+				rc, lba);
+			rc = -1;
+			goto out;
+		}
+
+		fsync(fd);
+		close(fd);
+	}
+
+	snprintf(cmd, sizeof(cmd), fmt_d, zname, "queue-depth", sblk->io_queue);
+	if (verbose)
+		printf("%s\n", cmd);
+	rc = system(cmd);
+	if (rc)
+		goto out;
+
+	snprintf(cmd, sizeof(cmd), fmt_d, zname, "gc-prio-def", sblk->gc_prio_def);
+	if (verbose) printf("%s\n", cmd);
+	rc = system(cmd);
+	if (rc) goto out;
+
+	snprintf(cmd, sizeof(cmd), fmt_d, zname, "gc-prio-low", sblk->gc_prio_low);
+	if (verbose) printf("%s\n", cmd);
+	rc = system(cmd);
+	if (rc) goto out;
+
+	snprintf(cmd, sizeof(cmd), fmt_d, zname, "gc-prio-high", sblk->gc_prio_high);
+	if (verbose) printf("%s\n", cmd);
+	rc = system(cmd);
+	if (rc) goto out;
+
+	snprintf(cmd, sizeof(cmd), fmt_d, zname, "gc-prio-crit", sblk->gc_prio_crit);
+	if (verbose) printf("%s\n", cmd);
+	rc = system(cmd);
+	if (rc) goto out;
+
+	snprintf(cmd, sizeof(cmd), fmt_d, zname, "gc-wm-crit", sblk->gc_wm_crit);
+	if (verbose) printf("%s\n", cmd);
+	rc = system(cmd);
+	if (rc) goto out;
+
+	snprintf(cmd, sizeof(cmd), fmt_d, zname, "gc-wm-high", sblk->gc_wm_high);
+	if (verbose) printf("%s\n", cmd);
+	rc = system(cmd);
+	if (rc) goto out;
+
+	snprintf(cmd, sizeof(cmd), fmt_d, zname, "gc-wm-low", sblk->gc_wm_low);
+	if (verbose) printf("%s\n", cmd);
+	rc = system(cmd);
+	if (rc) goto out;
+
+	snprintf(cmd, sizeof(cmd), fmt_d, zname, "gc-status", sblk->gc_status);
+	if (verbose) printf("%s\n", cmd);
+	rc = system(cmd);
+	if (rc) goto out;
+
+	snprintf(cmd, sizeof(cmd), fmt_d, zname, "cache-ageout-ms", sblk->cache_ageout_ms);
+	if (verbose) printf("%s\n", cmd);
+	rc = system(cmd);
+	if (rc) goto out;
+
+	snprintf(cmd, sizeof(cmd), fmt_d, zname, "cache-size", sblk->cache_size);
+	if (verbose) printf("%s\n", cmd);
+	rc = system(cmd);
+	if (rc) goto out;
+
+	snprintf(cmd, sizeof(cmd), fmt_d, zname, "cache-to-pagecache", sblk->cache_to_pagecache);
+	if (verbose) printf("%s\n", cmd);
+	rc = system(cmd);
+	if (rc) goto out;
+
+	snprintf(cmd, sizeof(cmd), fmt_d, zname, "cache-reada", sblk->cache_reada);
+	if (verbose) printf("%s\n", cmd);
+	rc = system(cmd);
+	if (rc) goto out;
+
+	snprintf(cmd, sizeof(cmd), fmt_d, zname, "journal-age", sblk->journal_age);
+	if (verbose) printf("%s\n", cmd);
+	rc = system(cmd);
+	if (rc) goto out;
+
+out:
+	if (rc != 0)
+		printf("Modify (msg) ZDM instance failed: %d\n", rc);
+	return rc;
+}
+
 
 int zdmadm_wipe(int fd, zdm_super_block_t * sblock)
 {
@@ -1478,6 +1748,10 @@ int zdmadm_probe_default(const char * dname, int fd, zdm_super_block_t * sblk,
 	}
 	sblk->sect_start = start; /* in 512 byte sectors */
 
+	sblk->zone_size = get_zone_size(dname);
+	if (0 == sblk->zone_size)
+		sblk->zone_size = 1 << 19; /* 256MiB in 512 byte sectors */
+
 	if (blkdev_get_size(fd, &sz) < 0) {
 		printf("Failed to determine partition size!!\n");
 		exCode = 2;
@@ -1502,7 +1776,7 @@ int zdmadm_probe_default(const char * dname, int fd, zdm_super_block_t * sblk,
 		}
 	} else {
 		u64 cache, need, pref;
-		u64 fz_sz = 0x80000;
+		u64 fz_sz = sblk->zone_size;
 		u64 zone = ((sblk->sect_start + fz_sz - 1) / fz_sz);
 		u64 fz_at = zone * fz_sz;
 		u64 mdzcount = 0;
@@ -1524,6 +1798,22 @@ int zdmadm_probe_default(const char * dname, int fd, zdm_super_block_t * sblk,
 		sblk->data_start = zone;
 	}
 	calculate_zdm_blocks(sblk, verbose);
+
+	sblk->io_queue           = 0;
+	sblk->gc_prio_def        = 0xff00;
+	sblk->gc_prio_low        = 0x7fff;
+	sblk->gc_prio_high       = 0x0400;
+	sblk->gc_prio_crit       = 0x0040;
+	sblk->gc_wm_crit         = 7;
+	sblk->gc_wm_high         = 5;
+	sblk->gc_wm_low          = 25;
+	sblk->gc_status          = GC_ON;
+	sblk->cache_ageout_ms    = 9000;
+	sblk->cache_size         = 4096;
+	sblk->cache_to_pagecache = GC_OFF;
+	sblk->cache_reada        = 64;
+	sblk->journal_age        = 3;
+
 	sblk->crc32 = zdm_crc32(sblk);
 
 out:
@@ -1557,7 +1847,7 @@ void usage(void)
 		"                           default is off\n"
 		"    --gc <on|off|force>    enable, disable and force GC to act\n"
 		"    --gc-prio-def  <stale> number of stale blocks for zone reclaim.\n"
-		"    --gc-prio-log  <stale> number of stale blocks for zone reclaim.\n"
+		"    --gc-prio-low  <stale> number of stale blocks for zone reclaim.\n"
 		"    --gc-prio-high <stale> number of stale blocks for zone reclaim.\n"
 		"    --gc-prio-crit <stale> number of stale blocks for zone reclaim.\n"
 		"    --gc-wm-crit <zones>   number of unused zones remaining\n"
@@ -1566,6 +1856,7 @@ void usage(void)
 		"    --cache-timeout <ms>   default: 9000\n"
 		"    --cache-size <pages>   default: 4096\n"
 		"    --cache-to-pagecache <num> 1=on/0=off, default is off.\n"
+		"    --journal-age <num>    default 3, max 500, 0 to disable\n"
 		"\n");
 }
 
@@ -1583,10 +1874,23 @@ int main(int argc, char *argv[])
 	int command = ZDMADM_PROBE;
 	int use_force = 0;
 	int verbose = 0;
-	int io_queue = 0;
 	int num_mirr = 0;
+	uint32_t io_queue           = ~0u;
+	uint32_t gc_prio_def        = ~0u;
+	uint32_t gc_prio_low        = ~0u;
+	uint32_t gc_prio_high       = ~0u;
+	uint32_t gc_prio_crit       = ~0u;
+	uint32_t gc_wm_crit         = ~0u;
+	uint32_t gc_wm_high         = ~0u;
+	uint32_t gc_wm_low          = ~0u;
+	uint32_t gc_opt             = ~0u;
+	uint32_t cache_timeout      = ~0u;
+	uint32_t cache_size         = ~0u;
+	uint32_t cache_to_pagecache = ~0u;
+	uint32_t cache_reada        = ~0u;
+	uint32_t journal_age        = ~0u;
 	char *md_device = NULL;
-	static const char *options = "a:t:R:l:q:m:MFpcruwkvh";
+	static const char *options = "a:t:R:l:q:m:MFpcsruwkvh";
 	static const struct option longopts[] = {
 	    { "raid-trim",          1, 0, 'a' },
 	    { "trim",               1, 0, 't' },
@@ -1606,17 +1910,18 @@ int main(int argc, char *argv[])
 	    { "check",              0, 0, 'k' },
 	    { "verbose",            0, 0, 'v' },
 	    { "help",               0, 0, 'h' },
-	    { "gc",                 1, 0, 0 },
-	    { "gc-prio-def",        1, 0, 0 },
-	    { "gc-prio-log",        1, 0, 0 },
-	    { "gc-prio-high",       1, 0, 0 },
-	    { "gc-prio-crit",       1, 0, 0 },
-	    { "gc-wm-crit",         1, 0, 0 },
-	    { "gc-wm-high",         1, 0, 0 },
-	    { "gc-wm-low",          1, 0, 0 },
-	    { "cache-timeout",      1, 0, 0 },
-	    { "cache-size",         1, 0, 0 },
-	    { "cache-to-pagecache", 1, 0, 0 },
+	    { "gc",                 1, 0, GC_OPT },
+	    { "gc-prio-def",        1, 0, GC_PRIO_DEF_OPT },
+	    { "gc-prio-low",        1, 0, GC_PRIO_LOW_OPT },
+	    { "gc-prio-high",       1, 0, GC_PRIO_HIGH_OPT },
+	    { "gc-prio-crit",       1, 0, GC_PRIO_CRIT_OPT },
+	    { "gc-wm-crit",         1, 0, GC_WM_CRIT_OPT },
+	    { "gc-wm-high",         1, 0, GC_WM_HIGH_OPT },
+	    { "gc-wm-low",          1, 0, GC_WM_LOW_OPT },
+	    { "cache-timeout",      1, 0, CACHE_TIMEOUT_OPT },
+	    { "cache-size",         1, 0, CACHE_SIZE_OPT },
+	    { "cache-to-pagecache", 1, 0, CACHE_TO_PAGECACHE_OPT },
+	    { "journal-age",        1, 0, JOURNAL_AGE_OPT },
 	    { NULL,                 0, 0, 0 }
 	};
 
@@ -1664,13 +1969,16 @@ int main(int argc, char *argv[])
 			num_mirr = 1;
 			break;
 		case 'q':
-			io_queue = atoi(optarg) ? 1 : 0;
+			io_queue = atoi(optarg);
 			break;
 		case 'R':
 			resv = strtoul(optarg, NULL, 0);
 			if (8 < resv && resv < 1024) {
 				over_provision = resv - reserved_zones;
 			}
+			break;
+		case 's':
+			command = ZDMADM_ADJUST;
 			break;
 		case 't':
 			discard_default = atoi(optarg) ? 1 : 0;
@@ -1680,6 +1988,54 @@ int main(int argc, char *argv[])
 			break;
 		case 'v':
 			verbose++;
+			break;
+
+		case GC_OPT:
+			if (strcasecmp(optarg, "on") == 0)
+				gc_opt = GC_ON;
+			else if (strcasecmp(optarg, "off") == 0)
+				gc_opt = GC_OFF;
+			else if (strcasecmp(optarg, "force") == 0)
+				gc_opt = GC_FORCE;
+			else
+				printf("Invalid gc opt `%s' ignored\n", optarg);
+			break;
+		case GC_PRIO_DEF_OPT:
+			gc_prio_def = atoi(optarg);
+			break;
+		case GC_PRIO_LOW_OPT:
+			gc_prio_low = atoi(optarg);
+			break;
+		case GC_PRIO_HIGH_OPT:
+			gc_prio_high = atoi(optarg);
+			break;
+		case GC_PRIO_CRIT_OPT:
+			gc_prio_crit = atoi(optarg);
+			break;
+		case GC_WM_CRIT_OPT:
+			gc_wm_crit = atoi(optarg);
+			break;
+		case GC_WM_HIGH_OPT:
+			gc_wm_high = atoi(optarg);
+			break;
+		case GC_WM_LOW_OPT:
+			gc_wm_low = atoi(optarg);
+			break;
+		case CACHE_TIMEOUT_OPT:
+			cache_timeout = atoi(optarg);
+			break;
+		case CACHE_SIZE_OPT:
+			cache_size = atoi(optarg);
+			break;
+		case CACHE_TO_PAGECACHE_OPT:
+			cache_to_pagecache = atoi(optarg) ? 1 : 0;
+			break;
+		case JOURNAL_AGE_OPT:
+			journal_age = atoi(optarg);
+			if (journal_age > 500) {
+				printf("Journal age out of range, ignored\n");
+				journal_age = ~0u;
+			}
 			break;
 		case 'h':
 		default:
@@ -1730,14 +2086,24 @@ int main(int argc, char *argv[])
 		}
 
 		if (ZDMADM_CREATE == command || ZDMADM_WIPE == command ) {
+			unsigned long zone_sz = 0;
+
 			if (0 == is_part(dname)) {
 				if (!use_force) {
 					printf("Whole disk .. use -F to force\n");
 					goto out;
 				}
 			}
-		}
 
+			zone_sz = get_zone_size(dname);
+			if (0 == zone_sz) {
+				if (!use_force) {
+					printf("Not zoned .. use -F to force\n");
+					goto out;
+				}
+				zone_sz = 1 << 19; /* 256MiB in 512 byte sectors */
+			}
+		}
 
 		if (need_rw) {
 			o_flags = O_RDWR;
@@ -1745,6 +2111,7 @@ int main(int argc, char *argv[])
 
 		fd = open(dname, o_flags);
 		if (fd > 0) {
+			int zdm_mod_msg = 0;
 			int zdm_exists = 1;
 			zdm_super_block_t sblk_def;
 			zdm_super_block_t sblk;
@@ -1761,6 +2128,53 @@ int main(int argc, char *argv[])
 				goto out;
 			}
 
+			if (~0u != io_queue           ||
+			    ~0u != gc_prio_def        ||
+			    ~0u != gc_prio_low        ||
+			    ~0u != gc_prio_high       ||
+			    ~0u != gc_prio_crit       ||
+			    ~0u != gc_wm_crit         ||
+			    ~0u != gc_wm_high         ||
+			    ~0u != gc_wm_low          ||
+			    ~0u != gc_opt             ||
+			    ~0u != cache_timeout      ||
+			    ~0u != cache_size         ||
+			    ~0u != cache_to_pagecache ||
+			    ~0u != journal_age        ||
+			    ~0u != cache_reada) {
+				zdm_mod_msg = 1;
+				if (io_queue != ~0u)
+					sblk_def.io_queue = io_queue;
+				if (gc_prio_def != ~0u)
+					sblk_def.gc_prio_def = gc_prio_def;
+				if (gc_prio_low != ~0u)
+					sblk_def.gc_prio_low = gc_prio_low;
+				if (gc_prio_high != ~0u)
+					sblk_def.gc_prio_high = gc_prio_high;
+				if (gc_prio_crit != ~0u)
+					sblk_def.gc_prio_crit = gc_prio_crit;
+				if (gc_wm_crit != ~0u)
+					sblk_def.gc_wm_crit = gc_wm_crit;
+				if (gc_wm_high != ~0u)
+					sblk_def.gc_wm_high = gc_wm_high;
+				if (gc_wm_low != ~0u)
+					sblk_def.gc_wm_low = gc_wm_low;
+				if (gc_opt != ~0u)
+					sblk_def.gc_status = gc_opt;
+				if (cache_timeout != ~0u)
+					sblk_def.cache_ageout_ms = cache_timeout;
+				if (cache_size != ~0u)
+					sblk_def.cache_size = cache_size;
+				if (cache_to_pagecache != ~0u)
+					sblk_def.cache_to_pagecache = cache_to_pagecache;
+				if (journal_age != ~0u)
+					sblk_def.journal_age = journal_age;
+				if (cache_reada != ~0u)
+					sblk_def.cache_reada = cache_reada;
+
+				sblk_def.crc32 = zdm_crc32(&sblk_def);
+			}
+
 			if (md_device) {
 				meta_fd = open( md_device, o_flags);
 				if (meta_fd < 0) {
@@ -1775,6 +2189,55 @@ int main(int argc, char *argv[])
 			exCode = zdmadm_probe_existing(meta_fd, &sblk, verbose);
 			if (exCode < 0) {
 				zdm_exists = 0;
+			}
+
+			if (zdm_exists) {
+				if (~0u != io_queue           ||
+				    ~0u != gc_prio_def        ||
+				    ~0u != gc_prio_low        ||
+				    ~0u != gc_prio_high       ||
+				    ~0u != gc_prio_crit       ||
+				    ~0u != gc_wm_crit         ||
+				    ~0u != gc_wm_high         ||
+				    ~0u != gc_wm_low          ||
+				    ~0u != gc_opt             ||
+				    ~0u != cache_timeout      ||
+				    ~0u != cache_size         ||
+				    ~0u != cache_to_pagecache ||
+				    ~0u != journal_age        ||
+				    ~0u != cache_reada) {
+					zdm_mod_msg = 1;
+
+					if (io_queue != ~0u)
+						sblk.io_queue = io_queue;
+					if (gc_prio_def != ~0u)
+						sblk.gc_prio_def = gc_prio_def;
+					if (gc_prio_low != ~0u)
+						sblk.gc_prio_low = gc_prio_low;
+					if (gc_prio_high != ~0u)
+						sblk.gc_prio_high = gc_prio_high;
+					if (gc_prio_crit != ~0u)
+						sblk.gc_prio_crit = gc_prio_crit;
+					if (gc_wm_crit != ~0u)
+						sblk.gc_wm_crit = gc_wm_crit;
+					if (gc_wm_high != ~0u)
+						sblk.gc_wm_high = gc_wm_high;
+					if (gc_wm_low != ~0u)
+						sblk.gc_wm_low = gc_wm_low;
+					if (gc_opt != ~0u)
+						sblk.gc_status = gc_opt;
+					if (cache_timeout != ~0u)
+						sblk.cache_ageout_ms = cache_timeout;
+					if (cache_size != ~0u)
+						sblk.cache_size = cache_size;
+					if (cache_to_pagecache != ~0u)
+						sblk.cache_to_pagecache = cache_to_pagecache;
+					if (journal_age != ~0u)
+						sblk.journal_age = journal_age;
+					if (cache_reada != ~0u)
+						sblk.cache_reada = cache_reada;
+					sblk.crc32 = zdm_crc32(&sblk);
+				}
 			}
 
 			if (md_device && command == ZDMADM_CREATE) {
@@ -1830,12 +2293,6 @@ int main(int argc, char *argv[])
 					goto out;
 				}
 
-				/* if we change options, update CRC too */
-				if (io_queue) {
-					sblk_def.io_queue = io_queue;
-					sblk_def.crc32 = zdm_crc32(&sblk_def);
-				}
-
 				/* does a lot of writing to fd and closes before
 				 * starting ZDM instance */
 				exCode = zdmadm_create(dname, label, md_device,
@@ -1843,6 +2300,15 @@ int main(int argc, char *argv[])
 						       num_mirr, verbose);
 				if (exCode < 0) {
 					printf("ZDM Create failed.\n");
+					exCode = 1;
+					goto out;
+				}
+
+				if (zdm_mod_msg)
+					exCode = zdmadm_modify(dname, &sblk_def, 0, verbose);
+
+				if (exCode < 0) {
+					printf("ZDM Modify failed.\n");
 					exCode = 1;
 					goto out;
 				}
@@ -1861,7 +2327,29 @@ int main(int argc, char *argv[])
 					exCode = 1;
 					goto next;
 				}
+				exCode = zdmadm_modify(dname, &sblk, 1, verbose);
+				if (exCode < 0) {
+					printf("ZDM Modify failed.\n");
+					exCode = 1;
+					goto out;
+				}
 			break;
+
+			case ZDMADM_ADJUST:
+				if (! zdm_exists) {
+					printf("ZDM Not found. Nothing to restore.\n");
+					goto next;
+				}
+				close(fd);
+				if (zdm_mod_msg)
+					exCode = zdmadm_modify(dname, &sblk, 1, verbose);
+				if (exCode < 0) {
+					printf("ZDM Modify failed.\n");
+					exCode = 1;
+					goto out;
+				}
+			break;
+
 			case ZDMADM_UNLOAD:
 				if (! zdm_exists) {
 					printf("ZDM Not found. Nothing to unload.\n");

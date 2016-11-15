@@ -1,0 +1,27 @@
+From 656d4efa8c08ee3ea63b65c0e6dcd5ba44e07a07 Mon Sep 17 00:00:00 2001
+From: Shaun Tancheff <shaun.tancheff@seagate.com>
+Date: Thu, 3 Nov 2016 19:45:42 -0500
+Subject: [PATCH 08/11] Bug fix: partition map for zone actions (reset wp).
+
+---
+ block/blk-core.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/block/blk-core.c b/block/blk-core.c
+index b28fa9f..5188fed 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -1787,8 +1787,9 @@ out_unlock:
+ static inline void blk_partition_remap(struct bio *bio)
+ {
+ 	struct block_device *bdev = bio->bi_bdev;
++	bool remap = bio_sectors(bio) != 0 || bio_op(bio) == REQ_OP_ZONE_RESET;
+ 
+-	if (bio_sectors(bio) && bdev != bdev->bd_contains) {
++	if (remap && bdev != bdev->bd_contains) {
+ 		struct hd_struct *p = bdev->bd_part;
+ 
+ 		bio->bi_iter.bi_sector += p->start_sect;
+-- 
+2.10.2
+
