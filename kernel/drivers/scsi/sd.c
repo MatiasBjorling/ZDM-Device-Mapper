@@ -52,7 +52,6 @@
 #include <linux/slab.h>
 #include <linux/pm_runtime.h>
 #include <linux/pr.h>
-#include <linux/ata.h>
 #include <asm/uaccess.h>
 #include <asm/unaligned.h>
 
@@ -65,6 +64,8 @@
 #include <scsi/scsi_host.h>
 #include <scsi/scsi_ioctl.h>
 #include <scsi/scsicam.h>
+
+#include <linux/ata.h>
 
 #include "sd.h"
 #include "scsi_priv.h"
@@ -296,16 +297,6 @@ FUA_show(struct device *dev, struct device_attribute *attr, char *buf)
 static DEVICE_ATTR_RO(FUA);
 
 static ssize_t
-urswrz_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	struct scsi_disk *sdkp = to_scsi_disk(dev);
-
-	return snprintf(buf, 20, "%u\n", sdkp->device->urswrz);
-}
-static DEVICE_ATTR_RO(urswrz);
-
-
-static ssize_t
 protection_type_show(struct device *dev, struct device_attribute *attr,
 		     char *buf)
 {
@@ -407,6 +398,11 @@ provisioning_mode_store(struct device *dev, struct device_attribute *attr,
 	if (!capable(CAP_SYS_ADMIN))
 		return -EACCES;
 
+	if (sd_is_zoned(sdkp)) {
+		sd_config_discard(sdkp, SD_LBP_DISABLE);
+		return count;
+	}
+
 	if (sdp->type != TYPE_DISK)
 		return -EINVAL;
 
@@ -498,7 +494,6 @@ static DEVICE_ATTR_RW(max_write_same_blocks);
 static struct attribute *sd_disk_attrs[] = {
 	&dev_attr_cache_type.attr,
 	&dev_attr_FUA.attr,
-	&dev_attr_urswrz.attr,
 	&dev_attr_allow_restart.attr,
 	&dev_attr_manage_start_stop.attr,
 	&dev_attr_protection_type.attr,
@@ -860,6 +855,12 @@ static int sd_setup_write_same_cmnd(struct scsi_cmnd *cmd)
 
 	BUG_ON(bio_offset(bio) || bio_iovec(bio).bv_len != sdp->sector_size);
 
+	if (sd_is_zoned(sdkp)) {
+		ret = sd_zbc_setup_read_write_cmnd(cmd);
+		if (ret != BLKPREP_OK)
+			return ret;
+	}
+
 	sector >>= ilog2(sdp->sector_size) - 9;
 	nr_sectors >>= ilog2(sdp->sector_size) - 9;
 
@@ -917,7 +918,7 @@ static int sd_setup_read_write_cmnd(struct scsi_cmnd *SCpnt)
 	struct request *rq = SCpnt->request;
 	struct scsi_device *sdp = SCpnt->device;
 	struct gendisk *disk = rq->rq_disk;
-	struct scsi_disk *sdkp;
+	struct scsi_disk *sdkp = scsi_disk(disk);
 	sector_t block = blk_rq_pos(rq);
 	sector_t threshold;
 	unsigned int this_count = blk_rq_sectors(rq);
@@ -925,11 +926,16 @@ static int sd_setup_read_write_cmnd(struct scsi_cmnd *SCpnt)
 	int ret;
 	unsigned char protect;
 
+	if (sd_is_zoned(sdkp)) {
+		ret = sd_zbc_setup_read_write_cmnd(SCpnt);
+		if (ret != BLKPREP_OK)
+			return ret;
+	}
+
 	ret = scsi_init_io(SCpnt);
 	if (ret != BLKPREP_OK)
 		goto out;
 	SCpnt = rq->special;
-	sdkp = scsi_disk(disk);
 
 	/* from here on until we're complete, any goto out
 	 * is used for a killable error condition */
@@ -1122,6 +1128,7 @@ static int sd_setup_read_write_cmnd(struct scsi_cmnd *SCpnt)
 			 */
 			scmd_printk(KERN_ERR, SCpnt,
 				    "FUA write on READ/WRITE(6) drive\n");
+			ret = BLKPREP_KILL;
 			goto out;
 		}
 
@@ -1148,153 +1155,9 @@ static int sd_setup_read_write_cmnd(struct scsi_cmnd *SCpnt)
 	 */
 	ret = BLKPREP_OK;
  out:
-	return ret;
-}
+	if (ret != BLKPREP_OK && sd_is_zoned(sdkp))
+		sd_zbc_cancel_read_write_cmnd(SCpnt);
 
-static int sd_setup_zone_report_cmnd(struct scsi_cmnd *cmd)
-{
-	struct request *rq = cmd->request;
-	struct scsi_device *sdp = cmd->device;
-	struct scsi_disk *sdkp = scsi_disk(rq->rq_disk);
-	struct bio *bio = rq->bio;
-	sector_t sector = blk_rq_pos(rq);
-	unsigned int nr_bytes = blk_rq_bytes(rq);
-	int ret = BLKPREP_KILL;
-	u8 rpt_opt = ZBC_ZONE_REPORTING_OPTION_ALL;
-
-	WARN_ON(nr_bytes == 0);
-
-	/*
-	 * For conventional drives generate a report that shows a
-	 * large single convetional zone the size of the block device
-	 */
-	if (sdkp->zoned != 1 && sdkp->device->type != TYPE_ZBC) {
-		void *src;
-		struct bdev_zone_report *conv;
-		__be64 blksz = cpu_to_be64(sdkp->capacity);
-
-		if (nr_bytes < 512)
-			goto out;
-
-		src = kmap_atomic(bio->bi_io_vec->bv_page);
-		conv = src + bio->bi_io_vec->bv_offset;
-		conv->descriptor_count = cpu_to_be32(1);
-		conv->same_field = BLK_ZONE_SAME_ALL;
-		conv->maximum_lba = blksz;
-		conv->descriptors[0].type = BLK_ZONE_TYPE_CONVENTIONAL;
-		conv->descriptors[0].flags = BLK_ZONE_NO_WP << 4;
-		conv->descriptors[0].length = blksz;
-		conv->descriptors[0].lba_start = 0;
-		conv->descriptors[0].lba_wptr = blksz;
-		kunmap_atomic(src);
-		goto out;
-	}
-	/* FUTURE ... when streamid is available */
-	/* rpt_opt = bio_get_streamid(bio); */
-
-	ret = scsi_init_io(cmd);
-	if (ret != BLKPREP_OK)
-		goto out;
-
-	cmd = rq->special;
-	if (sdp->changed) {
-		pr_err("SCSI disk has been changed or is not present.");
-		ret = BLKPREP_KILL;
-		goto out;
-	}
-
-	cmd->cmd_len = 16;
-	memset(cmd->cmnd, 0, cmd->cmd_len);
-	if (sdp->use_ata16_for_zbc) {
-		cmd->cmnd[0] = ATA_16;
-		cmd->cmnd[1] = (0x6 << 1) | 1;
-		cmd->cmnd[2] = 0x0e;
-		cmd->cmnd[3] = rpt_opt;
-		cmd->cmnd[4] = ATA_SUBCMD_ZAC_MGMT_IN_REPORT_ZONES;
-		cmd->cmnd[5] = ((nr_bytes / 512) >> 8) & 0xff;
-		cmd->cmnd[6] = (nr_bytes / 512) & 0xff;
-
-		_lba_to_cmd_ata(&cmd->cmnd[7], sector);
-
-		cmd->cmnd[13] = 1 << 6;
-		cmd->cmnd[14] = ATA_CMD_ZAC_MGMT_IN;
-	} else {
-		cmd->cmnd[0] = ZBC_IN;
-		cmd->cmnd[1] = ZI_REPORT_ZONES;
-		put_unaligned_be64(sector, &cmd->cmnd[2]);
-		put_unaligned_be32(nr_bytes, &cmd->cmnd[10]);
-		cmd->cmnd[14] = rpt_opt;
-	}
-	cmd->sc_data_direction = DMA_FROM_DEVICE;
-	cmd->sdb.length = nr_bytes;
-	cmd->transfersize = sdp->sector_size;
-	cmd->underflow = 0;
-	cmd->allowed = SD_MAX_RETRIES;
-	ret = BLKPREP_OK;
-out:
-	return ret;
-}
-
-static int sd_setup_zone_action_cmnd(struct scsi_cmnd *cmd)
-{
-	struct request *rq = cmd->request;
-	struct scsi_disk *sdkp = scsi_disk(rq->rq_disk);
-	sector_t sector = blk_rq_pos(rq);
-	int ret = BLKPREP_KILL;
-	u8 allbit = 0;
-
-	if (sdkp->zoned != 1 && sdkp->device->type != TYPE_ZBC)
-		goto out;
-
-	rq->timeout = SD_TIMEOUT;
-	rq->completion_data = NULL;
-
-	if (sector == ~0ul) {
-		allbit = 1;
-		sector = 0;
-	}
-
-	cmd->cmd_len = 16;
-	memset(cmd->cmnd, 0, cmd->cmd_len);
-	memset(&cmd->sdb, 0, sizeof(cmd->sdb));
-	cmd->cmnd[0] = ZBC_OUT;
-	switch (req_op(rq)) {
-	case REQ_OP_ZONE_OPEN:
-		cmd->cmnd[1] = ZO_OPEN_ZONE;
-		break;
-	case REQ_OP_ZONE_CLOSE:
-		cmd->cmnd[1] = ZO_CLOSE_ZONE;
-		break;
-	case REQ_OP_ZONE_FINISH:
-		cmd->cmnd[1] = ZO_FINISH_ZONE;
-		break;
-	case REQ_OP_ZONE_RESET:
-		cmd->cmnd[1] = ZO_RESET_WRITE_POINTER;
-		break;
-	default:
-		goto out;
-	}
-	cmd->cmnd[14] = allbit;
-	put_unaligned_be64(sector, &cmd->cmnd[2]);
-	if (sdkp->device->use_ata16_for_zbc) {
-		cmd->cmnd[4] = cmd->cmnd[1];
-		cmd->cmnd[0] = ATA_16;
-		cmd->cmnd[1] = (3 << 1) | 1;
-		cmd->cmnd[2] = 0;
-		cmd->cmnd[3] = allbit;
-		cmd->cmnd[5] = 0;
-		cmd->cmnd[6] = 0;
-		_lba_to_cmd_ata(&cmd->cmnd[7], sector);
-		cmd->cmnd[13] = 1 << 6;
-		cmd->cmnd[14] = ATA_CMD_ZAC_MGMT_OUT;
-	}
-	cmd->transfersize = 0;
-	cmd->underflow = 0;
-	cmd->allowed = SD_MAX_RETRIES;
-	cmd->sc_data_direction = DMA_NONE;
-
-	ret = BLKPREP_OK;
-out:
 	return ret;
 }
 
@@ -1313,12 +1176,9 @@ static int sd_init_command(struct scsi_cmnd *cmd)
 	case REQ_OP_WRITE:
 		return sd_setup_read_write_cmnd(cmd);
 	case REQ_OP_ZONE_REPORT:
-		return sd_setup_zone_report_cmnd(cmd);
-	case REQ_OP_ZONE_OPEN:
-	case REQ_OP_ZONE_CLOSE:
-	case REQ_OP_ZONE_FINISH:
+		return sd_zbc_setup_report_cmnd(cmd);
 	case REQ_OP_ZONE_RESET:
-		return sd_setup_zone_action_cmnd(cmd);
+		return sd_zbc_setup_reset_cmnd(cmd);
 	default:
 		BUG();
 	}
@@ -1950,7 +1810,10 @@ static int sd_done(struct scsi_cmnd *SCpnt)
 	unsigned char op = SCpnt->cmnd[0];
 	unsigned char unmap = SCpnt->cmnd[1] & 8;
 
-	if (req_op(req) == REQ_OP_DISCARD || req_op(req) == REQ_OP_WRITE_SAME) {
+	switch (req_op(req)) {
+	case REQ_OP_DISCARD:
+	case REQ_OP_WRITE_SAME:
+	case REQ_OP_ZONE_RESET:
 		if (!result) {
 			good_bytes = blk_rq_bytes(req);
 			scsi_set_resid(SCpnt, 0);
@@ -1958,6 +1821,17 @@ static int sd_done(struct scsi_cmnd *SCpnt)
 			good_bytes = 0;
 			scsi_set_resid(SCpnt, blk_rq_bytes(req));
 		}
+		break;
+	case REQ_OP_ZONE_REPORT:
+		if (!result) {
+			good_bytes = scsi_bufflen(SCpnt)
+				- scsi_get_resid(SCpnt);
+			scsi_set_resid(SCpnt, 0);
+		} else {
+			good_bytes = 0;
+			scsi_set_resid(SCpnt, blk_rq_bytes(req));
+		}
+		break;
 	}
 
 	if (result) {
@@ -2014,17 +1888,15 @@ static int sd_done(struct scsi_cmnd *SCpnt)
 				}
 			}
 		}
-		/* ATTEMPT TO READ INVALID DATA */
-		if (is_read_past_wp(&sshdr)) {
-			good_bytes = blk_rq_bytes(req);
-			scsi_set_resid(SCpnt, 0);
-			sd_printk(KERN_NOTICE, sdkp, "Read past WP\n");
-		}
 		break;
 	default:
 		break;
 	}
+
  out:
+	if (sd_is_zoned(sdkp))
+		sd_zbc_complete(SCpnt, good_bytes, &sshdr);
+
 	SCSI_LOG_HLCOMPLETE(1, scmd_printk(KERN_INFO, SCpnt,
 					   "sd_done: completed %d of %d bytes\n",
 					   good_bytes, scsi_bufflen(SCpnt)));
@@ -2158,7 +2030,6 @@ sd_spinup_disk(struct scsi_disk *sdkp)
 			printk("not responding...\n");
 	}
 }
-
 
 /*
  * Determine whether disk supports Data Integrity Field.
@@ -2309,6 +2180,9 @@ static int read_capacity_16(struct scsi_disk *sdkp, struct scsi_device *sdp,
 	/* Logical blocks per physical block exponent */
 	sdkp->physical_block_size = (1 << (buffer[13] & 0xf)) * sector_size;
 
+	/* RC basis */
+	sdkp->rc_basis = (buffer[12] >> 4) & 0x3;
+
 	/* Lowest aligned logical block */
 	alignment = ((buffer[14] & 0x3f) << 8 | buffer[15]) * sector_size;
 	blk_queue_alignment_offset(sdp->request_queue, alignment);
@@ -2418,7 +2292,6 @@ sd_read_capacity(struct scsi_disk *sdkp, unsigned char *buffer)
 {
 	int sector_size;
 	struct scsi_device *sdp = sdkp->device;
-	sector_t old_capacity = sdkp->capacity;
 
 	if (sd_try_rc16_first(sdp)) {
 		sector_size = read_capacity_16(sdkp, sdp, buffer);
@@ -2499,35 +2372,44 @@ got_data:
 		sector_size = 512;
 	}
 	blk_queue_logical_block_size(sdp->request_queue, sector_size);
-
-	{
-		char cap_str_2[10], cap_str_10[10];
-
-		string_get_size(sdkp->capacity, sector_size,
-				STRING_UNITS_2, cap_str_2, sizeof(cap_str_2));
-		string_get_size(sdkp->capacity, sector_size,
-				STRING_UNITS_10, cap_str_10,
-				sizeof(cap_str_10));
-
-		if (sdkp->first_scan || old_capacity != sdkp->capacity) {
-			sd_printk(KERN_NOTICE, sdkp,
-				  "%llu %d-byte logical blocks: (%s/%s)\n",
-				  (unsigned long long)sdkp->capacity,
-				  sector_size, cap_str_10, cap_str_2);
-
-			if (sdkp->physical_block_size != sector_size)
-				sd_printk(KERN_NOTICE, sdkp,
-					  "%u-byte physical blocks\n",
-					  sdkp->physical_block_size);
-		}
-	}
+	blk_queue_physical_block_size(sdp->request_queue,
+				      sdkp->physical_block_size);
+	sdkp->device->sector_size = sector_size;
 
 	if (sdkp->capacity > 0xffffffff)
 		sdp->use_16_for_rw = 1;
 
-	blk_queue_physical_block_size(sdp->request_queue,
-				      sdkp->physical_block_size);
-	sdkp->device->sector_size = sector_size;
+}
+
+/*
+ * Print disk capacity
+ */
+static void
+sd_print_capacity(struct scsi_disk *sdkp,
+		  sector_t old_capacity)
+{
+	int sector_size = sdkp->device->sector_size;
+	char cap_str_2[10], cap_str_10[10];
+
+	string_get_size(sdkp->capacity, sector_size,
+			STRING_UNITS_2, cap_str_2, sizeof(cap_str_2));
+	string_get_size(sdkp->capacity, sector_size,
+			STRING_UNITS_10, cap_str_10,
+			sizeof(cap_str_10));
+
+	if (sdkp->first_scan || old_capacity != sdkp->capacity) {
+		sd_printk(KERN_NOTICE, sdkp,
+			  "%llu %d-byte logical blocks: (%s/%s)\n",
+			  (unsigned long long)sdkp->capacity,
+			  sector_size, cap_str_10, cap_str_2);
+
+		if (sdkp->physical_block_size != sector_size)
+			sd_printk(KERN_NOTICE, sdkp,
+				  "%u-byte physical blocks\n",
+				  sdkp->physical_block_size);
+
+		sd_zbc_print_zones(sdkp);
+	}
 }
 
 /* called with buffer of length 512 */
@@ -2891,39 +2773,12 @@ static void sd_read_block_limits(struct scsi_disk *sdkp)
 }
 
 /**
- * sd_read_block_provisioning - Query zoned device VPD page
- * @disk: disk to query
- */
-static void sd_read_block_zoned_support(struct scsi_disk *sdkp)
-{
-	unsigned char *buffer = NULL;
-	const int vpd_len = 64;
-
-	/* Default urswrz for non-Host Managed devices */
-	if (sdkp->device->type != TYPE_ZBC)
-		sdkp->device->urswrz = 1;
-
-	/* Don't ask for b6 page if device isn't expected to support it */
-	if (sdkp->zoned != 1 && sdkp->device->type != TYPE_ZBC)
-		goto out;
-
-	buffer = kmalloc(vpd_len, GFP_KERNEL);
-	if (!buffer ||
-	    /* Zoned Block device characteristics VPD */
-	    scsi_get_vpd_page(sdkp->device, 0xb6, buffer, vpd_len))
-		goto out;
-
-	sdkp->device->urswrz = buffer[4] & 1;
-out:
-	kfree(buffer);
-}
-
-/**
  * sd_read_block_characteristics - Query block dev. characteristics
  * @disk: disk to query
  */
 static void sd_read_block_characteristics(struct scsi_disk *sdkp)
 {
+	struct request_queue *q = sdkp->disk->queue;
 	unsigned char *buffer;
 	u16 rot;
 	const int vpd_len = 512; /* this will bork a certain aac HBA */
@@ -2932,26 +2787,35 @@ static void sd_read_block_characteristics(struct scsi_disk *sdkp)
 
 	if (!buffer ||
 	    /* Block Device Characteristics VPD */
-	    scsi_get_vpd_page(sdkp->device, 0xb1, buffer, vpd_len))
+	    scsi_get_vpd_page(sdkp->device, 0xb1, buffer, 64))
 		goto out;
 
 	rot = get_unaligned_be16(&buffer[4]);
 
 	if (rot == 1) {
-		queue_flag_set_unlocked(QUEUE_FLAG_NONROT, sdkp->disk->queue);
-		queue_flag_clear_unlocked(QUEUE_FLAG_ADD_RANDOM, sdkp->disk->queue);
+		queue_flag_set_unlocked(QUEUE_FLAG_NONROT, q);
+		queue_flag_clear_unlocked(QUEUE_FLAG_ADD_RANDOM, q);
 	}
 
 	sdkp->zoned = (buffer[8] >> 4) & 3;
 	if (sdkp->zoned != 1) {
 		struct scsi_device *sdev = sdkp->device;
 
-		if (!scsi_get_vpd_page(sdev, 0x89, buffer, SD_BUF_SIZE)) {
+		if (!scsi_get_vpd_page(sdev, 0x89, buffer, vpd_len)) {
 			sdkp->zoned = ata_id_zoned_cap((u16 *)&buffer[60]);
 			if (sdkp->zoned == 1)
 				sdev->use_ata16_for_zbc = 1;
 		}
 	}
+	if (sdkp->zoned == 1)
+		q->limits.zoned = BLK_ZONED_HA;
+	else if (sdkp->device->type == TYPE_ZBC)
+		q->limits.zoned = BLK_ZONED_HM;
+	else
+		q->limits.zoned = BLK_ZONED_NONE;
+	if (blk_queue_is_zoned(q) && sdkp->first_scan)
+		sd_printk(KERN_NOTICE, sdkp, "Host-%s zoned block device\n",
+		      q->limits.zoned == BLK_ZONED_HM ? "managed" : "aware");
 
  out:
 	kfree(buffer);
@@ -3024,6 +2888,7 @@ static int sd_revalidate_disk(struct gendisk *disk)
 	struct scsi_disk *sdkp = scsi_disk(disk);
 	struct scsi_device *sdp = sdkp->device;
 	struct request_queue *q = sdkp->disk->queue;
+	sector_t old_capacity = sdkp->capacity;
 	unsigned char *buffer;
 	unsigned int dev_max, rw_max;
 
@@ -3051,21 +2916,21 @@ static int sd_revalidate_disk(struct gendisk *disk)
 	 * react badly if we do.
 	 */
 	if (sdkp->media_present) {
+		sd_read_capacity(sdkp, buffer);
+
 		if (scsi_device_supports_vpd(sdp)) {
 			sd_read_block_provisioning(sdkp);
 			sd_read_block_limits(sdkp);
 			sd_read_block_characteristics(sdkp);
-			sd_read_block_zoned_support(sdkp);
+			sd_zbc_read_zones(sdkp, buffer);
 		}
-		sd_read_capacity(sdkp, buffer);
+
+		sd_print_capacity(sdkp, old_capacity);
+
 		sd_read_write_protect_flag(sdkp, buffer);
 		sd_read_cache_type(sdkp, buffer);
 		sd_read_app_tag_own(sdkp, buffer);
 		sd_read_write_same(sdkp, buffer);
-		if (sdkp->zoned == 1)
-			q->limits.zoned |= ZONED_TYPE_HA;
-		if (sdp->type == TYPE_ZBC)
-			q->limits.zoned |= ZONED_TYPE_HM;
 	}
 
 	sdkp->first_scan = 0;
@@ -3266,6 +3131,10 @@ static int sd_probe(struct device *dev)
 	    sdp->type != TYPE_RBC)
 		goto out;
 
+#ifndef CONFIG_BLK_DEV_ZONED
+	if (sdp->type == TYPE_ZBC)
+		goto out;
+#endif
 	SCSI_LOG_HLQUEUE(3, sdev_printk(KERN_INFO, sdp,
 					"sd_probe\n"));
 
@@ -3368,6 +3237,8 @@ static int sd_remove(struct device *dev)
 	device_del(&sdkp->dev);
 	del_gendisk(sdkp->disk);
 	sd_shutdown(dev);
+
+	sd_zbc_remove(sdkp);
 
 	blk_register_region(devt, SD_MINORS, NULL,
 			    sd_default_probe, NULL, NULL);

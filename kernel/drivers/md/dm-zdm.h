@@ -6,7 +6,7 @@
  *
  * Written by:
  * Shaun Tancheff <shaun.tancheff@seagate.com>
- * 
+ *
  * Bio queue support and metadata relocation by:
  * Vineet Agarwal <vineet.agarwal@seagate.com>
  *
@@ -21,13 +21,9 @@
 #define ALLOC_DEBUG		0
 #define ADBG_ENTRIES		65536
 
-#define ENABLE_BIO_QUEUE	1
 #define ENABLE_SEC_METADATA	1
 
 #define WB_DELAY_MS		1
-
-#define USE_KTHREAD		0
-#define KFIFO_SIZE		(1 << 14)
 
 #define NORMAL			GFP_KERNEL
 #define CRIT			GFP_NOIO
@@ -66,7 +62,8 @@
 #define Z_AQ_NORMAL		(1u << 29)
 #define Z_AQ_STREAM_ID		(1u << 28)
 #define Z_AQ_STREAM_MASK	(0xFF)
-#define Z_AQ_META_STREAM	(Z_AQ_META | Z_AQ_STREAM_ID | 0xFE)
+#define Z_MDJRNL_SID		0xff
+#define Z_AQ_META_STREAM	(Z_AQ_META | Z_AQ_STREAM_ID | Z_MDJRNL_SID)
 
 #define Z_C4K			(4096ul)
 #define Z_SHFT_SEC		(9)
@@ -181,6 +178,12 @@ struct z_io_req_t {
 /* -------------------------------------------------------------------------- */
 /* -------------------------------------------------------------------------- */
 
+enum gc_opt_t {
+	GC_OFF = 0,
+	GC_ON,
+	GC_FORCE,
+};
+
 /**
  * enum pg_flag_enum - Map Pg flags
  * @IS_DIRTY: Block is modified from on-disk copy.
@@ -215,35 +218,34 @@ enum pg_flag_enum {
 	IS_CRC,           /*    20  */
 	IS_LUT,           /*    40  */
 
-	WB_JRNL_1,        /*    80  */
-	WB_JRNL_2,        /*   100  */
-	WB_DIRECT,        /*   200  */
-	WB_RE_CACHE,      /*   400  */
-	IN_WB_JOURNAL,    /*   800  */
+	WB_RE_CACHE,      /*    80  */
+	IN_WB_JOURNAL,    /*   100  */
 
-	R_IN_FLIGHT,      /*   1000 */
-	R_CRC_PENDING,    /*   2000 */
-	W_IN_FLIGHT,      /*   4000 */
-	DELAY_ADD,        /*   8000 */
-	STICKY,           /*  10000 */
-	IS_READA,         /*  20000 */
-	IS_DROPPED,       /*  40000 */
-	IS_LAZY,          /*  80000 */
-	IN_ZLT,           /* 100000 */
-	IS_ALLOC,         /* 200000 */
-	R_SCHED,          /* 400000 */
+	R_IN_FLIGHT,      /*   200  */
+	R_CRC_PENDING,    /*   400  */
+	W_IN_FLIGHT,      /*   800  */
+	DELAY_ADD,        /*   1000 */
+	STICKY,           /*   2000 */
+	IS_READA,         /*   4000 */
+	IS_DROPPED,       /*   8000 */
+	IS_LAZY,          /*  10000 */
+	IN_ZLT,           /*  20000 */
+	IS_ALLOC,         /*  40000 */
+	R_SCHED,          /*  80000 */
 };
 
 /**
  * enum gc_flags_enum - Garbage Collection [GC] states.
  */
 enum gc_flags_enum {
+	GC_IN_PROGRESS,
 	DO_GC_INIT,		/* -> GC_MD_MAP                          */
 	DO_GC_MD_MAP,		/* -> GC_MD_MAP   | GC_READ    | GC_DONE */
 	DO_GC_READ,		/* -> GC_WRITE    | GC_MD_SYNC           */
 	DO_GC_WRITE,		/* -> GC_CONTINUE                        */
 	DO_GC_CONTINUE,		/* -> GC_READ     | GC_MD_SYNC           */
-	DO_GC_MD_SYNC,		/* -> GC_DONE                            */
+	DO_GC_MD_SYNC,		/* -> DO_GC_MD_ZLT                       */
+	DO_GC_MD_ZLT,		/* -> GC_DONE                            */
 	DO_GC_DONE,
 	DO_GC_COMPLETE,
 };
@@ -340,15 +342,15 @@ enum map_type_enum {
 };
 
 /**
- * struct map_cache - An array of mappings (deprecating)
- * @mcd: map_cache_entry array
+ * struct gc_map_cache - An array of expected re-mapped blocks
+ * @gc_mcd: map_cache_entry array
  * @cached_lock:
  * @jcount:
  * @jsorted:
  * @jsize:
  * @map_content: See map_type_enum
  *
- * Longer description of this structure.
+ * Working set of mapping information during GC/zone reclamation.
  */
 struct gc_map_cache {
 	struct gc_map_cache_data *gc_mcd;
@@ -359,6 +361,17 @@ struct gc_map_cache {
 	int map_content;
 };
 
+/**
+ * struct map_pool - Mapping cache (ingress, discard, unused, journal)
+ * @count:	Number of current entries.
+ * @sorted:	Number of 'sorted' entries.
+ * @size:	Total size of array.
+ * @isa:	See map_type_enum
+ * @znd:	Reference to ZDM Instance
+ * @pgs:	Array of pages, each containing an array of entries.
+ *
+ * Working set of mapping information
+ */
 struct map_pool {
 	int count;
 	int sorted;
@@ -385,13 +398,18 @@ union map_pg_data {
  * @refcount:	In use (reference counted).
  * @age:	Most recent access time in jiffies
  * @lba:	Logical position (use lookups to find actual)
- * @md_lock:	Lock on data during i/o [TBD: Use spin locks/CRCs]
  * @last_write:	Last known LBA written on disk
- * @flags:	is dirty flag, is fwd, is rev, is crc, is lut
+ * @hentry:	List of same hash entries.
+ * @md_lock:	Spinlock held when data is modified.
+ * @flags:	State and Type flags.
  * @zltlst:	Entry in lookup table list.
  * @lazy:	Entry in lazy list.
  * @znd:	ZDM Instance (for async metadata I/O)
  * @crc_pg:	Backing CRC page (for IS_LUT pages)
+ * @lba48_in:	Mapped LBA to be read.
+ * @event:	I/O completion event (async).
+ * @io_error:	I/O error (async).
+ * @io_count:	Number of I/O attempts.
  * @hotness:	Additional time to keep cache block in memory.
  * @index:	Offset from base [array index].
  * @md_crc:	TBD: Use to test for dirty/clean during I/O instead of locking.
@@ -415,14 +433,15 @@ struct map_pg {
 	struct list_head lazy;
 
 	/* for async io */
-	struct completion event;
-	int io_error;
-	u64 lba48_in;
-
 	struct zdm *znd;
 	struct map_pg *crc_pg;
+	u64 lba48_in;
+	struct completion event;
+	int io_error;
+	int io_count;
 	int hotness;
 	int index;
+	u16 gen;
 	__le16 md_crc;
 };
 
@@ -515,33 +534,6 @@ struct meta_pg {
 };
 
 /**
- * struct md_journal_forward - In-Memory lba sorted journal access.
- * @lba: Metadata lba (sorted)
- * @entry: Location in md_journal (wb_map)
- */
-struct md_journal_forward {
-	u32 lba; /* origin lba */
-	u32 entry; /* entry in md_journal */
-};
-
-/**
- * @wb: Reverse Map table: 0xFFFFFFFF for unused.
- * @wb_next: Next location for ready for wb.
- * @size: Allocated size of wb/map.
- * @in_use: Number of wb blocks in use (schedule flush when > 70% in use)
- * @wb_alloc: Spin lock around wb
- * @flags: Dirty/Flush flags.
- */
-struct md_journal {
-	__le32 *wb; /* [RMAP] array of origin lbas stored at WB_JRNL_IDX */
-	u32 wb_next;
-	u32 size;
-	u32 in_use;
-	spinlock_t wb_alloc;
-	unsigned long flags;
-};
-
-/**
  * struct zdm_superblock - A page of map table
  * @uuid:
  * @nr_zones:
@@ -596,10 +588,8 @@ struct mz_superkey {
 	__le16 discards;
 	__le16 maps;
 	__le16 unused;
-	u8 reserved[1894];
-	__le32 wb_blocks;
-	__le32 wb_next;
-	__le32 wb_crc32;
+	__le16 wbjrnld;
+	u8 reserved[1904];
 	__le32 crc32;
 	__le64 generation;
 	__le64 magic;
@@ -631,28 +621,21 @@ struct stale_tracking {
 	int bins[STREAM_SIZE];
 };
 
-#if ENABLE_BIO_QUEUE
-
 /*
  * struct zdm_io_q - Queueing and ordering the BIO.
  */
 struct zdm_q_node {
 	struct bio *bio;
 	struct list_head jlist;
-	struct list_head llist;
 	sector_t bi_sector;
 	unsigned long jiffies;
-//	unsigned long reserved;
 };
 
 struct zdm_bio_chain {
 	struct zdm *znd;
 	struct bio *bio[BIO_MAX_PAGES];
 	atomic_t num_bios; /*Zero based counter & used as idx to bio[]*/
-//	int reserved;
 };
-
-#endif /* ENABLE_BIO_QUEUE */
 
 #if ENABLE_SEC_METADATA
 enum meta_dst_flags {
@@ -728,7 +711,6 @@ enum meta_dst_flags {
  * @suspended:
  * @gc_mz_pref:
  * @mz_provision:	Number of zones per 1024 of over-provisioning.
- * @ata_passthrough:
  * @is_empty:		For fast discards on initial format
  *
  * Longer description of this structure.
@@ -782,22 +764,14 @@ struct zdm {
 	mempool_t *mempool_maps;
 	mempool_t *mempool_wset;
 
-#if USE_KTHREAD /* experimental++ */
-	struct task_struct *bio_kthread;
-	DECLARE_KFIFO_PTR(bio_fifo, struct bio *);
-	wait_queue_head_t wait_bio;
-	wait_queue_head_t wait_fifo;
-#elif ENABLE_BIO_QUEUE
 	struct task_struct *bio_kthread;
 	struct list_head bio_srt_jif_lst_head;
-	struct list_head bio_srt_lba_lst_head;
 	spinlock_t zdm_bio_q_lck;
 
 	mempool_t *bp_q_node;
 	mempool_t *bp_chain_vec;
 	atomic_t enqueued;
 	wait_queue_head_t wait_bio;
-#endif
 	struct bio_set *bio_set;
 
 	struct gc_state *gc_active;
@@ -836,8 +810,6 @@ struct zdm {
 	u32 crc_count;
 	u32 map_count;
 
-	struct md_journal jrnl;
-
 	void *z_sballoc;
 	struct mz_superkey *bmkeys;
 	struct zdm_superblock *super_block;
@@ -846,7 +818,9 @@ struct zdm {
 	sector_t last_w;
 	u8 *cow_block;
 	u64 cow_addr;
+	u32 zone_count;
 	u32 data_zones;
+	u32 dz_start;
 	u32 gz_count;
 	u32 zdstart;
 	u32 z_gc_free;
@@ -897,15 +871,28 @@ struct zdm {
 	int hw_allocs;
 	void **alloc_trace;
 #endif
+	long queue_delay;
+
+	u32 queue_depth;
+	u32 gc_prio_def;
+	u32 gc_prio_low;
+	u32 gc_prio_high;
+	u32 gc_prio_crit;
+	u32 gc_wm_crit;
+	u32 gc_wm_high;
+	u32 gc_wm_low;
+	u32 gc_status;
+	u32 cache_ageout_ms;
+	u32 cache_size;
+	u32 cache_to_pagecache;
+	u32 cache_reada;
+	u32 journal_age;
+
 	u32 filled_zone;
 	u16 mz_provision;
 	unsigned bdev_is_zoned:1;
-	unsigned ata_passthrough:1;
-	unsigned issue_open_zone:1;
-	unsigned issue_close_zone:1;
 	unsigned is_empty:1;
 	unsigned enable_trim:1;
-	unsigned bio_queue:1;
 };
 
 /**

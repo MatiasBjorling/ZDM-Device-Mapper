@@ -6,7 +6,7 @@
  *
  * Written by:
  * Shaun Tancheff <shaun.tancheff@seagate.com>
- * 
+ *
  * Bio queue support and metadata relocation by:
  * Vineet Agarwal <vineet.agarwal@seagate.com>
  *
@@ -28,7 +28,6 @@
 #include <linux/sort.h>
 #include <linux/ctype.h>
 #include <linux/types.h>
-#include <linux/blkzoned_api.h>
 #include <linux/timer.h>
 #include <linux/delay.h>
 #include <linux/kthread.h>
@@ -84,8 +83,8 @@ static sector_t get_dev_size(struct dm_target *ti);
 static int dmz_reset_wp(struct zdm *znd, u64 z_id);
 static int dmz_open_zone(struct zdm *znd, u64 z_id);
 static int dmz_close_zone(struct zdm *znd, u64 z_id);
-static int dmz_report_zones(struct zdm *znd, u64 z_id,
-			    struct page *pgs, size_t bufsz);
+static int dmz_report_zones(struct zdm *znd, u64 z_id, struct blk_zone *zones,
+			    unsigned int *nz, gfp_t gfp);
 static void activity_timeout(unsigned long data);
 static void zoned_destroy(struct zdm *);
 static int gc_can_cherrypick(struct zdm *znd, u32 sid, int delay, gfp_t gfp);
@@ -93,18 +92,6 @@ static void bg_work_task(struct work_struct *work);
 static void on_timeout_activity(struct zdm *znd, int delay);
 static int zdm_create_proc_entries(struct zdm *znd);
 static void zdm_remove_proc_entries(struct zdm *znd);
-
-#if ENABLE_BIO_QUEUE
-static int _bio_queue_merge_delay;
-module_param(_bio_queue_merge_delay, int, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(_bio_queue_merge_delay,
-	"Delay (in jiffies) to be added between I/Os to enable bio merging");
-static inline int _merge_delay(void)
-{
-	return _bio_queue_merge_delay;
-}
-#define MERGE_DELAY _merge_delay()
-#endif
 
 #if ENABLE_SEC_METADATA
 /**
@@ -114,7 +101,8 @@ static inline int _merge_delay(void)
  *
  * Return: Backing device
  */
-struct block_device *znd_get_backing_dev(struct zdm *znd, sector_t *block)
+static struct block_device *znd_get_backing_dev(struct zdm *znd,
+						sector_t *block)
 {
 	struct block_device *bdev = NULL;
 
@@ -178,10 +166,10 @@ static inline u32 bio_stream(struct bio *bio)
 	 * use this heuristic to try to skip unnecessary co-mingling of data.
 	 */
 	if (bio->bi_opf & REQ_META) {
-		stream_id = 0xff;
+		stream_id = 0xfe; /* upper level metadata */
 	} else if (bio->bi_iter.bi_size < (Z_C4K * 4)) {
 		/* avoid XFS meta/data churn in extent maps */
-		stream_id = 0xfe;
+		stream_id = 0xfd; /* 'hot' upper level data */
 
 #if 0 /* bio_get_streamid() is available */
 	} else {
@@ -191,7 +179,7 @@ static inline u32 bio_stream(struct bio *bio)
 		stream_id = id >> 8;
 		if (stream_id == 0)
 			stream_id++;
-		if (stream_id >= 0xfd)
+		if (stream_id >= 0xfc)
 			stream_id--;
 #endif
 	}
@@ -210,7 +198,7 @@ static inline u32 bio_stream(struct bio *bio)
 static int zoned_map_discard(struct zdm *znd, struct bio *bio, u64 s_zdm)
 {
 	int rcode = DM_MAPIO_SUBMITTED;
-	u32 blks = bio->bi_iter.bi_size / Z_C4K;
+	u32 blks = bio->bi_iter.bi_size >> PAGE_SHIFT;
 	unsigned long flags;
 	int redundant = 0;
 	const gfp_t gfp = GFP_ATOMIC;
@@ -272,24 +260,30 @@ struct zone_action {
  */
 static void za_endio(struct bio *bio)
 {
-	struct zdm *znd = bio->bi_private;
+	struct zone_action *za = bio->bi_private;
 
 	switch (bio_op(bio)) {
 	case REQ_OP_ZONE_RESET:
 		/* find the zone and reset the wp on it */
-		(void)znd;
-		break;
-	case REQ_OP_ZONE_FINISH:
-		/* find the zone and set the wp to len on it */
-		break;
-
-	case REQ_OP_ZONE_OPEN:
-	case REQ_OP_ZONE_CLOSE:
 		break;
 	default:
 		pr_err("%s: unexpected op: %d\n", __func__, bio_op(bio));
 		break;
 	}
+
+	if (bio->bi_error) {
+		struct zdm *znd = za->znd;
+
+		Z_ERR(znd, "Zone Cmd: LBA: %" PRIx64 " -> %d failed.",
+		      za->s_addr, bio->bi_error);
+		Z_ERR(znd, "ZAC/ZBC support disabled.");
+
+		znd->bdev_is_zoned = 0;
+	}
+
+	if (!za->wait)
+		kfree(za);
+
 	bio_put(bio);
 }
 
@@ -307,16 +301,13 @@ static void do_zone_action_work(struct work_struct *work)
 	struct bio *bio = bio_alloc_bioset(gfp, 1, znd->bio_set);
 
 	if (bio) {
-		if (bdev != bdev->bd_contains)
-			bdev = bdev->bd_contains;
-
 		bio->bi_iter.bi_sector = za->s_addr;
 		bio->bi_bdev = bdev;
 		bio->bi_vcnt = 0;
 		bio->bi_iter.bi_size = 0;
 		bio_set_op_attrs(bio, za->op, za->op_f);
 		if (!za->wait) {
-			bio->bi_private = znd;
+			bio->bi_private = za;
 			bio->bi_end_io = za_endio;
 			submit_bio(bio);
 			return;
@@ -341,7 +332,7 @@ static int dmz_zone_action(struct zdm *znd, u64 z_id, unsigned int op,
 			   unsigned int op_f, int wait)
 {
 	int wp_err = 0;
-	u64 z_offset = zone_to_sector(z_id + znd->zdstart);
+	u64 z_offset = zone_to_sector(z_id);
 	struct zone_action za = {
 		.znd = znd,
 		.s_addr = z_offset,
@@ -365,8 +356,18 @@ static int dmz_zone_action(struct zdm *znd, u64 z_id, unsigned int op,
 	if (!znd->bdev_is_zoned)
 		return wp_err;
 
-	if (znd->ata_passthrough)
-		za.op_f |= REQ_META;
+	if (!wait) {
+		struct zone_action *zact = kzalloc(sizeof(*zact), GFP_ATOMIC);
+
+		if (!zact)
+			return -ENOMEM;
+
+		memcpy(zact, &za, sizeof(za));
+		INIT_WORK(&zact->work, do_zone_action_work);
+		queue_work(znd->zone_action_wq, &zact->work);
+		return 0;
+	}
+
 	/*
 	 * Issue the synchronous I/O from a different thread
 	 * to avoid generic_make_request recursion.
@@ -378,9 +379,12 @@ static int dmz_zone_action(struct zdm *znd, u64 z_id, unsigned int op,
 	wp_err = za.wp_err;
 
 	if (wait && wp_err) {
-		Z_ERR(znd, "Zone Cmd: LBA: %" PRIx64
-		      " [Z:%" PRIu64 "] -> %d failed.",
-		      za.s_addr, z_id, wp_err);
+		struct hd_struct *p = znd->dev->bdev->bd_part;
+
+		Z_ERR(znd, "Zone Cmd: LBA: %" PRIx64 " (%" PRIx64
+			   " [Z:%" PRIu64 "] -> %d failed.",
+		      za.s_addr, za.s_addr + p->start_sect, z_id, wp_err);
+
 		Z_ERR(znd, "ZAC/ZBC support disabled.");
 		znd->bdev_is_zoned = 0;
 		wp_err = -ENOTSUPP;
@@ -409,12 +413,7 @@ static int dmz_reset_wp(struct zdm *znd, u64 z_id)
  */
 static int dmz_open_zone(struct zdm *znd, u64 z_id)
 {
-/* FIXME: Just alloc and submit a bio here */
-
-	if (!znd->issue_open_zone)
-		return 0;
-	return dmz_zone_action(znd, z_id, REQ_OP_ZONE_OPEN, 0, 0);
-
+	return 0;
 }
 
 /**
@@ -426,9 +425,7 @@ static int dmz_open_zone(struct zdm *znd, u64 z_id)
  */
 static int dmz_close_zone(struct zdm *znd, u64 z_id)
 {
-	if (!znd->issue_close_zone)
-		return 0;
-	return dmz_zone_action(znd, z_id, REQ_OP_ZONE_CLOSE, 0, 0);
+	return 0;
 }
 
 /**
@@ -440,37 +437,20 @@ static int dmz_close_zone(struct zdm *znd, u64 z_id)
  *
  * Return: -ENOTSUPP or 0 on success
  */
-static int dmz_report_zones(struct zdm *znd, u64 z_id,
-			    struct page *pgs, size_t bufsz)
+static int dmz_report_zones(struct zdm *znd, u64 z_id, struct blk_zone *zones,
+			    unsigned int *nz, gfp_t gfp)
 {
 	int wp_err = -ENOTSUPP;
 
 	if (znd->bdev_is_zoned) {
 		struct block_device *bdev = znd->dev->bdev;
-		u64 s_addr;
-		unsigned int op_f = 0;
-		u8  opt = ZBC_ZONE_REPORTING_OPTION_ALL;
+		u64 s_addr = zone_to_sector(z_id);
 
 #if ENABLE_SEC_METADATA
-		if (znd->meta_dst_flag != DST_TO_SEC_DEVICE) {
-			s_addr = zone_to_sector(z_id + znd->zdstart);
-			if (bdev != bdev->bd_contains)
-				s_addr -= znd->start_sect << Z_SHFT4K;
-		} else {
+		if (znd->meta_dst_flag == DST_TO_SEC_DEVICE)
 			s_addr = zone_to_sector(z_id) + znd->sec_zone_align;
-		}
-#else
-		s_addr = zone_to_sector(z_id + znd->zdstart);
-
-		if (bdev != bdev->bd_contains)
-			s_addr -= znd->start_sect << Z_SHFT4K;
-
 #endif
-		if (znd->ata_passthrough)
-			op_f = REQ_META;
-
-		wp_err = blkdev_issue_zone_report(bdev, op_f, s_addr, opt,
-						  pgs, bufsz, GFP_KERNEL);
+		wp_err = blkdev_report_zones(bdev, s_addr, zones, nz, gfp);
 		if (wp_err) {
 			Z_ERR(znd, "Report Zones: LBA: %" PRIx64
 			      " [Z:%" PRIu64 " -> %d failed.",
@@ -483,96 +463,13 @@ static int dmz_report_zones(struct zdm *znd, u64 z_id,
 	return wp_err;
 }
 
-#if USE_KTHREAD
-
-static inline int stop_or_data(struct zdm *znd)
-{
-	if (kthread_should_stop())
-		return 1;
-	return kfifo_is_empty(&znd->bio_fifo) ? 0 : 1;
-}
-
-static int znd_bio_kthread(void *arg)
-{
-	int err = 0;
-	struct zdm *znd = (struct zdm *)arg;
-
-	Z_ERR(znd, "znd_bio_kthread [started]");
-
-	while (!kthread_should_stop()) {
-		struct bio *bio = NULL;
-		int rcode;
-
-		if (kfifo_is_empty(&znd->bio_fifo)) {
-			wake_up(&znd->wait_fifo);
-			wait_event_freezable(znd->wait_bio, stop_or_data(znd));
-			continue;
-		}
-		if (!kfifo_get(&znd->bio_fifo, &bio)) {
-			wake_up(&znd->wait_fifo);
-			continue;
-		}
-		if (kfifo_avail(&znd->bio_fifo) > 5)
-			wake_up(&znd->wait_fifo);
-
-		rcode = zoned_bio(znd, bio);
-		if (rcode == DM_MAPIO_REMAPPED)
-			rcode = DM_MAPIO_SUBMITTED;
-
-		if (rcode < 0) {
-			znd->meta_result = err = rcode;
-			goto out;
-		}
-	}
-	err = 0;
-	Z_ERR(znd, "znd_bio_kthread [stopped]");
-
-out:
-	return err;
-}
-
 /**
- * zoned_map() - Handle an incoming BIO
- * @ti: Device Mapper Target Instance
- * @bio: The BIO to disposition.
+ * _zoned_map() - kthread handling
+ * @znd: ZDM Instance
+ * @bio: bio to be mapped.
  *
  * Return: 0 on success, otherwise error.
  */
-static int zoned_map(struct dm_target *ti, struct bio *bio)
-{
-	struct zdm *znd = ti->private;
-	int rcode = DM_MAPIO_REQUEUE;
-
-	while (kfifo_put(&znd->bio_fifo, bio) == 0) {
-		wake_up_process(znd->bio_kthread);
-		wake_up(&znd->wait_bio);
-		wait_event_freezable(znd->wait_fifo,
-			kfifo_avail(&znd->bio_fifo) > 0);
-	}
-	rcode = DM_MAPIO_SUBMITTED;
-	wake_up_process(znd->bio_kthread);
-	wake_up(&znd->wait_bio);
-
-	return rcode;
-}
-
-#elif ENABLE_BIO_QUEUE
-
-static void zdm_merge_bio_endio(struct bio *bio)
-{
-	int idx = 0;
-	struct zdm_bio_chain *bio_chain = bio->bi_private;
-	struct zdm *znd = bio_chain->znd;
-
-	for (idx = 0; idx < atomic_read(&bio_chain->num_bios); idx++) {
-		if (bio->bi_error)
-			bio_chain->bio[idx]->bi_error = bio->bi_error;
-		bio_endio(bio_chain->bio[idx]);
-	}
-	bio_put(bio);
-	ZDM_FREE(znd, bio_chain, sizeof(*bio_chain), KM_15);
-}
-
 static int _zoned_map(struct zdm *znd, struct bio *bio)
 {
 	int err;
@@ -587,193 +484,48 @@ static int _zoned_map(struct zdm *znd, struct bio *bio)
 
 }
 
-static inline bool zdm_no_merge(struct bio *bio)
-{
-	return (bio->bi_opf & REQ_NOMERGE_FLAGS) ? true : false;
-}
-
-static struct bio *zdm_merge_bio_for_adjacent_io(struct zdm *znd)
-{
-	struct zdm_q_node *_tmp;
-//	struct zdm_q_node *prio = NULL;
-	struct zdm_q_node *node = NULL;
-	struct zdm_bio_chain *chain = NULL;
-	struct bio *merged_bio = NULL;
-	struct list_head *ll_head = &znd->bio_srt_lba_lst_head;
-	struct list_head *jl_head = &znd->bio_srt_jif_lst_head;
-	const gfp_t gfp = GFP_ATOMIC;
-	int nsegs;
-	int idx = 0;
-	int bi_segs = 0;
-//	int peek = READ_PRIO_DEPTH;
-	unsigned int bi_size = 0;
-	unsigned long flags;
-	struct bio_vec bv;
-	struct bvec_iter iter;
-
-	spin_lock_irqsave(&znd->zdm_bio_q_lck, flags);
-	node = list_first_entry_or_null(jl_head, struct zdm_q_node, jlist);
-	if (!node) {
-		spin_unlock_irqrestore(&znd->zdm_bio_q_lck, flags);
-		return NULL;
-	}
-
-#if 0
-	/* do a quick look ahead to prefer reads */
-	list_for_each_entry(prio, jl_head, jlist) {
-		if (zdm_no_merge(prio->bio))
-			break;
-		if (bio_data_dir(node->bio) == REQ_OP_READ) {
-			node = prio;
-			break;
-		}
-		if (--peek <= 0)
-			break;
-	}
-#endif
-
-	chain = ZDM_ALLOC(znd, sizeof(*chain), KM_15, gfp);
-	if (!chain) {
-		Z_ERR(znd, "chain allocation failed");
-		spin_unlock_irqrestore(&znd->zdm_bio_q_lck, flags);
-		return NULL;
-	}
-
-	chain->znd = znd;
-	atomic_set(&chain->num_bios, 0);
-
-	list_for_each_entry_safe_from(node, _tmp, ll_head, llist) {
-		if (atomic_read(&chain->num_bios) >= BIO_MAX_PAGES)
-			break;
-		nsegs = bio_segments(node->bio);
-		if (atomic_read(&chain->num_bios) > 0) {
-			int prev = atomic_read(&chain->num_bios) - 1;
-			struct bio *prev_bio = chain->bio[prev];
-			struct bio *bio = node->bio;
-
-			if (bio_end_sector(prev_bio) != bio->bi_iter.bi_sector)
-				break;
-			if (bio->bi_opf != chain->bio[0]->bi_opf)
-				break;
-			if (zdm_no_merge(bio))
-				break;
-			if ((bi_segs + nsegs) >= BIO_MAX_PAGES)
-				break;
-		}
-		chain->bio[atomic_read(&chain->num_bios)] = node->bio;
-		bi_segs += nsegs;
-		bi_size += node->bio->bi_iter.bi_size;
-		atomic_inc(&chain->num_bios);
-		list_del(&node->llist);
-		list_del(&node->jlist);
-		atomic_dec(&znd->enqueued);
-		ZDM_FREE(znd, node, sizeof(struct zdm_q_node), KM_14);
-	}
-	spin_unlock_irqrestore(&znd->zdm_bio_q_lck, flags);
-
-	if (atomic_read(&chain->num_bios) == 1) {
-		merged_bio = chain->bio[0];
-		ZDM_FREE(znd, chain, sizeof(*chain), KM_15);
-		goto nomerge;
-	}
-
-	merged_bio = bio_alloc_bioset(gfp, bi_segs, znd->bio_set);
-	if (!merged_bio) {
-		Z_INFO(znd, "bio allocation failed for merge bio");
-
-		for (idx = 0; idx < atomic_read(&chain->num_bios); idx++)
-			_zoned_map(znd, chain->bio[idx]);
-		ZDM_FREE(znd, chain, sizeof(*chain), KM_15);
-		chain = NULL;
-		goto nomerge;
-	}
-
-	/* merge chain bios */
-	merged_bio->bi_bdev		= chain->bio[0]->bi_bdev;
-	merged_bio->bi_opf		= chain->bio[0]->bi_opf;
-	merged_bio->bi_iter.bi_sector	= chain->bio[0]->bi_iter.bi_sector;
-	merged_bio->bi_iter.bi_size	= bi_size;
-	merged_bio->bi_private		= chain;
-	merged_bio->bi_end_io		= zdm_merge_bio_endio;
-
-	if (bio_op(merged_bio) == REQ_OP_DISCARD)
-		goto nomerge;
-
-	if (bio_op(merged_bio) == REQ_OP_WRITE_SAME) {
-		merged_bio->bi_io_vec[merged_bio->bi_vcnt] =
-			chain->bio[0]->bi_io_vec[0];
-		goto nomerge;
-	}
-
-	for (idx = 0; idx < atomic_read(&chain->num_bios); idx++) {
-		struct bio *bio_src = chain->bio[idx];
-
-		bio_for_each_segment(bv, bio_src, iter) {
-			merged_bio->bi_io_vec[merged_bio->bi_vcnt++] = bv;
-		}
-	}
-
-nomerge:
-	return merged_bio;
-}
-
+/**
+ * znd_bio_merge_dispatch() - kthread handling
+ * @arg: Argument
+ *
+ * Return: 0 on success, otherwise error.
+ */
 static int znd_bio_merge_dispatch(void *arg)
 {
 	struct zdm *znd = (struct zdm *)arg;
 	struct list_head *jlst = &znd->bio_srt_jif_lst_head;
 	struct zdm_q_node *node;
-	struct bio *bio;
+	struct bio *bio = NULL;
+	unsigned long flags;
+	long timeout;
 
 	Z_INFO(znd, "znd_bio_merge_dispatch kthread [started]");
 	while (!kthread_should_stop() || atomic_read(&znd->enqueued)) {
 		node = NULL;
-		if (atomic_read(&znd->enqueued))
-			node = list_first_entry_or_null(jlst, struct zdm_q_node,
-							jlist);
-
+		timeout = znd->queue_delay;
+		spin_lock_irqsave(&znd->zdm_bio_q_lck, flags);
+		node = list_first_entry_or_null(jlst, struct zdm_q_node, jlist);
 		if (node) {
-			bio = NULL;
-			if (time_after(jiffies, node->jiffies + MERGE_DELAY) ||
-			    bio_data_dir(node->bio) == REQ_OP_READ ||
-			    zdm_no_merge(node->bio) ||
-			    atomic_read(&znd->enqueued) > 512) {
-				bio = zdm_merge_bio_for_adjacent_io(znd);
-				if (bio)
-					_zoned_map(znd, bio);
+			bio = node->bio;
+			list_del(&node->jlist);
+			spin_unlock_irqrestore(&znd->zdm_bio_q_lck, flags);
+			ZDM_FREE(znd, node, sizeof(struct zdm_q_node), KM_14);
+			atomic_dec(&znd->enqueued);
+			if (bio) {
+				_zoned_map(znd, bio);
+				timeout = 0;
 			}
-			if (!bio)
-				schedule_timeout_interruptible(MERGE_DELAY);
 		} else {
-			schedule_timeout_interruptible(MERGE_DELAY * 100);
+			spin_unlock_irqrestore(&znd->zdm_bio_q_lck, flags);
+			if (znd->queue_depth <= atomic_read(&znd->enqueued))
+				timeout *= 100;
 		}
+		if (timeout)
+			schedule_timeout_interruptible(timeout);
 	}
 	z_flush_bdev(znd, GFP_KERNEL);
 	Z_INFO(znd, "znd_bio_merge_dispatch kthread [stopped]");
 	return 0;
-}
-
-static __always_inline void insert_node_lba_list(struct zdm_q_node *q_node,
-						 struct list_head *head)
-{
-	struct list_head *node;
-	struct zdm_q_node *tmp;
-	int walk = 0;
-	int fast_tail = list_empty(head) || zdm_no_merge(q_node->bio);
-
-	if (!fast_tail) {
-		list_for_each(node, head) {
-			tmp = list_entry(node, struct zdm_q_node, llist);
-			if (tmp->bi_sector > q_node->bi_sector) {
-//				if (tmp->bio->bi_rw != q_node->bio->bi_rw)
-//					break;
-				list_add_tail(&(q_node->llist), &tmp->llist);
-				return;
-			}
-			if (++walk > 4096)
-				break;
-		}
-	}
-	list_add_tail(&(q_node->llist), head);
 }
 
 /**
@@ -788,8 +540,13 @@ static int zoned_map(struct dm_target *ti, struct bio *bio)
 	struct zdm *znd = ti->private;
 	struct zdm_q_node *q_node;
 	unsigned long flags;
+	u32 op;
 
-	if (!znd->bio_queue)
+	if (znd->queue_depth == 0 && atomic_read(&znd->enqueued) == 0)
+		return _zoned_map(znd, bio);
+
+	op = bio_op(bio);
+	if (op == REQ_OP_READ || op == REQ_OP_DISCARD)
 		return _zoned_map(znd, bio);
 
 	q_node = ZDM_ALLOC(znd, sizeof(struct zdm_q_node), KM_14, GFP_ATOMIC);
@@ -802,41 +559,15 @@ static int zoned_map(struct dm_target *ti, struct bio *bio)
 	q_node->jiffies = jiffies;
 	q_node->bi_sector = bio->bi_iter.bi_sector;
 	INIT_LIST_HEAD(&(q_node->jlist));
-	INIT_LIST_HEAD(&(q_node->llist));
 
 	spin_lock_irqsave(&znd->zdm_bio_q_lck, flags);
 	list_add_tail(&(q_node->jlist), &(znd->bio_srt_jif_lst_head));
-	insert_node_lba_list(q_node, &znd->bio_srt_lba_lst_head);
 	atomic_inc(&znd->enqueued);
 	spin_unlock_irqrestore(&znd->zdm_bio_q_lck, flags);
 	wake_up_process(znd->bio_kthread);
 
 	return DM_MAPIO_SUBMITTED;
 }
-
-#else
-
-/**
- * zoned_map() - Handle an incoming BIO
- * @ti: Device Mapper Target Instance
- * @bio: The BIO to disposition.
- *
- * Return: 0 on success, otherwise error.
- */
-static int zoned_map(struct dm_target *ti, struct bio *bio)
-{
-	struct zdm *znd = ti->private;
-	int err = zoned_bio(znd, bio);
-
-	if (err < 0) {
-		znd->meta_result = err;
-		err = 0;
-	}
-
-	return err;
-}
-
-#endif
 
 /**
  * zoned_actual_size() - Set number of 4k blocks available on block device.
@@ -893,9 +624,21 @@ static int zoned_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	znd->enable_trim = 0;
-#if ENABLE_BIO_QUEUE
-	znd->bio_queue = 1;
-#endif
+	znd->queue_depth = 0;
+	znd->gc_prio_def = 0xff00;
+	znd->gc_prio_low = 0x7fff;
+	znd->gc_prio_high = 0x0400;
+	znd->gc_prio_crit = 0x0040;
+	znd->gc_wm_crit = 7;
+	znd->gc_wm_high = 5;
+	znd->gc_wm_low = 25;
+	znd->gc_status = 1;
+	znd->cache_ageout_ms = 9000;
+	znd->cache_size = 4096;
+	znd->cache_to_pagecache = 0;
+	znd->cache_reada = 64;
+	znd->journal_age = 3;
+	znd->queue_delay = msecs_to_jiffies(WB_DELAY_MS);
 
 	if (argc < 1) {
 		ti->error = "Invalid argument count";
@@ -926,9 +669,9 @@ static int zoned_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		if (!strcasecmp("nodiscard", argv[r]))
 			znd->enable_trim = 0;
 		if (!strcasecmp("bio-queue", argv[r]))
-			znd->bio_queue = 1;
+			znd->queue_depth = 1;
 		if (!strcasecmp("no-bio-queue", argv[r]))
-			znd->bio_queue = 0;
+			znd->queue_depth = 0;
 
 		if (!strncasecmp("reserve=", argv[r], 8)) {
 			u64 mz_resv;
@@ -1051,16 +794,10 @@ static int zoned_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		zoned_destroy(znd);
 		return -EINVAL;
 	}
-
-	znd->issue_open_zone = 1;
-	znd->issue_close_zone = 1;
 	znd->filled_zone = NOZONE;
 
-	if (zac_probe)
+	if (zac_probe || zbc_probe)
 		znd->bdev_is_zoned = 1;
-	if (zbc_probe)
-		znd->bdev_is_zoned = 1;
-	znd->ata_passthrough = 1;
 
 	r = zoned_init_disk(ti, znd, create, force);
 	if (r) {
@@ -1081,22 +818,7 @@ static int zoned_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	if (!znd->bio_set)
 		return -ENOMEM;
 
-#if USE_KTHREAD
-	r = kfifo_alloc(&znd->bio_fifo, KFIFO_SIZE, GFP_KERNEL);
-	if (r)
-		return r;
-
-	znd->bio_kthread = kthread_run(znd_bio_kthread, znd, "zdm-io-%s",
-		znd->bdev_name);
-	if (IS_ERR(znd->bio_kthread)) {
-		r = PTR_ERR(znd->bio_kthread);
-		ti->error = "Couldn't alloc kthread";
-		zoned_destroy(znd);
-		return r;
-	}
-#elif ENABLE_BIO_QUEUE
 	INIT_LIST_HEAD(&(znd->bio_srt_jif_lst_head));
-	INIT_LIST_HEAD(&(znd->bio_srt_lba_lst_head));
 	spin_lock_init(&znd->zdm_bio_q_lck);
 	znd->bio_kthread = kthread_run(znd_bio_merge_dispatch, znd, "zdm-io-%s",
 			znd->bdev_name);
@@ -1107,7 +829,6 @@ static int zoned_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		return r;
 	}
 
-#endif
 	r = zdm_create_proc_entries(znd);
 	if (r) {
 		ti->error = "Failed to create /proc entries";
@@ -1116,7 +837,6 @@ static int zoned_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	/* Restore any ZDM SB 'config' changes here */
-
 	mod_timer(&znd->timer, jiffies + msecs_to_jiffies(5000));
 
 	return 0;
@@ -1140,16 +860,9 @@ static void zoned_dtr(struct dm_target *ti)
 		sblock->csum = sb_crc32(sblock);
 	}
 
-#if USE_KTHREAD
-	wake_up_process(znd->bio_kthread);
-	wait_event(znd->wait_bio, kfifo_is_empty(&znd->bio_fifo));
-	kthread_stop(znd->bio_kthread);
-	kfifo_free(&znd->bio_fifo);
-#elif ENABLE_BIO_QUEUE
 	wake_up_process(znd->bio_kthread);
 	wait_event(znd->wait_bio, atomic_read(&znd->enqueued) == 0);
 	kthread_stop(znd->bio_kthread);
-#endif
 	zdm_remove_proc_entries(znd);
 	zoned_destroy(znd);
 }
@@ -1167,9 +880,20 @@ static void do_io_work(struct work_struct *work)
 
 	req->result = dm_io(io_req, 1, req->where, &error_bits);
 	if (error_bits)
-		DMERR("ERROR: dm_io error: %lx", error_bits);
+		DMERR("ERROR: dm_io_work error: %lx", error_bits);
 }
 
+/**
+ * _znd_async_io() - Issue I/O via dm_io async or sync (using worker thread).
+ * @znd: ZDM Instance
+ * @io_req: I/O request
+ * @data: Data for I/O
+ * @where: I/O region
+ * @dtype: I/O data type
+ * @queue: Use worker when true
+ *
+ * Return 0 on success, otherwise error.
+ */
 static int _znd_async_io(struct zdm *znd, struct dm_io_request *io_req,
 			void *data, struct dm_io_region *where,
 			enum dm_io_mem_type dtype, int queue)
@@ -1203,7 +927,18 @@ static int _znd_async_io(struct zdm *znd, struct dm_io_request *io_req,
 		req.where = where;
 		req.io_req = io_req;
 		queue_work(znd->io_wq, &req.work);
+
+		Z_DBG(znd, "%s: wait for %s io (%lx)",
+			__func__,
+			io_req->bi_op == REQ_OP_READ ? "R" : "W",
+			where->sector >> 3);
+
 		flush_workqueue(znd->io_wq);
+
+		Z_DBG(znd, "%s: cmplted %s io (%lx)",
+			__func__,
+			io_req->bi_op == REQ_OP_READ ? "R" : "W",
+			where->sector >> 3);
 		destroy_work_on_stack(&req.work);
 
 		rcode = req.result;
@@ -1318,10 +1053,9 @@ static int block_io(struct zdm *znd,
  *
  * Return 0 on success, otherwise error.
  */
-static int read_block(struct dm_target *ti, enum dm_io_mem_type dtype,
+static int read_block(struct zdm *znd, enum dm_io_mem_type dtype,
 		      void *data, u64 lba, unsigned int count, int queue)
 {
-	struct zdm *znd = ti->private;
 	sector_t block = lba << Z_SHFT4K;
 	unsigned int nDMsect = count << Z_SHFT4K;
 	int rc;
@@ -1354,11 +1088,10 @@ static int read_block(struct dm_target *ti, enum dm_io_mem_type dtype,
  *
  * Return 0 on success, otherwise error.
  */
-static int writef_block(struct dm_target *ti, enum dm_io_mem_type dtype,
+static int writef_block(struct zdm *znd, enum dm_io_mem_type dtype,
 			void *data, u64 lba, unsigned int op_flags,
 			unsigned int count, int queue)
 {
-	struct zdm *znd = ti->private;
 	sector_t block = lba << Z_SHFT4K;
 	unsigned int nDMsect = count << Z_SHFT4K;
 	int rc;
@@ -1385,12 +1118,12 @@ static int writef_block(struct dm_target *ti, enum dm_io_mem_type dtype,
  *
  * Return 0 on success, otherwise error.
  */
-static int write_block(struct dm_target *ti, enum dm_io_mem_type dtype,
+static int write_block(struct zdm *znd, enum dm_io_mem_type dtype,
 		       void *data, u64 lba, unsigned int count, int queue)
 {
 	unsigned int op_flags = 0;
 
-	return writef_block(ti, dtype, data, lba, op_flags, count, queue);
+	return writef_block(znd, dtype, data, lba, op_flags, count, queue);
 }
 
 /**
@@ -1484,10 +1217,14 @@ static void _common_endio(struct zdm *znd, struct bio *bio)
 	u32 blks = bio->bi_iter.bi_size / Z_C4K;
 
 #if ENABLE_SEC_METADATA
-	struct block_device *bdev;
+	struct block_device *bdev = znd->dev->bdev;
+
+	if (bio->bi_bdev != bdev->bd_contains && bio->bi_bdev != bdev)
+		return;
 
 	switch (znd->meta_dst_flag) {
 	case DST_TO_PRI_DEVICE:
+	case DST_TO_BOTH_DEVICE:
 		if (bio_op(bio) == REQ_OP_WRITE && lba > znd->start_sect) {
 			lba -= znd->start_sect;
 			if (lba > 0)
@@ -1495,20 +1232,11 @@ static void _common_endio(struct zdm *znd, struct bio *bio)
 		}
 		break;
 	case DST_TO_SEC_DEVICE:
-		bdev = znd->dev->bdev;
-		if (bio->bi_bdev == bdev->bd_contains &&
-		    bio_op(bio) == REQ_OP_WRITE &&
+		if (bio_op(bio) == REQ_OP_WRITE &&
 		    lba > znd->sec_dev_start_sect) {
 
 			lba = lba - znd->sec_dev_start_sect
 				 - (znd->sec_zone_align >> Z_SHFT4K);
-			if (lba > 0)
-				increment_used_blks(znd, lba - 1, blks + 1);
-		}
-		break;
-	case DST_TO_BOTH_DEVICE:
-		if (bio_op(bio) == REQ_OP_WRITE && lba > znd->start_sect) {
-			lba -= znd->start_sect;
 			if (lba > 0)
 				increment_used_blks(znd, lba - 1, blks + 1);
 		}
@@ -1604,7 +1332,6 @@ out:
 static int zm_cow(struct zdm *znd, struct bio *bio, u64 s_zdm, u32 blks,
 		  u64 origin)
 {
-	struct dm_target *ti = znd->ti;
 	int count = 1;
 	int use_wq = 1;
 	unsigned int bytes = bio_cur_bytes(bio);
@@ -1637,7 +1364,7 @@ static int zm_cow(struct zdm *znd, struct bio *bio, u64 s_zdm, u32 blks,
 			if (s_zdm != znd->cow_addr) {
 				Z_ERR(znd, "Copy block from %llx <= %llx",
 				      origin, s_zdm);
-				ioer = read_block(ti, DM_IO_KMEM, io, origin,
+				ioer = read_block(znd, DM_IO_KMEM, io, origin,
 						count, use_wq);
 				if (ioer)
 					return -EIO;
@@ -1664,7 +1391,7 @@ static int zm_cow(struct zdm *znd, struct bio *bio, u64 s_zdm, u32 blks,
 
 		/* ---------------------------------------------------------- */
 
-		ioer = write_block(ti, DM_IO_KMEM, io, disk_lba, count, use_wq);
+		ioer = write_block(znd, DM_IO_KMEM, io, disk_lba, count, use_wq);
 		if (ioer)
 			return -EIO;
 
@@ -1706,7 +1433,7 @@ static int zm_write_cache(struct zdm *znd, struct io_dm_block *dm_vbuf,
 	int remainder = cached - sectors;
 	int err;
 
-	err = write_block(znd->ti, DM_IO_VMA, dm_vbuf, lba, blks, use_wq);
+	err = write_block(znd, DM_IO_VMA, dm_vbuf, lba, blks, use_wq);
 	if (!err) {
 		if (remainder)
 			memcpy(dm_vbuf[0].data,
@@ -1902,6 +1629,13 @@ reacquire:
 					bio_endio(bio);
 					goto out;
 				}
+
+				if (mapped < blks) {
+					Z_ERR(znd, "ERROR: Bad write %"
+					      PRId32 " beyond alloc'd space",
+					      mapped);
+				}
+
 				lba     += blks;
 				written += blks;
 				mcount  += blks;
@@ -1911,11 +1645,6 @@ reacquire:
 					bio_advance_iter(bio, &iter, bv.bv_len);
 					start = iter;
 					break;
-				}
-				if (mapped < 0) {
-					Z_ERR(znd, "ERROR: Bad write %"
-					      PRId32 " beyond alloc'd space",
-					      mapped);
 				}
 			}
 		} /* end: __bio_for_each_segment */
@@ -1931,16 +1660,18 @@ reacquire:
 				bio_endio(bio);
 				goto out;
 			}
+
+			if (mapped < blks) {
+				Z_ERR(znd, "ERROR: [2] Bad write %"
+				      PRId32 " beyond alloc'd space",
+				      mapped);
+			}
+
 			lba     += blks;
 			written += blks;
 			mcount  += blks;
 			mapped  -= blks;
 
-			if (mapped < 0) {
-				Z_ERR(znd, "ERROR: [2] Bad write %"
-				      PRId32 " beyond alloc'd space",
-				      mapped);
-			}
 		}
 		err = z_mapped_addmany(znd, s_zdm, alloc_ori, mcount, gfp);
 		if (err) {
@@ -2205,7 +1936,13 @@ static int zoned_bio(struct zdm *znd, struct bio *bio)
 	if (is_write) {
 		if ((bio->bi_opf & REQ_CHECKPOINT) ||
 		     bio_op(bio) == REQ_OP_FLUSH) {
+
+#if ENABLE_SEC_METADATA
+			if (znd->meta_dst_flag != DST_TO_SEC_DEVICE)
+				bio->bi_opf &= ~REQ_CHECKPOINT;
+#else
 			bio->bi_opf &= ~REQ_CHECKPOINT;
+#endif
 			set_bit(DO_SYNC, &znd->flags);
 			set_bit(DO_FLUSH, &znd->flags);
 			op_is_flush = true;
@@ -2232,7 +1969,7 @@ static int zoned_bio(struct zdm *znd, struct bio *bio)
 			const int gc_wait = 0;
 
 			rcode = zoned_map_write(znd, bio, s_zdm);
-			if (znd->z_gc_free < 7)
+			if (znd->z_gc_free < (znd->gc_wm_crit + 2))
 				gc_immediate(znd, gc_wait, gfp);
 
 		} else {
@@ -2242,6 +1979,9 @@ static int zoned_bio(struct zdm *znd, struct bio *bio)
 	} else {
 		do_end_bio = true;
 	}
+
+	if (znd->memstat > 25 << 20)
+		set_bit(DO_MEMPOOL, &znd->flags);
 
 	if (test_bit(DO_FLUSH, &znd->flags) ||
 	    test_bit(DO_SYNC, &znd->flags) ||
@@ -2263,9 +2003,16 @@ static int zoned_bio(struct zdm *znd, struct bio *bio)
 	if (do_flush_workqueue && work_pending(&znd->meta_work))
 		flush_workqueue(znd->meta_wq);
 
+
+
 out:
-	if (do_end_bio)
+	if (do_end_bio) {
+		if (znd->meta_result) {
+			bio->bi_error = znd->meta_result;
+			znd->meta_result = 0;
+		}
 		bio_endio(bio);
+	}
 
 	Z_DBG(znd, "%s: ..... -> s:%"PRIx64"-> rc: %d", __func__, s_zdm, rcode);
 
@@ -2280,7 +2027,7 @@ out:
  */
 static inline int _do_mem_purge(struct zdm *znd)
 {
-	const int pool_size = MZ_MEMPOOL_SZ * 4;
+	const int pool_size = znd->cache_size >> 1;
 	int do_work = 0;
 
 	if (atomic_read(&znd->incore) > pool_size) {
@@ -2507,7 +2254,7 @@ static void *proc_wp_next(struct seq_file *seqf, void *v, loff_t *pos)
 	struct zdm *znd = seqf->private;
 	u32 zone = ++znd->wp_proc_at;
 
-	return zone < znd->data_zones ? &znd->wp_proc_at : NULL;
+	return zone < znd->zone_count ? &znd->wp_proc_at : NULL;
 }
 
 /**
@@ -2527,7 +2274,7 @@ static int proc_wp_show(struct seq_file *seqf, void *v)
 	u32 zone = znd->wp_proc_at;
 	u32 out = 0;
 
-	while (zone < znd->data_zones) {
+	while (zone < znd->zone_count) {
 		u32 gzno  = zone >> GZ_BITS;
 		u32 gzoff = zone & GZ_MMSK;
 		struct meta_pg *wpg = &znd->wp[gzno];
@@ -2614,7 +2361,7 @@ static void *proc_used_next(struct seq_file *seqf, void *v, loff_t *pos)
 	struct zdm *znd = seqf->private;
 	u32 zone = ++znd->wp_proc_at;
 
-	return zone < znd->data_zones ? &znd->wp_proc_at : NULL;
+	return zone < znd->zone_count ? &znd->wp_proc_at : NULL;
 }
 
 /**
@@ -2636,7 +2383,7 @@ static int proc_used_show(struct seq_file *seqf, void *v)
 	u32 zone = znd->wp_proc_at;
 	u32 out = 0;
 
-	while (zone < znd->data_zones) {
+	while (zone < znd->zone_count) {
 		u32 gzno  = zone >> GZ_BITS;
 		u32 gzoff = zone & GZ_MMSK;
 		struct meta_pg *wpg = &znd->wp[gzno];
@@ -2712,7 +2459,7 @@ static int zdm_status_show(struct seq_file *seqf, void *unused)
 	u32 zone;
 
 	memset(&status, 0, sizeof(status));
-	for (zone = 0; zone < znd->data_zones; zone++) {
+	for (zone = 0; zone < znd->zone_count; zone++) {
 		u32 gzno  = zone >> GZ_BITS;
 		u32 gzoff = zone & GZ_MMSK;
 		struct meta_pg *wpg = &znd->wp[gzno];
@@ -2724,11 +2471,11 @@ static int zdm_status_show(struct seq_file *seqf, void *unused)
 	status.map_cache_entries = znd->mc_entries;
 	status.discard_cache_entries = znd->dc_entries;
 	status.b_discard = znd->discard_count;
-	status.journal_pages = znd->journal_entries;
-	status.journal_entries = znd->jrnl.in_use;
+	status.journal_pages = znd->wbjrnl->size / PAGE_SIZE;
+	status.journal_entries = znd->wbjrnl->count;
 
 	/*  fixed array of ->fwd_tm and ->rev_tm */
-	status.m_zones = znd->data_zones;
+	status.m_zones = znd->zone_count;
 
 	status.memstat = znd->memstat;
 	memcpy(status.bins, znd->bins, sizeof(status.bins));
@@ -2772,9 +2519,6 @@ static int zdm_info_show(struct seq_file *seqf, void *unused)
 	seq_printf(seqf, "Empty Zones:   %u\n", znd->z_gc_free);
 	seq_printf(seqf, "Cached Pages:  %u\n", znd->mc_entries);
 	seq_printf(seqf, "Discard Pages: %u\n", znd->dc_entries);
-	seq_printf(seqf, "Journal Pages: %u\n", znd->journal_entries);
-	seq_printf(seqf, "Journal InUse: %u / %u\n",
-		znd->jrnl.in_use, znd->jrnl.size);
 	seq_printf(seqf, "ZTL Pages:     %d\n", atomic_read(&znd->incore));
 	seq_printf(seqf, "   in ZTL:     %d\n", znd->in_zlt);
 	seq_printf(seqf, "   in LZY:     %d\n", znd->in_lzy);
@@ -2790,6 +2534,21 @@ static int zdm_info_show(struct seq_file *seqf, void *unused)
 		znd->trim->count, znd->trim->size);
 	seq_printf(seqf, "WB Jrnl InUse: %u / %u\n",
 		znd->wbjrnl->count, znd->wbjrnl->size);
+
+	seq_printf(seqf, "queue-depth=%u\n", znd->queue_depth);
+	seq_printf(seqf, "gc-prio-def=%u\n", znd->gc_prio_def);
+	seq_printf(seqf, "gc-prio-low=%u\n", znd->gc_prio_low);
+	seq_printf(seqf, "gc-prio-high=%u\n", znd->gc_prio_high);
+	seq_printf(seqf, "gc-prio-crit=%u\n", znd->gc_prio_crit);
+	seq_printf(seqf, "gc-wm-crit=%u\n", znd->gc_wm_crit);
+	seq_printf(seqf, "gc-wm-high=%u\n", znd->gc_wm_high);
+	seq_printf(seqf, "gc-wm-low=%u\n", znd->gc_wm_low);
+	seq_printf(seqf, "gc-status=%u\n", znd->gc_status);
+	seq_printf(seqf, "cache-ageout-ms=%u\n", znd->cache_ageout_ms);
+	seq_printf(seqf, "cache-size=%u\n", znd->cache_size);
+	seq_printf(seqf, "cache-to-pagecache=%u\n", znd->cache_to_pagecache);
+	seq_printf(seqf, "cache-reada=%u\n", znd->cache_reada);
+	seq_printf(seqf, "journal-age=%u\n", znd->journal_age);
 
 	for (bin = 0; bin < ARRAY_SIZE(znd->bins); bin++) {
 		if (znd->max_bins[bin])
@@ -2945,22 +2704,66 @@ static void zoned_resume(struct dm_target *ti)
 	/* TODO */
 }
 
-/*
- *
+struct marg {
+	const char *prefix;
+	u32 *value;
+};
+
+/**
+ * zoned_message() - dmsetup message sent to target.
+ * @ti: Target Instance
+ * @argc: Number of arguments
+ * @argv: Array of arguments
  */
 static int zoned_message(struct dm_target *ti, unsigned int argc, char **argv)
 {
 	struct zdm *znd = ti->private;
 	int iter;
+	struct marg margs[] = {
+		{ "queue-depth=",       &znd->queue_depth        },
+		{ "gc-prio-def=",       &znd->gc_prio_def        },
+		{ "gc-prio-low=",       &znd->gc_prio_low        },
+		{ "gc-prio-high=",      &znd->gc_prio_high       },
+		{ "gc-prio-crit=",      &znd->gc_prio_crit       },
+		{ "gc-wm-crit=",        &znd->gc_wm_crit         },
+		{ "gc-wm-high=",        &znd->gc_wm_high         },
+		{ "gc-wm-low=",         &znd->gc_wm_low          },
+		{ "gc-status=",         &znd->gc_status          },
+		{ "cache-ageout-ms=",   &znd->cache_ageout_ms    },
+		{ "cache-size=",        &znd->cache_size         },
+		{ "cache-to-pagecache=",&znd->cache_to_pagecache },
+		{ "cache-reada=",       &znd->cache_reada        },
+		{ "journal-age=",       &znd->journal_age        },
+	};
 
 	for (iter = 0; iter < argc; iter++) {
-		if (!strcasecmp("bio-queue", argv[iter]))
-			znd->bio_queue = 1;
-		else if (!strcasecmp("no-bio-queue", argv[iter]))
-			znd->bio_queue = 0;
-		else
+		u64 tmp;
+		int ii, err;
+		bool handled = false;
+
+		for (ii = 0; ii < ARRAY_SIZE(margs); ii++) {
+			const char *opt = margs[ii].prefix;
+			int len = strlen(opt);
+
+			if (!strncasecmp(argv[iter], opt, len)) {
+				err = kstrtoll(argv[iter] + len, 0, &tmp);
+				if (err) {
+					Z_ERR(znd, "Invalid arg %s\n",
+						argv[iter]);
+					continue;
+				}
+				*margs[ii].value = tmp;
+				handled = true;
+				break;
+			}
+		}
+		if (!handled)
 			Z_ERR(znd, "Message: %s not handled.", argv[iter]);
 	}
+
+	if (znd->queue_depth == 0 && atomic_read(&znd->enqueued) > 0)
+		wake_up_process(znd->bio_kthread);
+
 	return 0;
 }
 
@@ -3005,10 +2808,6 @@ static int __init dm_zoned_init(void)
 	if (rcode)
 		DMERR("zdm target registration failed: %d", rcode);
 
-#if ENABLE_BIO_QUEUE
-	if (!_bio_queue_merge_delay)
-		_bio_queue_merge_delay = msecs_to_jiffies(WB_DELAY_MS);
-#endif
 	return rcode;
 }
 

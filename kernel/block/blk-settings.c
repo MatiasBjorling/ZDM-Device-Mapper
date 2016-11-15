@@ -101,13 +101,13 @@ void blk_set_default_limits(struct queue_limits *lim)
 	lim->discard_alignment = 0;
 	lim->discard_misaligned = 0;
 	lim->discard_zeroes_data = 0;
-	lim->zoned = ZONED_TYPE_NONE;
 	lim->logical_block_size = lim->physical_block_size = lim->io_min = 512;
 	lim->bounce_pfn = (unsigned long)(BLK_BOUNCE_ANY >> PAGE_SHIFT);
 	lim->alignment_offset = 0;
 	lim->io_opt = 0;
 	lim->misaligned = 0;
 	lim->cluster = 1;
+	lim->zoned = BLK_ZONED_NONE;
 }
 EXPORT_SYMBOL(blk_set_default_limits);
 
@@ -571,7 +571,6 @@ int blk_stack_limits(struct queue_limits *t, struct queue_limits *b,
 
 	t->cluster &= b->cluster;
 	t->discard_zeroes_data &= b->discard_zeroes_data;
-	t->zoned |= b->zoned;
 
 	/* Physical block size a multiple of the logical block size? */
 	if (t->physical_block_size & (t->logical_block_size - 1)) {
@@ -631,6 +630,10 @@ int blk_stack_limits(struct queue_limits *t, struct queue_limits *b,
 		t->discard_alignment = lcm_not_zero(t->discard_alignment, alignment) %
 			t->discard_granularity;
 	}
+
+	if (b->chunk_sectors)
+		t->chunk_sectors = min_not_zero(t->chunk_sectors,
+						b->chunk_sectors);
 
 	return ret;
 }
