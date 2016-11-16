@@ -112,8 +112,9 @@ Building:
 
 ## Standards Versions Supported
 
-ZAC/ZBC standards are still being developed. Changes to the command set and
-command interface can be expected before the final public release.
+ZAC/ZBC standards are still being developed. The Zoned Device ATA command Set v1 is finalized, 
+and v2 is under development. Changes to the command set and
+command interface can be expected, but are not expected to be included in subsequent ZDM work.
 
 ## License
 
@@ -127,7 +128,8 @@ If not, please see http://www.gnu.org/licenses/.
 
 ## Contact and Bug Reports
 
-  - Shaun Tancheff [shaun.tancheff@seagate.com](mailto:shaun.tancheff@seagate.com)
+  - Shaun Tancheff (author)
+  - Adrian Palmer [adrian.palmer@seagate.com](mailto:adrian.palmer@seagate.com)
 
 ## ZDM Patches for other projects
 
